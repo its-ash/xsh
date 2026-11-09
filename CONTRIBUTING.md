@@ -5,8 +5,8 @@ Thank you for helping. This page lists the rules and the commands.
 ## Set up
 
 ```sh
-git clone https://github.com/its-ash/rushy
-cd rushy
+git clone https://github.com/its-ash/xsh
+cd xsh
 cargo build --workspace
 swift build --package-path app
 ```

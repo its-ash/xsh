@@ -37,7 +37,7 @@ pub use paths::Paths;
 
 /// Default bundle registry index.
 pub const DEFAULT_REGISTRY_URL: &str =
-    "https://raw.githubusercontent.com/its-ash/rushy/main/registry.json";
+    "https://raw.githubusercontent.com/its-ash/xsh/main/registry.json";
 
 /// Hosts bundle downloads may come from unless the user config overrides them.
 pub const DEFAULT_ALLOWED_HOSTS: &[&str] = &[

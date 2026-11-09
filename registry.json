@@ -5,9 +5,9 @@
       "name": "git",
       "version": "0.1.0",
       "description": "Git prompt segment, aliases, and completions.",
-      "repo": "https://github.com/its-ash/rushy",
+      "repo": "https://github.com/its-ash/xsh",
       "sha256": "255691c939d5ec13679579b1ec8ebd00fb89604d388e29516710b700cb51e2e6",
-      "url": "https://raw.githubusercontent.com/its-ash/rushy/main/plugins/git/bundle.toml",
+      "url": "https://raw.githubusercontent.com/its-ash/xsh/main/plugins/git/bundle.toml",
       "files": [
         { "path": "init.rushy", "sha256": "4ec77fb7c01043e0702418bec1d1aea851874d820f7d37d7867b1b89b0268e20" },
         { "path": "README.md", "sha256": "bf5a84be2954e593c71d9cb446df17b5223c151aaa95b8c6979bf692b7a11c56" }
@@ -17,9 +17,9 @@
       "name": "rsync",
       "version": "0.1.0",
       "description": "Safe rsync presets for copying, moving, and syncing.",
-      "repo": "https://github.com/its-ash/rushy",
+      "repo": "https://github.com/its-ash/xsh",
       "sha256": "90222c8ed7949f59eb8fff7d91ae014ffef50e8757c724fc8d78c6dc8525057e",
-      "url": "https://raw.githubusercontent.com/its-ash/rushy/main/plugins/rsync/bundle.toml",
+      "url": "https://raw.githubusercontent.com/its-ash/xsh/main/plugins/rsync/bundle.toml",
       "files": [
         { "path": "README.md", "sha256": "c5fb79b6534bfb22b2bbf1eee9a83f356d9222f0ba93cf4b9fa7a3512a0a07a6" }
       ]
@@ -28,9 +28,9 @@
       "name": "adb",
       "version": "0.1.0",
       "description": "Android Debug Bridge aliases and completions.",
-      "repo": "https://github.com/its-ash/rushy",
+      "repo": "https://github.com/its-ash/xsh",
       "sha256": "801f71aeddddc42e98162886bd7a84c4227188423026cd5f0df4518922d16668",
-      "url": "https://raw.githubusercontent.com/its-ash/rushy/main/plugins/adb/bundle.toml",
+      "url": "https://raw.githubusercontent.com/its-ash/xsh/main/plugins/adb/bundle.toml",
       "files": [
         { "path": "README.md", "sha256": "67d042f0dec233bff8b085114bc5dcea2b890b04ae1b7beab102d3065d8b63f4" }
       ]
@@ -39,9 +39,9 @@
       "name": "npm",
       "version": "0.1.0",
       "description": "npm aliases and script completions for Node.js projects.",
-      "repo": "https://github.com/its-ash/rushy",
+      "repo": "https://github.com/its-ash/xsh",
       "sha256": "088a97759e9cc2e49419f36b48d728a930d7f682f12753ed762dd4d24566e2d5",
-      "url": "https://raw.githubusercontent.com/its-ash/rushy/main/plugins/npm/bundle.toml",
+      "url": "https://raw.githubusercontent.com/its-ash/xsh/main/plugins/npm/bundle.toml",
       "files": [
         { "path": "README.md", "sha256": "d54b6f527d3fb717ca9260b3225d59751e25ab33b810293a9743cd9ba424c2d0" }
       ]
@@ -50,9 +50,9 @@
       "name": "pip",
       "version": "0.1.0",
       "description": "pip aliases that always use the active interpreter.",
-      "repo": "https://github.com/its-ash/rushy",
+      "repo": "https://github.com/its-ash/xsh",
       "sha256": "013fe1b407f513c0f339732eeb5bbe8416757076cc3104abca19257f2dcd5d27",
-      "url": "https://raw.githubusercontent.com/its-ash/rushy/main/plugins/pip/bundle.toml",
+      "url": "https://raw.githubusercontent.com/its-ash/xsh/main/plugins/pip/bundle.toml",
       "files": [
         { "path": "README.md", "sha256": "2caa2d5e27160cd36e3391db95765e81a45c6e0156f4bef22bb484fe83317f91" }
       ]
@@ -61,9 +61,9 @@
       "name": "postgres",
       "version": "0.1.0",
       "description": "PostgreSQL client aliases.",
-      "repo": "https://github.com/its-ash/rushy",
+      "repo": "https://github.com/its-ash/xsh",
       "sha256": "cfbd6d16e2cd83c5dfaf11234d8cbc85c6a9703bbafb516fa276b6ca578e4f68",
-      "url": "https://raw.githubusercontent.com/its-ash/rushy/main/plugins/postgres/bundle.toml",
+      "url": "https://raw.githubusercontent.com/its-ash/xsh/main/plugins/postgres/bundle.toml",
       "files": [
         { "path": "README.md", "sha256": "f928defa8c3637df7c35a6ee7076611d19a4698d461c3b12c84b340565f56f15" }
       ]
@@ -72,9 +72,9 @@
       "name": "sbt",
       "version": "0.1.0",
       "description": "sbt aliases for Scala builds.",
-      "repo": "https://github.com/its-ash/rushy",
+      "repo": "https://github.com/its-ash/xsh",
       "sha256": "2bf334317e6c06c8feefe2258d5466521c4abdb77b71dcef182c9a44e195c8e0",
-      "url": "https://raw.githubusercontent.com/its-ash/rushy/main/plugins/sbt/bundle.toml",
+      "url": "https://raw.githubusercontent.com/its-ash/xsh/main/plugins/sbt/bundle.toml",
       "files": [
         { "path": "README.md", "sha256": "82b48fd49f5d3413e1cd0aa63d806fd454ccf572438811f355b4fd5a0af12cfc" }
       ]
@@ -83,9 +83,9 @@
       "name": "scala",
       "version": "0.1.0",
       "description": "Scala and scala-cli aliases.",
-      "repo": "https://github.com/its-ash/rushy",
+      "repo": "https://github.com/its-ash/xsh",
       "sha256": "1c452e08fdee1c405bdf3b06768efe23d5fb464e3dc7c95e0e774525afe97038",
-      "url": "https://raw.githubusercontent.com/its-ash/rushy/main/plugins/scala/bundle.toml",
+      "url": "https://raw.githubusercontent.com/its-ash/xsh/main/plugins/scala/bundle.toml",
       "files": [
         { "path": "README.md", "sha256": "fd72a58cb6ad78caa49b629790c610479869dc4e6742ae5696f29e62df938f3f" }
       ]
@@ -94,9 +94,9 @@
       "name": "ubuntu",
       "version": "0.1.0",
       "description": "apt and systemd aliases for Ubuntu and Debian.",
-      "repo": "https://github.com/its-ash/rushy",
+      "repo": "https://github.com/its-ash/xsh",
       "sha256": "9d2498c751fc972031456f4c443ed7e07da5597f6fcf83bf30ae82dd7455b9bd",
-      "url": "https://raw.githubusercontent.com/its-ash/rushy/main/plugins/ubuntu/bundle.toml",
+      "url": "https://raw.githubusercontent.com/its-ash/xsh/main/plugins/ubuntu/bundle.toml",
       "files": [
         { "path": "README.md", "sha256": "6721284e7d7e2d6986059b7d8488f0281f1534211968a394bded53a540ff34b5" }
       ]
@@ -105,9 +105,9 @@
       "name": "node",
       "version": "0.1.0",
       "description": "Node.js version prompt segment and helpers.",
-      "repo": "https://github.com/its-ash/rushy",
+      "repo": "https://github.com/its-ash/xsh",
       "sha256": "60971411d93aafeb2db1e762a2cdb0833f2cb863a5bab495b22f299d12b98fd1",
-      "url": "https://raw.githubusercontent.com/its-ash/rushy/main/plugins/node/bundle.toml",
+      "url": "https://raw.githubusercontent.com/its-ash/xsh/main/plugins/node/bundle.toml",
       "files": [
         { "path": "README.md", "sha256": "78f41c854e6d6edb6e85107812383e196a08aecf36d00e95fb943cf8d1effada" }
       ]
@@ -116,9 +116,9 @@
       "name": "python",
       "version": "0.1.0",
       "description": "Python version prompt segment and virtualenv helpers.",
-      "repo": "https://github.com/its-ash/rushy",
+      "repo": "https://github.com/its-ash/xsh",
       "sha256": "c22d2cce37a4049ce43906b6ff8a30330cd47f2d9eff9a1c29f5fe96046771a7",
-      "url": "https://raw.githubusercontent.com/its-ash/rushy/main/plugins/python/bundle.toml",
+      "url": "https://raw.githubusercontent.com/its-ash/xsh/main/plugins/python/bundle.toml",
       "files": [
         { "path": "README.md", "sha256": "047904757716150de5b024d92d466eaa9c72e0af317378b06aaf71c7b3839e16" }
       ]
@@ -127,9 +127,9 @@
       "name": "history",
       "version": "0.1.0",
       "description": "Short aliases for rushy's encrypted history.",
-      "repo": "https://github.com/its-ash/rushy",
+      "repo": "https://github.com/its-ash/xsh",
       "sha256": "f62b4582acd194d03770994e95e65638512e8cfc4f137a2f00c609d7aa2d2434",
-      "url": "https://raw.githubusercontent.com/its-ash/rushy/main/plugins/history/bundle.toml",
+      "url": "https://raw.githubusercontent.com/its-ash/xsh/main/plugins/history/bundle.toml",
       "files": [
         { "path": "init.rushy", "sha256": "cdaf6c2f26a6f19fc3bf27c36074bfacc3b1844093217348a0427c01f762355f" },
         { "path": "README.md", "sha256": "2cc1f4b756cd735246ca9d78ad88e127afd5b46cf5a7a6e31dca4331d223e3b7" }
@@ -139,9 +139,9 @@
       "name": "vscode",
       "version": "0.1.0",
       "description": "Visual Studio Code launcher aliases.",
-      "repo": "https://github.com/its-ash/rushy",
+      "repo": "https://github.com/its-ash/xsh",
       "sha256": "808bfcc74ca06be4813ba0d072f05e9a3afeedae68524498aa82e58d0c58d3e7",
-      "url": "https://raw.githubusercontent.com/its-ash/rushy/main/plugins/vscode/bundle.toml",
+      "url": "https://raw.githubusercontent.com/its-ash/xsh/main/plugins/vscode/bundle.toml",
       "files": [
         { "path": "README.md", "sha256": "86c067f2813aa58197021ca8aee0b6a5cc0e0557aa2edce4627faaedb1c76afc" }
       ]
@@ -150,9 +150,9 @@
       "name": "docker",
       "version": "0.1.0",
       "description": "Docker and Docker Compose aliases and completions.",
-      "repo": "https://github.com/its-ash/rushy",
+      "repo": "https://github.com/its-ash/xsh",
       "sha256": "b220efc28fed46e70b0078176f6f5b4fea1f314a81aec9d82772ebbdd8189372",
-      "url": "https://raw.githubusercontent.com/its-ash/rushy/main/plugins/docker/bundle.toml",
+      "url": "https://raw.githubusercontent.com/its-ash/xsh/main/plugins/docker/bundle.toml",
       "files": [
         { "path": "init.rushy", "sha256": "cea6e7daee065ddd0c0fe9ce1fa69f5d0a9f2b80472a54b9bb0c5e5cb01d8ac7" },
         { "path": "README.md", "sha256": "0590021a1837abaa9a25972222a981095dbe1cd797ba88a5f3a9813bfb2395fe" }

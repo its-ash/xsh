@@ -49,7 +49,7 @@ fn fixture_registry(dir: &Path) -> Result<String, Box<dyn Error>> {
             name: (*name).to_owned(),
             version: "0.1.0".into(),
             description: String::new(),
-            repo: "https://github.com/its-ash/rushy".into(),
+            repo: "https://github.com/its-ash/xsh".into(),
             sha256: sha256_hex(&manifest),
             url: format!("{name}/bundle.toml"),
             files,

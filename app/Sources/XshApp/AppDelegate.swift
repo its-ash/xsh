@@ -154,7 +154,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     @objc func checkForUpdates(_ sender: Any?) { Updater.check(manual: true) }
 
     @objc func showHelp(_ sender: Any?) {
-        if let u = URL(string: "https://github.com/its-ash/rushy#readme") { NSWorkspace.shared.open(u) }
+        if let u = URL(string: "https://github.com/its-ash/xsh#readme") { NSWorkspace.shared.open(u) }
     }
 
     @objc func showSettings(_ sender: Any?) {

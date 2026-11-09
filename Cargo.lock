@@ -1819,7 +1819,7 @@ dependencies = [
 
 [[package]]
 name = "rushy-ai"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "keyring",
@@ -1838,7 +1838,7 @@ dependencies = [
 
 [[package]]
 name = "rushy-bundles"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "globset",
  "hex",
@@ -1857,7 +1857,7 @@ dependencies = [
 
 [[package]]
 name = "rushy-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1885,7 +1885,7 @@ dependencies = [
 
 [[package]]
 name = "rushy-config"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dirs",
  "figment",
@@ -1897,7 +1897,7 @@ dependencies = [
 
 [[package]]
 name = "rushy-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "tempfile",
  "thiserror 2.0.21",
@@ -1906,7 +1906,7 @@ dependencies = [
 
 [[package]]
 name = "rushy-history"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -1924,7 +1924,7 @@ dependencies = [
 
 [[package]]
 name = "rushy-pty"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "portable-pty",
  "serde",
@@ -1937,7 +1937,7 @@ dependencies = [
 
 [[package]]
 name = "rushy-tui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "notify",

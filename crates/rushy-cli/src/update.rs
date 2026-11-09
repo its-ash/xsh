@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use crate::app::App;
 
-const REPO: &str = "its-ash/rushy";
+const REPO: &str = "its-ash/xsh";
 const CHECK_TIMEOUT: Duration = Duration::from_secs(20);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(10);
 const MAX_ARCHIVE_BYTES: usize = 400 * 1024 * 1024;

@@ -171,7 +171,7 @@ fn fixture_registry(dir: &Path) -> Result<String, Box<dyn Error>> {
             .unwrap_or_default();
         bundles.push(serde_json::json!({
             "name": name, "version": "0.1.0", "description": desc,
-            "repo": "https://github.com/its-ash/rushy",
+            "repo": "https://github.com/its-ash/xsh",
             "sha256": hex::encode(Sha256::digest(&manifest)),
             "url": format!("{name}/bundle.toml"), "files": files,
         }));

@@ -34,8 +34,8 @@ Two panes in `--screen-reader` style (plain ASCII borders). The default style us
 xsh runs on macOS 14 or later, on Apple silicon and Intel. From source (needs Rust **1.95** or newer and the Xcode command-line tools):
 
 ```sh
-git clone https://github.com/its-ash/rushy
-cd rushy
+git clone https://github.com/its-ash/xsh
+cd xsh
 make build                 # creates target/xsh.app
 cp -R target/xsh.app /Applications/
 ```
@@ -131,7 +131,7 @@ prefix = "C-b"
 shell = ""                  # empty: panes run xsh
 
 [bundles]
-registry_url = "https://raw.githubusercontent.com/its-ash/rushy/main/registry.json"
+registry_url = "https://raw.githubusercontent.com/its-ash/xsh/main/registry.json"
 allowed_hosts = ["raw.githubusercontent.com", "github.com", "objects.githubusercontent.com"]
 allow_hooks = true
 disabled = []
