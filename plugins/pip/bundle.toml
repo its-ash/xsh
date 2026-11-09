@@ -1,0 +1,29 @@
+[package]
+name = "pip"
+version = "0.1.0"
+description = "pip aliases that always use the active interpreter."
+author = "rushy contributors"
+license = "MIT"
+min_rushy_version = "0.1.0"
+
+[bundle]
+requires_commands = ["python3"]
+
+[env]
+PIP_DISABLE_PIP_VERSION_CHECK = "1"
+
+[aliases]
+pipi = "python3 -m pip install"
+pipu = "python3 -m pip install --upgrade"
+pipun = "python3 -m pip uninstall"
+pipl = "python3 -m pip list"
+pipo = "python3 -m pip list --outdated"
+pipreq = "python3 -m pip freeze > requirements.txt"
+pipir = "python3 -m pip install -r requirements.txt"
+
+[completion]
+commands = ["pip", "pip3"]
+
+[completion.subcommands]
+pip = ["download", "freeze", "install", "list", "show", "uninstall", "wheel"]
+pip3 = ["download", "freeze", "install", "list", "show", "uninstall", "wheel"]

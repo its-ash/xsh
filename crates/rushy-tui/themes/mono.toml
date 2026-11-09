@@ -1,0 +1,13 @@
+name = "mono"
+
+[colors]
+background = "reset"
+foreground = "reset"
+accent = "reset"
+error = "reset"
+success = "reset"
+prompt_user = "reset"
+prompt_path = "reset"
+
+[prompt]
+format = "{user} {path} {git}{node}{python}> "

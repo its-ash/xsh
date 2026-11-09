@@ -1,0 +1,6 @@
+# Static aliases: parsed, never executed.
+alias gco='git checkout'
+alias gcb='git checkout -b'
+alias gst='git stash'
+alias gstp='git stash pop'
+alias grb='git rebase'

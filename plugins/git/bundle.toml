@@ -1,0 +1,43 @@
+[package]
+name = "git"
+version = "0.1.0"
+description = "Git prompt segment, aliases, and completions."
+author = "rushy contributors"
+license = "MIT"
+min_rushy_version = "0.1.0"
+
+[bundle]
+detect = ["**/.git"]
+requires_commands = ["git"]
+
+[env]
+GIT_PAGER = "less -FRX"
+
+[aliases]
+gs = "git status --short --branch"
+gl = "git log --oneline --graph --decorate -20"
+ga = "git add"
+gc = "git commit"
+gd = "git diff"
+gds = "git diff --staged"
+gp = "git push"
+gpl = "git pull --ff-only"
+gb = "git branch"
+gsw = "git switch"
+
+[prompt]
+segment = "git"
+color = "cyan"
+format = " {branch}{dirty} "
+priority = 80
+max_width = 32
+
+[completion]
+commands = ["git"]
+
+[completion.subcommands]
+git = ["add", "bisect", "blame", "branch", "checkout", "cherry-pick", "clone", "commit", "diff", "fetch", "init", "log", "merge", "pull", "push", "rebase", "remote", "reset", "restore", "revert", "show", "stash", "status", "switch", "tag", "worktree"]
+
+[[hooks]]
+on = "activate"
+run = "git status --short"

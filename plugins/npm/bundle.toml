@@ -1,0 +1,27 @@
+[package]
+name = "npm"
+version = "0.1.0"
+description = "npm aliases and script completions for Node.js projects."
+author = "rushy contributors"
+license = "MIT"
+min_rushy_version = "0.1.0"
+
+[bundle]
+detect = ["package.json"]
+requires_commands = ["npm"]
+
+[aliases]
+ni = "npm install"
+nid = "npm install --save-dev"
+nci = "npm ci"
+nr = "npm run"
+nrd = "npm run dev"
+nrb = "npm run build"
+nt = "npm test"
+nout = "npm outdated"
+
+[completion]
+commands = ["npm"]
+
+[completion.subcommands]
+npm = ["audit", "ci", "exec", "init", "install", "link", "ls", "outdated", "pack", "publish", "run", "start", "test", "uninstall", "update", "version"]

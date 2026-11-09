@@ -1,0 +1,23 @@
+[package]
+name = "scala"
+version = "0.1.0"
+description = "Scala and scala-cli aliases."
+author = "rushy contributors"
+license = "MIT"
+min_rushy_version = "0.1.0"
+
+[bundle]
+requires_commands = ["scala"]
+
+[aliases]
+scr = "scala run ."
+sct = "scala test ."
+scc = "scala compile ."
+screpl = "scala repl"
+scfmt = "scala fmt ."
+
+[completion]
+commands = ["scala"]
+
+[completion.subcommands]
+scala = ["clean", "compile", "doc", "fmt", "package", "publish", "repl", "run", "setup-ide", "test", "version"]

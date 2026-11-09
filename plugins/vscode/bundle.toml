@@ -1,0 +1,26 @@
+[package]
+name = "vscode"
+version = "0.1.0"
+description = "Visual Studio Code launcher aliases."
+author = "rushy contributors"
+license = "MIT"
+min_rushy_version = "0.1.0"
+
+[bundle]
+requires_commands = ["code"]
+
+[aliases]
+vsc = "code ."
+vsca = "code --add"
+vscd = "code --diff"
+vscg = "code --goto"
+vscn = "code --new-window"
+vscr = "code --reuse-window"
+vscw = "code --wait"
+vscext = "code --list-extensions"
+
+[completion]
+commands = ["code"]
+
+[completion.subcommands]
+code = ["--add", "--diff", "--goto", "--install-extension", "--list-extensions", "--new-window", "--reuse-window", "--wait"]

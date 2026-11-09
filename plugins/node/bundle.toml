@@ -1,0 +1,29 @@
+[package]
+name = "node"
+version = "0.1.0"
+description = "Node.js version prompt segment and helpers."
+author = "rushy contributors"
+license = "MIT"
+min_rushy_version = "0.1.0"
+
+[bundle]
+detect = ["package.json"]
+requires_commands = ["node"]
+
+[aliases]
+nv = "node --version"
+nrepl = "node"
+nx = "npx"
+
+[prompt]
+segment = "node"
+color = "green"
+format = " node {version} "
+priority = 40
+max_width = 16
+
+[completion]
+commands = ["node"]
+
+[completion.subcommands]
+node = ["--check", "--eval", "--inspect", "--print", "--require", "--test", "--version", "--watch"]

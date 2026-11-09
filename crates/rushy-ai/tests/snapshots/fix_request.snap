@@ -1,0 +1,15 @@
+{
+  "messages": [
+    {
+      "role": "system",
+      "content": "A shell command failed. Find the most likely cause and suggest a corrected command.\nReply with JSON only: {\"command\": \"corrected command or empty\", \"explanation\": \"cause and fix in at most 2 sentences\"}.\n\n# Shell context\nOS: macos\nWorking directory: /work/demo\n$SHELL: /bin/zsh (commands run in xsh, a POSIX-like shell without loops or subshells)\nActive bundles: git\nDirectory listing:\n  Cargo.toml\n  src/\nRecent commands:\n  ls\n  cargo build\n"
+    },
+    {
+      "role": "user",
+      "content": "Command: cargo bild\nExit code: 101\nWorking directory: /work/demo\nStderr:\nerror: no such command: `bild`\ngit status --short:\n M src/main.rs"
+    }
+  ],
+  "tools": [],
+  "temperature": 0.2,
+  "max_tokens": 1024
+}

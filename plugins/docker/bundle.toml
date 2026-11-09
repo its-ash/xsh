@@ -1,0 +1,27 @@
+[package]
+name = "docker"
+version = "0.1.0"
+description = "Docker and Docker Compose aliases and completions."
+author = "rushy contributors"
+license = "MIT"
+min_rushy_version = "0.1.0"
+
+[bundle]
+requires_commands = ["docker"]
+
+[aliases]
+dps = "docker ps"
+dpsa = "docker ps -a"
+di = "docker images"
+dex = "docker exec -it"
+dlogs = "docker logs -f"
+dco = "docker compose"
+dcup = "docker compose up -d"
+dcdn = "docker compose down"
+dclogs = "docker compose logs -f"
+
+[completion]
+commands = ["docker"]
+
+[completion.subcommands]
+docker = ["build", "compose", "exec", "image", "images", "inspect", "logs", "network", "ps", "pull", "push", "rm", "rmi", "run", "start", "stop", "system", "volume"]

@@ -1,0 +1,15 @@
+[package]
+name = "rushy-core"
+description = "Shell state, parser, executor, and jobs for rushy."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["time"] }

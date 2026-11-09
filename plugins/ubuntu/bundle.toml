@@ -1,0 +1,27 @@
+[package]
+name = "ubuntu"
+version = "0.1.0"
+description = "apt and systemd aliases for Ubuntu and Debian."
+author = "rushy contributors"
+license = "MIT"
+min_rushy_version = "0.1.0"
+
+[bundle]
+requires_commands = ["apt"]
+
+[aliases]
+agi = "sudo apt install"
+agr = "sudo apt remove"
+agu = "sudo apt update"
+agug = "sudo apt upgrade"
+agar = "sudo apt autoremove"
+acs = "apt search"
+acsh = "apt show"
+sstat = "systemctl status"
+slog = "journalctl -xeu"
+
+[completion]
+commands = ["apt"]
+
+[completion.subcommands]
+apt = ["autoremove", "full-upgrade", "install", "list", "purge", "remove", "search", "show", "update", "upgrade"]

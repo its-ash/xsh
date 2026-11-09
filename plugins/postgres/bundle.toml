@@ -1,0 +1,26 @@
+[package]
+name = "postgres"
+version = "0.1.0"
+description = "PostgreSQL client aliases."
+author = "rushy contributors"
+license = "MIT"
+min_rushy_version = "0.1.0"
+
+[bundle]
+requires_commands = ["psql"]
+
+[env]
+PGCONNECT_TIMEOUT = "10"
+
+[aliases]
+pgl = "psql -l"
+pgc = "psql"
+pgdump = "pg_dump --format=custom"
+pgrestore = "pg_restore --no-owner"
+pgready = "pg_isready"
+
+[completion]
+commands = ["psql"]
+
+[completion.subcommands]
+psql = ["--command", "--dbname", "--file", "--host", "--list", "--port", "--username"]

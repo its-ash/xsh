@@ -1,0 +1,24 @@
+[package]
+name = "rushy-tui"
+description = "ratatui rendering, themes, and widgets for rushy."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+notify.workspace = true
+ratatui.workspace = true
+rushy-bundles = { path = "../rushy-bundles" }
+rushy-config = { path = "../rushy-config" }
+rushy-history = { path = "../rushy-history" }
+rushy-pty = { path = "../rushy-pty" }
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+vt100.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

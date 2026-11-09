@@ -1,0 +1,14 @@
+[package]
+name = "history"
+version = "0.1.0"
+description = "Short aliases for rushy's encrypted history."
+author = "rushy contributors"
+license = "MIT"
+min_rushy_version = "0.1.0"
+
+[aliases]
+h = "history 30"
+hs = "history search"
+hp = "history pause"
+hr = "history resume"
+hx = "history export --format json"

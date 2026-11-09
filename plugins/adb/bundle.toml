@@ -1,0 +1,24 @@
+[package]
+name = "adb"
+version = "0.1.0"
+description = "Android Debug Bridge aliases and completions."
+author = "rushy contributors"
+license = "MIT"
+min_rushy_version = "0.1.0"
+
+[bundle]
+requires_commands = ["adb"]
+
+[aliases]
+adbd = "adb devices -l"
+adbl = "adb logcat"
+adbs = "adb shell"
+adbi = "adb install -r"
+adbu = "adb uninstall"
+adbr = "adb reverse tcp:8081 tcp:8081"
+
+[completion]
+commands = ["adb"]
+
+[completion.subcommands]
+adb = ["connect", "devices", "disconnect", "install", "kill-server", "logcat", "pull", "push", "reboot", "reverse", "shell", "start-server", "uninstall"]

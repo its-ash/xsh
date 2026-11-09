@@ -1,0 +1,1 @@
+doc-valid-idents = ["SQLite", "OpenAI", "ConPTY", "XChaCha20", "Argon2id", "GitHub", "TOML", "JSON", "WebSocket", "WezTerm", "FSEvents", ".."]

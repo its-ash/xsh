@@ -1,0 +1,55 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/rushy-core",
+    "crates/rushy-pty",
+    "crates/rushy-tui",
+    "crates/rushy-bundles",
+    "crates/rushy-ai",
+    "crates/rushy-history",
+    "crates/rushy-config",
+    "crates/rushy-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/its-ash/rushy"
+
+[workspace.dependencies]
+anyhow = "1"
+argon2 = "0.5"
+async-trait = "0.1"
+base64 = "0.22"
+chacha20poly1305 = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+figment = { version = "0.10", features = ["toml", "env"] }
+globset = "0.4"
+hex = "0.4"
+keyring = { version = "3", features = ["apple-native"] }
+notify = "8"
+nucleo-matcher = "0.3"
+portable-pty = "0.9"
+rand = "0.8"
+ratatui = { version = "0.29", default-features = false, features = ["crossterm", "underline-color"] }
+reedline = "0.52"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tempfile = "3"
+toml_edit = { version = "0.23", features = ["serde"] }
+url = "2"
+vt100 = "0.15"
+zeroize = "1"
+
+[profile.release]
+strip = true

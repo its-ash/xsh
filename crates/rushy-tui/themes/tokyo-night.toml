@@ -1,0 +1,19 @@
+name = "tokyo-night"
+
+[colors]
+background = "#1a1b26"
+foreground = "#c0caf5"
+accent = "#7aa2f7"
+error = "#f7768e"
+success = "#9ece6a"
+prompt_user = "#7aa2f7"
+prompt_path = "#bb9af7"
+cursor = "#c0caf5"
+selection = "#33467c"
+ansi = [
+    "#15161e", "#f7768e", "#9ece6a", "#e0af68", "#7aa2f7", "#bb9af7", "#7dcfff", "#a9b1d6",
+    "#414868", "#f7768e", "#9ece6a", "#e0af68", "#7aa2f7", "#bb9af7", "#7dcfff", "#c0caf5",
+]
+
+[prompt]
+format = "{user} {path} {git}{node}{python}❯ "

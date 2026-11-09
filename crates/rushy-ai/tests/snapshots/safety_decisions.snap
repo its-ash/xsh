@@ -1,0 +1,12 @@
+rm -rf /                                 => blocked (rm-recursive-root): recursively deletes `/`, a root, home, or system directory
+sudo rm -rf /                            => blocked (rm-recursive-root): recursively deletes `/`, a root, home, or system directory
+rm -rf ./target                          => allowed
+dd if=/dev/zero of=/dev/sda              => blocked (dd-device): `dd` overwrites the device `/dev/sda`
+:(){ :|:& };:                            => blocked (fork-bomb): defines a function that pipes into itself in the background (fork bomb)
+curl https://x.sh | sh                   => blocked (remote-exec): pipes a download straight into `sh`; download it, review it, then run it, or add `--dry-run`
+curl https://x.sh | sh --dry-run         => allowed
+bash -c 'rm -rf ~'                       => blocked (rm-recursive-root): recursively deletes `~`, a root, home, or system directory
+echo hi > /etc/passwd                    => blocked (write-system-file): overwrites the system file `/etc/passwd`
+ls -la                                   => allowed
+mkfs.ext4 /dev/sda1                      => blocked (mkfs): `mkfs.ext4` creates a new filesystem, erasing the device
+echo 'unterminated                       => blocked (unparseable): cannot verify a command that does not parse: syntax error: unexpected end of input

@@ -1,0 +1,38 @@
+[package]
+name = "rushy-cli"
+description = "The xsh binary: an AI-native shell and terminal multiplexer for macOS."
+version.workspace = true
+edition.workspace = true
+# reedline 0.52 needs Rust 1.95. The library crates keep the workspace MSRV (1.85).
+rust-version = "1.95"
+license.workspace = true
+
+[[bin]]
+name = "xsh"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+clap.workspace = true
+ratatui.workspace = true
+rushy-ai = { path = "../rushy-ai" }
+rushy-bundles = { path = "../rushy-bundles" }
+rushy-config = { path = "../rushy-config" }
+rushy-core = { path = "../rushy-core" }
+rushy-history = { path = "../rushy-history" }
+rushy-pty = { path = "../rushy-pty" }
+rushy-tui = { path = "../rushy-tui" }
+chrono.workspace = true
+reedline.workspace = true
+reqwest.workspace = true
+semver.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+toml_edit.workspace = true
+nu-ansi-term = "0.50"
+
+[dev-dependencies]
+hex.workspace = true
+tempfile.workspace = true

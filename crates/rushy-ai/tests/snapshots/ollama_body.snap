@@ -1,0 +1,61 @@
+{
+  "messages": [
+    {
+      "content": "You turn a request into ONE command for the xsh shell.\nxsh supports: pipelines (|), redirection (>, >>, <), `;` between commands, background (&), $VAR and ${VAR}, single and double quotes. It has no &&, ||, loops, functions, subshells, or command substitution.\nReply with JSON only: {\"command\": \"...\", \"explanation\": \"one short sentence\"}.\nPrefer safe, read-only commands. Never use sudo unless the request needs it. If the request is unclear or impossible, return an empty command and explain why.\n\n# Shell context\nOS: macos\nWorking directory: /work/demo\n$SHELL: /bin/zsh (commands run in xsh, a POSIX-like shell without loops or subshells)\nActive bundles: git\nDirectory listing:\n  Cargo.toml\n  src/\nRecent commands:\n  ls\n  cargo build\n",
+      "role": "system"
+    },
+    {
+      "content": "hi",
+      "role": "user"
+    },
+    {
+      "content": "",
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "function": {
+            "arguments": {
+              "command": "ls"
+            },
+            "name": "run_command"
+          }
+        }
+      ]
+    },
+    {
+      "content": "ok",
+      "role": "tool"
+    }
+  ],
+  "model": "llama3.1:8b",
+  "options": {
+    "num_predict": 1024,
+    "temperature": 0.20000000298023224
+  },
+  "stream": false,
+  "tools": [
+    {
+      "function": {
+        "description": "Run one command in the user's xsh shell and return its exit status, stdout, and stderr.",
+        "name": "run_command",
+        "parameters": {
+          "properties": {
+            "command": {
+              "description": "The command line to run.",
+              "type": "string"
+            },
+            "reason": {
+              "description": "Why this step is needed.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    }
+  ]
+}

@@ -1,0 +1,3 @@
+# Static aliases: parsed, never executed.
+alias dprune='docker system prune'
+alias dcb='docker compose build'

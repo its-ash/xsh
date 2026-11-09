@@ -1,0 +1,57 @@
+{
+  "max_tokens": 1024,
+  "messages": [
+    {
+      "content": "hi",
+      "role": "user"
+    },
+    {
+      "content": [
+        {
+          "id": "c1",
+          "input": {
+            "command": "ls"
+          },
+          "name": "run_command",
+          "type": "tool_use"
+        }
+      ],
+      "role": "assistant"
+    },
+    {
+      "content": [
+        {
+          "content": "ok",
+          "tool_use_id": "c1",
+          "type": "tool_result"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "model": "claude-opus-5-5",
+  "system": "You turn a request into ONE command for the xsh shell.\nxsh supports: pipelines (|), redirection (>, >>, <), `;` between commands, background (&), $VAR and ${VAR}, single and double quotes. It has no &&, ||, loops, functions, subshells, or command substitution.\nReply with JSON only: {\"command\": \"...\", \"explanation\": \"one short sentence\"}.\nPrefer safe, read-only commands. Never use sudo unless the request needs it. If the request is unclear or impossible, return an empty command and explain why.\n\n# Shell context\nOS: macos\nWorking directory: /work/demo\n$SHELL: /bin/zsh (commands run in xsh, a POSIX-like shell without loops or subshells)\nActive bundles: git\nDirectory listing:\n  Cargo.toml\n  src/\nRecent commands:\n  ls\n  cargo build\n",
+  "temperature": 0.20000000298023224,
+  "tools": [
+    {
+      "description": "Run one command in the user's xsh shell and return its exit status, stdout, and stderr.",
+      "input_schema": {
+        "properties": {
+          "command": {
+            "description": "The command line to run.",
+            "type": "string"
+          },
+          "reason": {
+            "description": "Why this step is needed.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command"
+        ],
+        "type": "object"
+      },
+      "name": "run_command"
+    }
+  ]
+}

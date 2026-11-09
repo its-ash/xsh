@@ -1,0 +1,22 @@
+[package]
+name = "rsync"
+version = "0.1.0"
+description = "Safe rsync presets for copying, moving, and syncing."
+author = "rushy contributors"
+license = "MIT"
+min_rushy_version = "0.1.0"
+
+[bundle]
+requires_commands = ["rsync"]
+
+[aliases]
+rsync-copy = "rsync -avz --progress -h"
+rsync-move = "rsync -avz --progress -h --remove-source-files"
+rsync-update = "rsync -avzu --progress -h"
+rsync-synchronize = "rsync -avzu --delete --progress -h"
+
+[completion]
+commands = ["rsync"]
+
+[completion.subcommands]
+rsync = ["--archive", "--compress", "--delete", "--dry-run", "--exclude", "--human-readable", "--progress", "--verbose"]

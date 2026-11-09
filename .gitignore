@@ -1,0 +1,10 @@
+/target
+/.cargo-home
+/.rustup-home
+/.claude
+/.task-x
+/.superdesign
+/app/.build
+/app/.swiftpm
+.DS_Store
+*.rs.bk

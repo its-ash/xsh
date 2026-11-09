@@ -1,0 +1,15 @@
+{
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a security reviewer for shell commands that an AI proposed.\nDecide if running the command could destroy data, change system settings, leak secrets or credentials, download and execute code, or affect machines other than this one, without the user clearly asking for it. Read-only and project-local build or test commands are safe.\nReply with JSON only: {\"safe\": true|false, \"reason\": \"one sentence\"}.\n\n# Shell context\nOS: macos\nWorking directory: /work/demo\n$SHELL: /bin/zsh (commands run in xsh, a POSIX-like shell without loops or subshells)\nActive bundles: git\nDirectory listing:\n  Cargo.toml\n  src/\nRecent commands:\n  ls\n  cargo build\n"
+    },
+    {
+      "role": "user",
+      "content": "Command: ls -la"
+    }
+  ],
+  "tools": [],
+  "temperature": 0.2,
+  "max_tokens": 1024
+}

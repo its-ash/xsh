@@ -1,0 +1,19 @@
+name = "solarized-dark"
+
+[colors]
+background = "#002b36"
+foreground = "#839496"
+accent = "#268bd2"
+error = "#dc322f"
+success = "#859900"
+prompt_user = "#268bd2"
+prompt_path = "#2aa198"
+cursor = "#93a1a1"
+selection = "#073642"
+ansi = [
+    "#073642", "#dc322f", "#859900", "#b58900", "#268bd2", "#d33682", "#2aa198", "#eee8d5",
+    "#002b36", "#cb4b16", "#586e75", "#657b83", "#839496", "#6c71c4", "#93a1a1", "#fdf6e3",
+]
+
+[prompt]
+format = "{user} {path} {git}{node}{python}❯ "

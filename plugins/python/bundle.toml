@@ -1,0 +1,34 @@
+[package]
+name = "python"
+version = "0.1.0"
+description = "Python version prompt segment and virtualenv helpers."
+author = "rushy contributors"
+license = "MIT"
+min_rushy_version = "0.1.0"
+
+[bundle]
+detect = ["pyproject.toml"]
+requires_commands = ["python3"]
+
+[env]
+PYTHONDONTWRITEBYTECODE = "1"
+
+[aliases]
+py = "python3"
+pyv = "python3 --version"
+mkvenv = "python3 -m venv .venv"
+pyserve = "python3 -m http.server"
+pytest-q = "python3 -m pytest -q"
+
+[prompt]
+segment = "python"
+color = "yellow"
+format = " py {version} "
+priority = 40
+max_width = 16
+
+[completion]
+commands = ["python3"]
+
+[completion.subcommands]
+python3 = ["-c", "-m", "-V", "--version"]

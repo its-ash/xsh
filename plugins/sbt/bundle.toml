@@ -1,0 +1,25 @@
+[package]
+name = "sbt"
+version = "0.1.0"
+description = "sbt aliases for Scala builds."
+author = "rushy contributors"
+license = "MIT"
+min_rushy_version = "0.1.0"
+
+[bundle]
+detect = ["build.sbt"]
+requires_commands = ["sbt"]
+
+[aliases]
+sbc = "sbt compile"
+sbt-test = "sbt test"
+sbr = "sbt run"
+sbcl = "sbt clean"
+sbp = "sbt package"
+sbcc = "sbt ~compile"
+
+[completion]
+commands = ["sbt"]
+
+[completion.subcommands]
+sbt = ["clean", "compile", "console", "package", "publishLocal", "reload", "run", "test", "update"]
