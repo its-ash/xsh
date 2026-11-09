@@ -2,7 +2,8 @@
 //! functions, built-ins, external processes, and redirection.
 
 use std::future::Future;
-use std::io::{self, ErrorKind, Read as _, Write as _};
+use std::io::{self, ErrorKind, IsTerminal as _, Read as _, Write as _};
+use std::os::fd::OwnedFd;
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -24,6 +25,10 @@ use crate::test::{self, Tok};
 use crate::{Result, glob, parser};
 
 const TEE_KEEP: usize = 32 * 1024;
+/// How long to wait for a tee to drain after its command has exited. A
+/// helper the command left running (an SSH control master, a credential
+/// daemon) can hold the output open; the shell must not wait for it.
+const TEE_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
 const MAX_NESTING: u32 = 1000;
 
 /// A boxed future, for recursion.
@@ -118,6 +123,51 @@ enum Plan {
     ErrTee,
     Fill(Arc<Mutex<Vec<u8>>>),
     SlotChild(Arc<Mutex<Slot>>),
+    /// Standard error goes to a pseudo-terminal; this reads its other end.
+    ErrPty(PtyReader),
+}
+
+/// The reading end of a pseudo-terminal. It is non-blocking and read
+/// through the reactor like a pipe, so a helper that the command leaves
+/// running (and that keeps the terminal open) ties up no thread.
+type PtyReader = tokio::net::unix::pipe::Receiver;
+
+/// Opens a pseudo-terminal for a child's standard error, so programs that
+/// show progress only on a terminal (`git clone`, `curl`, `cargo`) behave
+/// as they do in any other terminal while xsh keeps a copy of the text.
+/// Returns the reading end and the child's end, or `None` when our own
+/// standard error is not a terminal or no pseudo-terminal is available.
+fn err_pty() -> Option<(PtyReader, OwnedFd)> {
+    use rustix::fs::{Mode, OFlags, open};
+    use rustix::io::{FdFlags, fcntl_setfd, ioctl_fionbio};
+    use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+    use rustix::termios::{
+        OptionalActions, OutputModes, tcgetattr, tcgetwinsize, tcsetattr, tcsetwinsize,
+    };
+    let stderr = io::stderr();
+    if !stderr.is_terminal() {
+        return None;
+    }
+    let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).ok()?;
+    // Close-on-exec, so no other child keeps the terminal open. (The
+    // command still gets the child end: spawning duplicates it to fd 2.)
+    fcntl_setfd(&master, FdFlags::CLOEXEC).ok()?;
+    ioctl_fionbio(&master, true).ok()?;
+    grantpt(&master).ok()?;
+    unlockpt(&master).ok()?;
+    let name = ptsname(&master, Vec::new()).ok()?;
+    let flags = OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC;
+    let slave = open(name.as_c_str(), flags, Mode::empty()).ok()?;
+    // Pass bytes through unchanged (no "\n" to "\r\n" translation).
+    if let Ok(mut t) = tcgetattr(&slave) {
+        t.output_modes.remove(OutputModes::OPOST);
+        let _ = tcsetattr(&slave, OptionalActions::Now, &t);
+    }
+    if let Ok(size) = tcgetwinsize(&stderr) {
+        let _ = tcsetwinsize(&slave, size);
+    }
+    let reader = PtyReader::from_owned_fd_unchecked(master).ok()?;
+    Some((reader, slave))
 }
 
 pub(crate) fn exit_code(status: ExitStatus) -> i32 {
@@ -665,13 +715,13 @@ impl<'a> Ctx<'a> {
         let code = exit_code(status);
         for r in readers {
             match r {
-                Reader::OutTee(h) => {
-                    if let Ok(b) = h.await {
+                Reader::OutTee(mut h) => {
+                    if let Ok(Ok(b)) = tokio::time::timeout(TEE_GRACE, &mut h).await {
                         self.state.push_stdout(&b);
                     }
                 }
-                Reader::ErrTee(h) => {
-                    if let Ok(b) = h.await {
+                Reader::ErrTee(mut h) => {
+                    if let Ok(Ok(b)) = tokio::time::timeout(TEE_GRACE, &mut h).await {
                         self.state.push_stderr(&b);
                     }
                 }
@@ -809,7 +859,10 @@ impl<'a> Ctx<'a> {
                 }
             }
             Sink::Stderr => {
-                if (self.state.capture_stderr() || self.state.log_enabled()) && !bg {
+                let capture = self.state.capture_stderr() && !self.state.log_enabled();
+                if let Some((reader, slave)) = (is_err && capture && !bg).then(err_pty).flatten() {
+                    (Stdio::from(slave), Plan::ErrPty(reader))
+                } else if (self.state.capture_stderr() || self.state.log_enabled()) && !bg {
                     (Stdio::piped(), Plan::ErrTee)
                 } else if is_err {
                     (Stdio::inherit(), Plan::Direct)
@@ -910,9 +963,11 @@ impl<'a> Ctx<'a> {
                     g.child = child.stdout.take();
                 }
             }
+            Plan::ErrPty(f) => readers.push(Reader::ErrTee(tee(f, false))),
         }
         match err_plan {
             Plan::Direct | Plan::SlotChild(_) => {}
+            Plan::ErrPty(f) => readers.push(Reader::ErrTee(tee(f, false))),
             Plan::OutTee => {
                 readers.extend(child.stderr.take().map(|s| Reader::OutTee(tee(s, true))));
             }

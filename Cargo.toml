@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0 OR MIT"
@@ -39,6 +39,7 @@ ratatui = { version = "0.29", default-features = false, features = ["crossterm",
 reedline = "0.52"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
+rustix = { version = "1", default-features = false, features = ["std", "pty", "termios"] }
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

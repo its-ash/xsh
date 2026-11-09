@@ -30,6 +30,7 @@ export XSH_HISTORY__KEY_SOURCE=passphrase XSH_HISTORY_PASSPHRASE=test
 - [ ] `x=1; sh -c 'echo [$x]'` prints `[]`. `export x; sh -c 'echo [$x]'` prints `[1]`. `export -n x` hides it again.
 - [ ] `export A=1`, `echo $A ${A} $? $$`, `unset A`.
 - [ ] `echo hi | wc -c` prints `3`; `echo a > f; echo b >> f; wc -l < f` prints `2`.
+- [ ] With `shell.capture_stderr = true` (the default), `git clone https://github.com/git/git /tmp/g` shows live progress (`Receiving objects: 12% ...`) on one updating line, the same as in Terminal.app. `sh -c '[ -t 2 ] && echo tty'` prints `tty`. `ls /nope`, then `ai fix`: the error text is still sent.
 
 ## 3. History and `Ctrl-R`
 

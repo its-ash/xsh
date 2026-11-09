@@ -143,7 +143,7 @@ key_source = "auto"         # auto | keyring | passphrase
 
 A project file (`.xsh.toml`) may only set `[shell]`, `[ui]`, and `[mux]`. A repository you clone cannot change the registry or the history settings. Example variable: `XSH_UI__THEME=mono`.
 
-Note on `capture_stderr`: when it is on, a foreground command's standard error is a pipe, so some programs turn off colors or progress bars. xsh still prints everything unchanged. Set it to `false` if that matters to you; `ai fix` then has no error text to send.
+Note on `capture_stderr`: when it is on and xsh runs in a terminal, a foreground command's standard error is a pseudo-terminal that xsh reads, so programs still see a terminal and keep their colors and progress bars (`git clone`, `curl`, `cargo`). xsh prints everything unchanged. Set it to `false` if you see a difference; `ai fix` then has no error text to send.
 
 ### AI
 

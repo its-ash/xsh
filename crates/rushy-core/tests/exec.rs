@@ -190,6 +190,41 @@ async fn failed_command_stderr_is_captured_for_ai_fix() -> TestResult {
 }
 
 #[tokio::test]
+async fn captured_stderr_is_still_a_terminal() -> TestResult {
+    use std::io::IsTerminal as _;
+    if !std::io::stderr().is_terminal() {
+        println!("skipped: standard error is not a terminal");
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let mut sh = shell(dir.path());
+    sh.state_mut().set_capture_stderr(true);
+    sh.run_line("sh -c '[ -t 2 ] && echo tty > t.txt; echo boom >&2; exit 3'")
+        .await?;
+    assert_eq!(read(dir.path(), "t.txt").await?, "tty\n");
+    let f = sh.last_failure().ok_or("no failure recorded")?;
+    assert_eq!((f.exit_code, f.stderr.as_str()), (3, "boom\n"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_helper_left_running_does_not_hold_the_prompt() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut sh = shell(dir.path());
+    sh.state_mut().set_capture_stderr(true);
+    let start = std::time::Instant::now();
+    // The background `sleep` keeps the captured standard error open.
+    sh.run_line("sh -c 'sleep 5 > /dev/null &'").await?;
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        start.elapsed()
+    );
+    assert_eq!(sh.last_status(), 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn log_collects_stdout_and_stderr_of_every_command() -> TestResult {
     let dir = tempfile::tempdir()?;
     let mut sh = shell(dir.path());
