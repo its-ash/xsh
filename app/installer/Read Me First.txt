@@ -1,0 +1,20 @@
+Install xsh
+===========
+
+1. Drag xsh.app onto the Applications folder in this window.
+
+2. Open Terminal and run this command:
+
+       xattr -dr com.apple.quarantine /Applications/xsh.app
+
+   Why: xsh has an ad hoc signature, not an Apple Developer ID. macOS marks
+   every downloaded app with a quarantine flag, and for an app like this it
+   then says "xsh is damaged" or "xsh cannot be opened". The command removes
+   only that flag from xsh.app.
+
+3. Open xsh from Applications. Press Cmd-, for Settings.
+
+Updates: xsh checks for a new release once a day and asks before it
+installs one. You do not need this command again after an update.
+
+Source, checksums, and help: https://github.com/its-ash/xsh

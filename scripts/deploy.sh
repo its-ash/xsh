@@ -1,7 +1,8 @@
 #!/bin/sh
 # Builds the app with `make build`, commits with a message from a local model,
-# pushes to main, and publishes a GitHub release with the gh CLI. The app reads
-# that release to update itself.
+# pushes to main, and publishes a GitHub release with the gh CLI. The release
+# holds a DMG for people (the website links to it) and a .tar.gz that the app
+# reads to update itself. GitHub Pages serves index.html from main.
 #
 # Usage: make deploy [VERSION=1.2.3] [LLM_URL=...] [LLM_MODEL=...]
 # VERSION defaults to the next patch version.
@@ -19,7 +20,7 @@ die() {
     exit 1
 }
 
-for tool in git gh make curl shasum tar; do
+for tool in git gh make curl shasum tar hdiutil; do
     command -v "$tool" > /dev/null || die "$tool is not installed"
 done
 
@@ -78,6 +79,17 @@ cp target/xsh.app/Contents/MacOS/xsh "$work/$name/"
 tar -C "$work" -czf "$dist/$name.tar.gz" "$name"
 (cd "$dist" && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
 
+# The DMG: the app, a link to /Applications to drag it onto, and the read-me
+# with the command that removes the quarantine flag.
+echo "deploy: make $name.dmg"
+vol="$work/dmg"
+mkdir "$vol"
+cp -R target/xsh.app "$vol/"
+ln -s /Applications "$vol/Applications"
+cp "app/installer/Read Me First.txt" "$vol/"
+hdiutil create -quiet -volname "xsh $version" -srcfolder "$vol" -fs HFS+ -format UDZO -ov "$dist/$name.dmg"
+(cd "$dist" && shasum -a 256 "$name.dmg" > "$name.dmg.sha256")
+
 git add -A
 secrets="$(git diff --cached --name-only | grep -Ei '(^|/)(\.env(\..*)?|.*\.(pem|key|p12)|id_rsa|id_ed25519)$' || true)"
 [ -z "$secrets" ] || die "these staged files can hold secrets: $secrets"
@@ -99,3 +111,14 @@ git push --atomic origin main "$tag" \
 gh release create "$tag" "$dist"/* --repo "$REPO" --title "$tag" --generate-notes --verify-tag \
     || die "the release failed. The push is done. Run: gh release create $tag $dist/* --repo $REPO --title $tag --generate-notes --verify-tag"
 echo "deploy: published $tag"
+
+# GitHub Pages serves index.html from the root of main. Turn it on once.
+if ! gh api "repos/$REPO/pages" > /dev/null 2>&1; then
+    if gh api -X POST "repos/$REPO/pages" -f 'source[branch]=main' -f 'source[path]=/' > /dev/null 2>&1; then
+        echo "deploy: turned on GitHub Pages for main"
+    else
+        echo "deploy: could not turn on GitHub Pages. Do it in Settings > Pages (branch main, folder /)" >&2
+    fi
+fi
+owner="${REPO%%/*}"
+echo "deploy: website https://$owner.github.io/${REPO#*/}/"

@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>xsh: the AI-native terminal for macOS</title>
+<meta name="description" content="xsh is a native macOS terminal app and shell with AI help, split panes, a multiplexer, declarative plugins, and encrypted history.">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="assets/xsh.svg" type="image/svg+xml">
+<style>
+  :root {
+    --bg: #f5f5f7;
+    --bg-elevated: #ffffff;
+    --label: #1d1d1f;
+    --label-2: #6e6e73;
+    --label-3: #86868b;
+    --separator: rgba(0, 0, 0, 0.1);
+    --fill: rgba(0, 0, 0, 0.05);
+    --accent: #0071e3;
+    --accent-hover: #0077ed;
+    --link: #0066cc;
+    --toolbar: rgba(245, 245, 247, 0.72);
+    --shadow: 0 2px 6px rgba(0, 0, 0, 0.06), 0 12px 40px rgba(0, 0, 0, 0.12);
+    --term-bg: #1e1e20;
+    --term-fg: #e8e8ed;
+    --radius-l: 18px;
+    --radius-m: 12px;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Monaco, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #000000;
+      --bg-elevated: #1c1c1e;
+      --label: #f5f5f7;
+      --label-2: #a1a1a6;
+      --label-3: #86868b;
+      --separator: rgba(255, 255, 255, 0.14);
+      --fill: rgba(255, 255, 255, 0.07);
+      --accent: #0a84ff;
+      --accent-hover: #409cff;
+      --link: #2997ff;
+      --toolbar: rgba(22, 22, 23, 0.72);
+      --shadow: 0 2px 6px rgba(0, 0, 0, 0.4), 0 12px 40px rgba(0, 0, 0, 0.6);
+      --term-bg: #161618;
+    }
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Helvetica, Arial, sans-serif;
+    font-size: 17px;
+    line-height: 1.47;
+    letter-spacing: -0.022em;
+    color: var(--label);
+    background: var(--bg);
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--link); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  :focus-visible { outline: 3px solid color-mix(in srgb, var(--accent) 60%, transparent); outline-offset: 2px; border-radius: 6px; }
+  code { font-family: var(--mono); font-size: 0.9em; }
+
+  /* Toolbar */
+  .toolbar {
+    position: sticky; top: 0; z-index: 10;
+    background: var(--toolbar);
+    backdrop-filter: saturate(180%) blur(20px);
+    -webkit-backdrop-filter: saturate(180%) blur(20px);
+    border-bottom: 1px solid var(--separator);
+  }
+  .toolbar-inner {
+    max-width: 1024px; margin: 0 auto; padding: 0 22px;
+    height: 52px; display: flex; align-items: center; gap: 28px;
+  }
+  .brand { display: flex; align-items: center; gap: 8px; font-weight: 600; color: var(--label); font-size: 19px; }
+  .brand:hover { text-decoration: none; }
+  .brand img { width: 26px; height: 26px; }
+  .toolbar nav { display: flex; gap: 24px; margin-left: auto; font-size: 13px; }
+  .toolbar nav a { color: var(--label-2); }
+  .toolbar nav a:hover { color: var(--label); text-decoration: none; }
+  .toolbar .btn { padding: 5px 14px; font-size: 13px; }
+  @media (max-width: 640px) { .toolbar nav { display: none; } .toolbar .btn { margin-left: auto; } }
+
+  /* Buttons */
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 11px 22px; border-radius: 980px;
+    font-size: 17px; font-weight: 500; line-height: 1.2;
+    background: var(--accent); color: #fff; border: 0; cursor: pointer;
+    transition: background-color 0.2s ease;
+  }
+  .btn:hover { background: var(--accent-hover); text-decoration: none; }
+  .btn.secondary { background: transparent; color: var(--link); padding-left: 8px; padding-right: 8px; }
+  .btn.secondary:hover { text-decoration: underline; background: transparent; }
+  .btn svg { width: 16px; height: 16px; }
+
+  /* Hero */
+  .hero { text-align: center; padding: 88px 22px 40px; max-width: 1024px; margin: 0 auto; }
+  .hero .icon { width: 128px; height: 128px; filter: drop-shadow(0 10px 24px rgba(0, 0, 0, 0.22)); }
+  .eyebrow { margin: 22px 0 6px; font-size: 21px; font-weight: 600; color: var(--label-2); letter-spacing: 0.011em; }
+  h1 {
+    margin: 0; font-size: clamp(44px, 8vw, 80px); line-height: 1.05; font-weight: 700; letter-spacing: -0.015em;
+  }
+  h1 .grad {
+    background: linear-gradient(90deg, #0a84ff, #5e5ce6 50%, #bf5af2);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  .lede { max-width: 640px; margin: 18px auto 30px; font-size: 21px; line-height: 1.38; color: var(--label-2); letter-spacing: 0.011em; }
+  .cta { display: flex; justify-content: center; align-items: center; flex-wrap: wrap; gap: 12px; }
+  .meta { margin-top: 14px; font-size: 13px; color: var(--label-3); letter-spacing: -0.01em; }
+
+  /* Window */
+  .window-wrap { max-width: 920px; margin: 48px auto 0; padding: 0 22px; }
+  .window {
+    border-radius: 12px; overflow: hidden; background: var(--term-bg);
+    box-shadow: var(--shadow), 0 0 0 1px var(--separator);
+    text-align: left;
+  }
+  .titlebar {
+    height: 38px; display: flex; align-items: center; padding: 0 14px; gap: 8px;
+    background: linear-gradient(#3a3a3c, #2c2c2e); border-bottom: 1px solid #000;
+    position: relative;
+  }
+  .light { width: 12px; height: 12px; border-radius: 50%; box-shadow: inset 0 0 0 0.5px rgba(0,0,0,0.3); }
+  .light.r { background: #ff5f57; } .light.y { background: #febc2e; } .light.g { background: #28c840; }
+  .titlebar .title { position: absolute; left: 0; right: 0; text-align: center; font-size: 13px; font-weight: 600; color: #a1a1a6; pointer-events: none; }
+  .panes { display: grid; grid-template-columns: 1fr 1fr; }
+  .pane { padding: 16px 18px 20px; font: 13px/1.6 var(--mono); color: var(--term-fg); white-space: pre-wrap; word-break: break-word; min-height: 250px; }
+  .pane + .pane { border-left: 1px solid #000; }
+  .pane .bar { display: block; margin: -16px -18px 12px; padding: 4px 18px; font-size: 11px; color: #8e8e93; background: rgba(255,255,255,0.04); border-bottom: 1px solid rgba(255,255,255,0.06); }
+  .p { color: #64d2ff; } .b { color: #bf5af2; } .ok { color: #30d158; } .dim { color: #8e8e93; } .ai { color: #ffd60a; }
+  @media (max-width: 720px) { .panes { grid-template-columns: 1fr; } .pane + .pane { border-left: 0; border-top: 1px solid #000; } }
+
+  /* Sections */
+  section { max-width: 1024px; margin: 0 auto; padding: 96px 22px 0; }
+  h2 { margin: 0 0 12px; font-size: clamp(32px, 5vw, 48px); line-height: 1.08; font-weight: 700; letter-spacing: -0.003em; text-align: center; }
+  .sub { margin: 0 auto 44px; max-width: 620px; text-align: center; font-size: 19px; color: var(--label-2); letter-spacing: 0.012em; }
+
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }
+  @media (max-width: 900px) { .grid { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 600px) { .grid { grid-template-columns: 1fr; } }
+  .card { background: var(--bg-elevated); border-radius: var(--radius-l); padding: 28px; }
+  @media (prefers-color-scheme: light) { .card { box-shadow: 0 1px 2px rgba(0,0,0,0.04); } }
+  .card .glyph { width: 44px; height: 44px; border-radius: 11px; display: grid; place-items: center; margin-bottom: 18px; color: #fff; }
+  .card .glyph svg { width: 24px; height: 24px; }
+  .card h3 { margin: 0 0 6px; font-size: 19px; font-weight: 600; letter-spacing: 0.012em; }
+  .card p { margin: 0; font-size: 15px; color: var(--label-2); letter-spacing: -0.01em; }
+  .blue { background: linear-gradient(#409cff, #0a84ff); }
+  .purple { background: linear-gradient(#a78bfa, #5e5ce6); }
+  .pink { background: linear-gradient(#ff6ba0, #ff375f); }
+  .green { background: linear-gradient(#5be38a, #30d158); }
+  .orange { background: linear-gradient(#ffb340, #ff9f0a); }
+  .gray { background: linear-gradient(#a1a1a6, #636366); }
+
+  /* Install */
+  .steps { display: grid; gap: 16px; max-width: 720px; margin: 0 auto; counter-reset: step; }
+  .step { display: grid; grid-template-columns: 36px 1fr; gap: 16px; background: var(--bg-elevated); border-radius: var(--radius-l); padding: 22px 24px; }
+  .step::before {
+    counter-increment: step; content: counter(step);
+    width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center;
+    background: var(--fill); font-weight: 600; font-size: 15px; color: var(--label);
+  }
+  .step h3 { margin: 4px 0 4px; font-size: 17px; font-weight: 600; }
+  .step p { margin: 0; font-size: 15px; color: var(--label-2); }
+  .cmd {
+    margin-top: 12px; display: flex; align-items: center; gap: 10px;
+    background: var(--term-bg); color: var(--term-fg); border-radius: var(--radius-m);
+    padding: 10px 10px 10px 16px; font: 13px/1.5 var(--mono); overflow-x: auto;
+  }
+  .cmd code { flex: 1; white-space: nowrap; font-size: 13px; }
+  .cmd code::before { content: "$ "; color: #8e8e93; }
+  .copy {
+    flex: none; font: 500 12px -apple-system, BlinkMacSystemFont, sans-serif; letter-spacing: 0;
+    color: #fff; background: rgba(255,255,255,0.12); border: 0; border-radius: 7px; padding: 6px 11px; cursor: pointer;
+  }
+  .copy:hover { background: rgba(255,255,255,0.2); }
+  .note { max-width: 720px; margin: 18px auto 0; font-size: 13px; color: var(--label-3); text-align: center; }
+
+  footer { max-width: 1024px; margin: 96px auto 0; padding: 22px 22px 40px; border-top: 1px solid var(--separator); font-size: 12px; color: var(--label-3); display: flex; flex-wrap: wrap; gap: 8px 24px; }
+  footer a { color: var(--label-2); }
+  footer .spacer { flex: 1; }
+</style>
+</head>
+<body>
+
+<header class="toolbar">
+  <div class="toolbar-inner">
+    <a class="brand" href="#top" aria-label="xsh home"><img src="assets/xsh.svg" alt="">xsh</a>
+    <nav aria-label="Sections">
+      <a href="#features">Features</a>
+      <a href="#install">Install</a>
+      <a href="https://github.com/its-ash/xsh">GitHub</a>
+    </nav>
+    <a class="btn dl-link" href="https://github.com/its-ash/xsh/releases/latest">Download</a>
+  </div>
+</header>
+
+<main id="top">
+  <div class="hero">
+    <img class="icon" src="assets/xsh.svg" alt="The xsh app icon">
+    <p class="eyebrow">xsh for macOS</p>
+    <h1>A terminal that <span class="grad">understands you.</span></h1>
+    <p class="lede">A native terminal app and a shell, built in Swift and Rust. Ask for a command in plain words, split panes, keep sessions alive, and keep your history encrypted.</p>
+    <div class="cta">
+      <a class="btn dl-link" href="https://github.com/its-ash/xsh/releases/latest">
+        <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 1.5a.75.75 0 0 1 .75.75v7.19l2.22-2.22a.75.75 0 1 1 1.06 1.06l-3.5 3.5a.75.75 0 0 1-1.06 0l-3.5-3.5a.75.75 0 1 1 1.06-1.06l2.22 2.22V2.25A.75.75 0 0 1 8 1.5ZM2.75 12.5a.75.75 0 0 0 0 1.5h10.5a.75.75 0 0 0 0-1.5H2.75Z"/></svg>
+        Download for Mac
+      </a>
+      <a class="btn secondary" href="https://github.com/its-ash/xsh">View on GitHub &rsaquo;</a>
+    </div>
+    <p class="meta" id="release-meta">macOS 14 Sonoma or later &middot; Free and open source</p>
+  </div>
+
+  <div class="window-wrap" aria-hidden="true">
+    <div class="window">
+      <div class="titlebar">
+        <span class="light r"></span><span class="light y"></span><span class="light g"></span>
+        <span class="title">xsh — ~/code/app</span>
+      </div>
+      <div class="panes">
+<div class="pane"><span class="bar">%1 ● ai agent</span><span class="p">~/code/app</span> <span class="b">main*</span> ❯ <span class="ai">find the 5 largest files here</span>
+<span class="dim">✦ suggested command</span>
+find . -type f -exec du -h {} + | sort -rh | head -5
+<span class="dim">[Enter] run  [e] edit  [Esc] cancel</span>
+
+<span class="p">~/code/app</span> <span class="b">main*</span> ❯ ai explain tar -xzf b.tgz -C /tmp
+Unpacks b.tgz (gzip tar) into /tmp.
+  <span class="dim">-x extract  -z gunzip  -C change dir</span></div>
+<div class="pane"><span class="bar">%2 cargo test</span><span class="p">~/code/app</span> <span class="b">main*</span> ❯ cargo test
+running 42 tests
+test parser::pipes ... <span class="ok">ok</span>
+test jobs::background ... <span class="ok">ok</span>
+test history::search ... <span class="ok">ok</span>
+
+test result: <span class="ok">ok</span>. 42 passed; 0 failed</div>
+      </div>
+    </div>
+  </div>
+
+  <section id="features">
+    <h2>Everything a terminal should be.</h2>
+    <p class="sub">A complete replacement for Terminal and iTerm, with a shell that knows what you mean.</p>
+    <div class="grid">
+      <article class="card">
+        <div class="glyph purple"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l1.9 4.6L18.5 9.5 13.9 11.4 12 16l-1.9-4.6L5.5 9.5l4.6-1.9z"/><path d="M19 15l.8 2 2 .8-2 .8-.8 2-.8-2-2-.8 2-.8z"/></svg></div>
+        <h3>AI in the prompt</h3>
+        <p>Describe a task to get a command. Use <code>explain</code> and <code>fix</code>, or start an agent that asks before every step. Works with OpenAI, Anthropic, or Ollama.</p>
+      </article>
+      <article class="card">
+        <div class="glyph green"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l8 3v6c0 4.5-3.4 8.3-8 9-4.6-.7-8-4.5-8-9V6z"/><path d="M9 12l2 2 4-4"/></svg></div>
+        <h3>A safety guard</h3>
+        <p>Every command from the AI passes a safety check before it can run, and the agent stops after ten steps.</p>
+      </article>
+      <article class="card">
+        <div class="glyph blue"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M12 4v16M12 12h9"/></svg></div>
+        <h3>Native tabs and panes</h3>
+        <p>AppKit windows, native tabs, split panes, profiles, GPU drawing, find, and a global hotkey.</p>
+      </article>
+      <article class="card">
+        <div class="glyph orange"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></div>
+        <h3>Built-in multiplexer</h3>
+        <p>Sessions, windows, and splits like tmux. Detach, close the window, and attach again later.</p>
+      </article>
+      <article class="card">
+        <div class="glyph pink"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="10" width="16" height="11" rx="2.5"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg></div>
+        <h3>Encrypted history</h3>
+        <p>History is stored in SQLite with XChaCha20-Poly1305 encryption. The key is in your Keychain. Search it with fuzzy <code>Ctrl-R</code>.</p>
+      </article>
+      <article class="card">
+        <div class="glyph gray"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 7l-8-4-8 4 8 4z"/><path d="M4 12l8 4 8-4M4 17l8 4 8-4"/></svg></div>
+        <h3>Declarative bundles</h3>
+        <p>Plugins add aliases, prompt segments, and completions, and they can never run arbitrary code. Bundles are included for git, docker, npm, python, and more.</p>
+      </article>
+    </div>
+  </section>
+
+  <section id="install">
+    <h2>Install in a minute.</h2>
+    <p class="sub">xsh is free. Builds have an ad hoc signature, so macOS needs one extra command the first time.</p>
+    <div class="steps">
+      <div class="step"><div>
+        <h3>Download the disk image</h3>
+        <p>Get <a class="dl-link" href="https://github.com/its-ash/xsh/releases/latest">the latest .dmg</a> and open it.</p>
+      </div></div>
+      <div class="step"><div>
+        <h3>Drag xsh to Applications</h3>
+        <p>Drop <strong>xsh.app</strong> on the Applications folder in the window that opens.</p>
+      </div></div>
+      <div class="step"><div>
+        <h3>Allow it to open</h3>
+        <p>Open Terminal and run this command. It removes the quarantine flag that macOS adds to downloads.</p>
+        <div class="cmd"><code id="xattr">xattr -dr com.apple.quarantine /Applications/xsh.app</code><button class="copy" type="button" data-copy="xattr">Copy</button></div>
+      </div></div>
+      <div class="step"><div>
+        <h3>Open xsh</h3>
+        <p>Launch it from Applications and press <code>⌘,</code> for Settings. Updates install from inside the app.</p>
+      </div></div>
+    </div>
+    <p class="note">Prefer to build it yourself? <code>git clone https://github.com/its-ash/xsh &amp;&amp; cd xsh &amp;&amp; make build</code></p>
+  </section>
+</main>
+
+<footer>
+  <span>xsh is open source under the Apache 2.0 or MIT license.</span>
+  <span class="spacer"></span>
+  <a href="https://github.com/its-ash/xsh">Source</a>
+  <a href="https://github.com/its-ash/xsh/releases">Releases</a>
+  <a href="https://github.com/its-ash/xsh/issues">Report an issue</a>
+</footer>
+
+<script>
+  // Point every download link at the DMG of the latest release. Without
+  // network access the links stay on the releases page.
+  (async () => {
+    try {
+      const res = await fetch("https://api.github.com/repos/its-ash/xsh/releases/latest", {
+        headers: { Accept: "application/vnd.github+json" },
+      });
+      if (!res.ok) return;
+      const rel = await res.json();
+      const dmgs = (rel.assets || []).filter((a) => a.name.endsWith(".dmg"));
+      if (!dmgs.length) return;
+      const arm = dmgs.find((a) => a.name.includes("aarch64"));
+      const dmg = arm || dmgs[0];
+      document.querySelectorAll(".dl-link").forEach((a) => { a.href = dmg.browser_download_url; });
+      const chip = dmg.name.includes("aarch64") ? "Apple silicon" : "Intel";
+      const mb = Math.round(dmg.size / 1048576);
+      const meta = document.getElementById("release-meta");
+      meta.textContent = `${rel.tag_name} · ${chip} · ${mb} MB · macOS 14 Sonoma or later`;
+    } catch (_) { /* keep the fallback links */ }
+  })();
+
+  document.querySelectorAll(".copy").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const text = document.getElementById(btn.dataset.copy).textContent;
+      try {
+        await navigator.clipboard.writeText(text);
+        btn.textContent = "Copied";
+      } catch (_) {
+        btn.textContent = "Select and copy";
+      }
+      setTimeout(() => { btn.textContent = "Copy"; }, 1600);
+    });
+  });
+</script>
+</body>
+</html>
