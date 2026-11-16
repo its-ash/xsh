@@ -70,9 +70,8 @@ pub enum Sub {
     /// Install, remove, and inspect bundles.
     #[command(subcommand)]
     Bundle(BundleCmd),
-    /// AI helpers: explain, fix, suggest, agent.
-    #[command(subcommand)]
-    Ai(AiCmd),
+    /// AI helpers: `ai <question or command>` explains; also fix, suggest, agent, claude.
+    Ai(AiArgs),
     /// Show, search, export, and manage the encrypted command history.
     History(HistoryArgs),
     /// List themes, or switch to one and save the choice.
@@ -110,6 +109,14 @@ pub enum Sub {
     /// Bridge for the macOS app.
     #[command(hide = true, subcommand)]
     App(AppCmd),
+    /// MCP server for `ai claude`: passes each tool call to the xsh session
+    /// that started Claude Code.
+    #[command(hide = true)]
+    Mcp {
+        /// Socket of that session.
+        #[arg(long)]
+        socket: PathBuf,
+    },
 }
 
 /// `xsh app ...`: what the macOS app uses to read and change settings.
@@ -237,6 +244,18 @@ pub struct UpdateArgs {
     pub all: bool,
 }
 
+/// `xsh ai [--model MODEL] ...`
+#[derive(Debug, Args)]
+pub struct AiArgs {
+    /// Model for this command only, such as `gpt-4o` (default: the one in `ai.toml`).
+    /// With `ai claude`, a Claude Code model such as `sonnet`.
+    #[arg(long, global = true, value_name = "MODEL")]
+    pub model: Option<String>,
+    /// What to do.
+    #[command(subcommand)]
+    pub cmd: AiCmd,
+}
+
 /// `xsh ai ...`
 #[derive(Debug, Subcommand)]
 pub enum AiCmd {
@@ -263,8 +282,21 @@ pub enum AiCmd {
         #[arg(required = true, trailing_var_arg = true)]
         goal: Vec<String>,
     },
+    /// Let Claude Code work towards a goal. Its own tools are off: it can only
+    /// use the xsh tools, so every command passes the safety guard and your approval.
+    Claude {
+        /// Autopilot: run each command and edit without a question. The safety checks stay on.
+        #[arg(long)]
+        auto: bool,
+        /// The goal.
+        #[arg(required = true, trailing_var_arg = true)]
+        goal: Vec<String>,
+    },
     /// Show which provider and model are configured.
     Status,
+    /// `ai <text>`: any other text is explained, like `ai explain <text>`.
+    #[command(external_subcommand)]
+    Ask(Vec<String>),
 }
 
 /// `xsh history ...`
@@ -351,5 +383,53 @@ mod tests {
             assert!(Cli::try_parse_from(args).is_ok(), "{args:?}");
         }
         assert!(Cli::try_parse_from(["xsh", "bundle", "update"]).is_err());
+    }
+
+    #[test]
+    fn ai_text_without_subcommand_is_explain() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(["xsh", "ai", "what does", "tar", "-xzf", "do?"])?;
+        let Some(Sub::Ai(AiArgs {
+            cmd: AiCmd::Ask(words),
+            model: None,
+        })) = cli.sub
+        else {
+            return Err(clap::Error::new(clap::error::ErrorKind::InvalidSubcommand));
+        };
+        assert_eq!(words, ["what does", "tar", "-xzf", "do?"]);
+        let cli = Cli::try_parse_from(["xsh", "ai", "agent", "find", "big", "files"])?;
+        assert!(matches!(
+            cli.sub,
+            Some(Sub::Ai(AiArgs {
+                cmd: AiCmd::Agent { .. },
+                ..
+            }))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn ai_model_goes_before_or_after_the_mode() -> Result<(), clap::Error> {
+        for args in [
+            &["xsh", "ai", "--model", "gpt-4o", "explain", "ls"][..],
+            &["xsh", "ai", "explain", "--model", "gpt-4o", "ls"],
+            &["xsh", "ai", "--model", "gpt-4o", "what", "is", "ls"],
+        ] {
+            let cli = Cli::try_parse_from(args)?;
+            let Some(Sub::Ai(a)) = cli.sub else {
+                return Err(clap::Error::new(clap::error::ErrorKind::InvalidSubcommand));
+            };
+            assert_eq!(a.model.as_deref(), Some("gpt-4o"), "{args:?}");
+        }
+        let cli = Cli::try_parse_from(["xsh", "ai", "claude", "--auto", "fix", "the", "tests"])?;
+        let Some(Sub::Ai(AiArgs {
+            cmd: AiCmd::Claude { auto, goal },
+            ..
+        })) = cli.sub
+        else {
+            return Err(clap::Error::new(clap::error::ErrorKind::InvalidSubcommand));
+        };
+        assert!(auto);
+        assert_eq!(goal, ["fix", "the", "tests"]);
+        Ok(())
     }
 }

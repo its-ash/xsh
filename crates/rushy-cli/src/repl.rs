@@ -149,6 +149,31 @@ fn escape(value: &str) -> String {
     out
 }
 
+/// The `items` whose key starts with `typed`; with `fuzzy`, the ones that
+/// match it fuzzily instead, best first: `dwn` finds `Downloads`, `--nv`
+/// finds `--no-verify`.
+///
+/// The completer asks for fuzzy matches only when no prefix match of any
+/// kind exists, so `Tab` still completes a unique prefix at once.
+fn pick_words<'a, T>(
+    items: &'a [T],
+    key: impl Fn(&T) -> &str,
+    typed: &str,
+    fuzzy: bool,
+) -> Vec<&'a T> {
+    if !fuzzy {
+        return items.iter().filter(|i| key(i).starts_with(typed)).collect();
+    }
+    if typed.is_empty() {
+        return Vec::new();
+    }
+    let keys: Vec<&str> = items.iter().map(&key).collect();
+    rushy_history::fuzzy::rank_literal(typed, &keys)
+        .into_iter()
+        .filter_map(|i| items.get(i))
+        .collect()
+}
+
 fn suggestion(value: String, span: Span) -> Suggestion {
     Suggestion {
         value,
@@ -158,22 +183,32 @@ fn suggestion(value: String, span: Span) -> Suggestion {
 }
 
 /// Commands: built-ins, aliases, bundle commands, and `PATH` executables.
-fn command_matches(data: &CompData, prefix: &str, span: Span) -> Vec<Suggestion> {
+fn command_matches(data: &CompData, prefix: &str, span: Span, fuzzy: bool) -> Vec<Suggestion> {
     let mut seen = HashSet::new();
-    data.commands
+    let all: Vec<&String> = data
+        .commands
         .iter()
         .chain(&data.path_commands)
-        .filter(|c| c.starts_with(prefix) && seen.insert((*c).clone()))
+        .filter(|c| seen.insert(c.as_str()))
+        .collect();
+    pick_words(&all, |c| c.as_str(), prefix, fuzzy)
+        .into_iter()
         .take(MAX_SUGGESTIONS)
-        .map(|c| suggestion(c.clone(), span))
+        .map(|c| suggestion((*c).clone(), span))
         .collect()
 }
 
 /// First-argument candidates of `cmd` from the active bundles.
-fn sub_matches(data: &CompData, cmd: &str, prefix: &str, span: Span) -> Vec<Suggestion> {
+fn sub_matches(
+    data: &CompData,
+    cmd: &str,
+    prefix: &str,
+    span: Span,
+    fuzzy: bool,
+) -> Vec<Suggestion> {
     data.subs.get(cmd).map_or_else(Vec::new, |subs| {
-        subs.iter()
-            .filter(|s| s.starts_with(prefix))
+        pick_words(subs, String::as_str, prefix, fuzzy)
+            .into_iter()
             .take(MAX_SUGGESTIONS)
             .map(|s| suggestion(s.clone(), span))
             .collect()
@@ -230,13 +265,16 @@ fn complete_files(
 }
 
 /// File names that match `prefix` when case is ignored, used when the exact
-/// match finds nothing (`doc<Tab>` finds `Documents/`).
-fn complete_files_nocase(
+/// match finds nothing (`doc<Tab>` finds `Documents/`). With `fuzzy`, the
+/// names that match it fuzzily instead (`dwn<Tab>` finds `Downloads/`).
+/// Only the last part of the path is matched loosely.
+fn complete_files_loose(
     data: &CompData,
     home: Option<&str>,
     prefix: &str,
     span: Span,
     quoted: bool,
+    fuzzy: bool,
 ) -> Vec<Suggestion> {
     let cut = prefix.rfind(['/', '\\']).map_or(0, |i| i + 1);
     let (dir, base) = prefix.split_at(cut);
@@ -249,16 +287,28 @@ fn complete_files_nocase(
     let Ok(entries) = std::fs::read_dir(&root) else {
         return Vec::new();
     };
-    let mut names: Vec<(String, bool)> = entries
+    // Hidden files take part only when the typed name starts with a dot.
+    let mut all: Vec<(String, bool)> = entries
         .flatten()
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().into_owned();
-            (name.to_lowercase().starts_with(&lower)
-                && (!name.starts_with('.') || base.starts_with('.')))
-            .then(|| (name, e.path().is_dir()))
+            (!name.starts_with('.') || base.starts_with('.')).then(|| (name, e.path().is_dir()))
         })
         .collect();
-    names.sort();
+    all.sort();
+    let names: Vec<(String, bool)> = if !fuzzy {
+        all.into_iter()
+            .filter(|(name, _)| name.to_lowercase().starts_with(&lower))
+            .collect()
+    } else if base.is_empty() {
+        Vec::new()
+    } else {
+        let keys: Vec<&str> = all.iter().map(|(name, _)| name.as_str()).collect();
+        rushy_history::fuzzy::rank_literal(base, &keys)
+            .into_iter()
+            .filter_map(|i| all.get(i).cloned())
+            .collect()
+    };
     names
         .into_iter()
         .take(MAX_SUGGESTIONS)
@@ -270,8 +320,14 @@ fn complete_files_nocase(
 }
 
 /// Arguments that depend on the command: SSH hosts, `make` targets,
-/// `npm run` scripts, git branches, and `xsh config` keys.
-fn context_matches(data: &CompData, args: &[&String], prefix: &str) -> Option<Vec<String>> {
+/// `npm run` scripts, git branches, and `xsh config` keys. Those that start
+/// with `prefix`; with `fuzzy`, those that match it fuzzily.
+fn context_matches(
+    data: &CompData,
+    args: &[&String],
+    prefix: &str,
+    fuzzy: bool,
+) -> Option<Vec<String>> {
     let cmd = args.first()?.as_str();
     let sub = args.get(1).map(|s| s.as_str());
     let list = match (cmd, sub) {
@@ -291,7 +347,151 @@ fn context_matches(data: &CompData, args: &[&String], prefix: &str) -> Option<Ve
         ("unset" | "export", _) => data.vars.clone(),
         _ => return None,
     };
-    let out: Vec<String> = list.into_iter().filter(|s| s.starts_with(prefix)).collect();
+    let out: Vec<String> = pick_words(&list, String::as_str, prefix, fuzzy)
+        .into_iter()
+        .cloned()
+        .collect();
+    (!out.is_empty()).then_some(out)
+}
+
+/// The modes of `ai`, with what each one does.
+const AI_MODES: &[(&str, &str)] = &[
+    (
+        "agent",
+        "xsh agent: works towards a goal, one approved command at a time",
+    ),
+    (
+        "claude",
+        "Claude Code as the agent, with only the xsh tools",
+    ),
+    ("explain", "explain a command in plain English"),
+    ("fix", "suggest a fix for the last failed command"),
+    ("suggest", "turn a description into a command"),
+    ("status", "show the provider and model"),
+];
+
+/// Models that `ai claude --model` accepts: Claude Code aliases first.
+const CLAUDE_MODELS: &[(&str, &str)] = &[
+    ("opus", "Claude Code alias: the latest Opus"),
+    ("sonnet", "Claude Code alias: the latest Sonnet"),
+    ("haiku", "Claude Code alias: the latest Haiku"),
+    ("fable", "Claude Code alias: the latest Fable"),
+    ("claude-opus-5-5", "Claude Opus 5.5"),
+    ("claude-sonnet-5-5", "Claude Sonnet 5.5"),
+    ("claude-haiku-5-5", "Claude Haiku 5.5"),
+    ("claude-fable-5-1", "Claude Fable 5.1"),
+];
+
+/// Models pulled into the local Ollama store, as `name:tag`.
+fn ollama_models(home: Option<&str>) -> Vec<String> {
+    let Some(home) = home else {
+        return Vec::new();
+    };
+    let lib =
+        std::path::Path::new(home).join(".ollama/models/manifests/registry.ollama.ai/library");
+    let mut out = Vec::new();
+    for model in std::fs::read_dir(lib).into_iter().flatten().flatten() {
+        let name = model.file_name().to_string_lossy().into_owned();
+        for tag in std::fs::read_dir(model.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            out.push(format!("{name}:{}", tag.file_name().to_string_lossy()));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// `(model, description)` for `ai --model`: the configured model first, then
+/// the known models of the configured provider (and local Ollama models).
+fn ai_models(data: &CompData, home: Option<&str>, claude: bool) -> Vec<(String, String)> {
+    if claude {
+        return CLAUDE_MODELS
+            .iter()
+            .map(|(m, d)| ((*m).to_owned(), (*d).to_owned()))
+            .collect();
+    }
+    let cfg = rushy_ai::AiConfig::load(&data.ai_file).unwrap_or_default();
+    let provider = cfg.default.provider.clone();
+    let current = cfg.model(&provider);
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut add = |m: String, d: String| {
+        if !m.is_empty() && !out.iter().any(|(x, _)| *x == m) {
+            out.push((m, d));
+        }
+    };
+    add(current, format!("{provider} (configured)"));
+    for m in rushy_ai::known_models(&provider) {
+        add((*m).to_owned(), provider.clone());
+    }
+    if provider == "ollama" {
+        for m in ollama_models(home) {
+            add(m, "ollama (installed)".to_owned());
+        }
+    }
+    out
+}
+
+/// Completions for `ai`: its modes, its flags, and the value of `--model`.
+fn ai_matches(
+    data: &CompData,
+    home: Option<&str>,
+    args: &[&String],
+    prefix: &str,
+    span: Span,
+    fuzzy: bool,
+) -> Option<Vec<Suggestion>> {
+    let with = |(v, d): (String, String)| Suggestion {
+        description: Some(d),
+        ..suggestion(v, span)
+    };
+    let rest = args.get(1..).unwrap_or_default();
+    // The mode is the first word that is not a flag or the value of `--model`.
+    let mut mode = None;
+    let mut i = 0;
+    while let Some(w) = rest.get(i) {
+        if *w == "--model" {
+            i += 2;
+            continue;
+        }
+        if !w.starts_with('-') {
+            mode = Some(w.as_str());
+            break;
+        }
+        i += 1;
+    }
+    let claude = mode == Some("claude");
+    let list: Vec<(String, String)> = if args.last().is_some_and(|w| *w == "--model") {
+        ai_models(data, home, claude)
+    } else if prefix.starts_with('-') {
+        let mut flags = vec![(
+            "--model".to_owned(),
+            "model for this command only".to_owned(),
+        )];
+        if matches!(mode, Some("agent" | "claude")) {
+            flags.push((
+                "--auto".to_owned(),
+                "autopilot: no questions; the safety checks stay on".to_owned(),
+            ));
+        }
+        flags.push(("--help".to_owned(), "show help".to_owned()));
+        flags
+    } else if mode.is_none() {
+        AI_MODES
+            .iter()
+            .map(|(m, d)| ((*m).to_owned(), (*d).to_owned()))
+            .collect()
+    } else {
+        return None;
+    };
+    let out: Vec<Suggestion> = pick_words(&list, |(v, _)| v.as_str(), prefix, fuzzy)
+        .into_iter()
+        .take(MAX_SUGGESTIONS)
+        .cloned()
+        .map(with)
+        .collect();
     (!out.is_empty()).then_some(out)
 }
 
@@ -462,13 +662,24 @@ struct ShellCompleter {
 }
 
 impl ShellCompleter {
-    /// Options of `cmd` (or of its subcommand page) that start with `prefix`.
-    fn man_flags(&self, cmd: &str, sub: Option<&str>, prefix: &str, span: Span) -> Vec<Suggestion> {
+    /// Options of `cmd` (or of its subcommand page) that start with `prefix`;
+    /// with `fuzzy`, those that match it fuzzily.
+    fn man_flags(
+        &self,
+        cmd: &str,
+        sub: Option<&str>,
+        prefix: &str,
+        span: Span,
+        fuzzy: bool,
+    ) -> Vec<Suggestion> {
         let mut seen = HashSet::new();
-        self.man
-            .load(cmd, sub)
+        let options = self.man.load(cmd, sub);
+        let unique: Vec<_> = options
             .iter()
-            .filter(|o| o.flag.starts_with(prefix) && seen.insert(o.flag.clone()))
+            .filter(|o| seen.insert(o.flag.clone()))
+            .collect();
+        pick_words(&unique, |o| o.flag.as_str(), prefix, fuzzy)
+            .into_iter()
             .take(MAX_SUGGESTIONS)
             .map(|o| Suggestion {
                 description: (!o.help.is_empty()).then(|| o.help.clone()),
@@ -495,14 +706,60 @@ impl Completer for ShellCompleter {
             .filter(|w| !is_assignment(w))
             .collect();
         let cmd = args.first().map(|s| s.as_str()).unwrap_or_default();
-        let mut found = if let Some(name) = prefix
+        // Exact matches first: the command's own words, then file names, then
+        // file names in any case. Only when all of those find nothing, the
+        // same again matched fuzzily.
+        let dirs_only = matches!(cmd, "cd" | "pushd" | "rmdir");
+        let home = self.home.as_deref();
+        let files = |found: Vec<Suggestion>| {
+            let mut found = found;
+            if dirs_only {
+                found.retain(|s| s.value.ends_with('/'));
+            }
+            found
+        };
+        let mut found = self.words_for(&data, &args, &prefix, span, false);
+        if found.is_empty() {
+            found = files(complete_files(&data, home, &prefix, span, quoted));
+        }
+        if found.is_empty() {
+            found = files(complete_files_loose(
+                &data, home, &prefix, span, quoted, false,
+            ));
+        }
+        if found.is_empty() {
+            found = self.words_for(&data, &args, &prefix, span, true);
+        }
+        if found.is_empty() {
+            found = files(complete_files_loose(
+                &data, home, &prefix, span, quoted, true,
+            ));
+        }
+        CompletionResult::fresh(found)
+    }
+}
+
+impl ShellCompleter {
+    /// What the command at hand knows for the word being typed: variables,
+    /// `ai` modes and models, branches, hosts and other arguments, man-page
+    /// options, commands, and bundle subcommands. Prefix matches, or with
+    /// `fuzzy` the fuzzy ones.
+    fn words_for(
+        &self,
+        data: &CompData,
+        args: &[&String],
+        prefix: &str,
+        span: Span,
+        fuzzy: bool,
+    ) -> Vec<Suggestion> {
+        let cmd = args.first().map(|s| s.as_str()).unwrap_or_default();
+        if let Some(name) = prefix
             .strip_prefix("${")
             .or_else(|| prefix.strip_prefix('$'))
         {
             let open = prefix.starts_with("${");
-            data.vars
-                .iter()
-                .filter(|v| v.starts_with(name))
+            pick_words(&data.vars, String::as_str, name, fuzzy)
+                .into_iter()
                 .take(MAX_SUGGESTIONS)
                 .map(|v| {
                     suggestion(
@@ -515,9 +772,13 @@ impl Completer for ShellCompleter {
                     )
                 })
                 .collect()
+        } else if cmd == "ai"
+            && let Some(list) = ai_matches(data, self.home.as_deref(), args, prefix, span, fuzzy)
+        {
+            list
         } else if !args.is_empty()
             && !prefix.starts_with('-')
-            && let Some(list) = context_matches(&data, &args, &prefix)
+            && let Some(list) = context_matches(data, args, prefix, fuzzy)
         {
             list.into_iter()
                 .take(MAX_SUGGESTIONS)
@@ -529,12 +790,13 @@ impl Completer for ShellCompleter {
                 .copied()
                 .map(String::as_str)
                 .filter(|s| !s.starts_with('-'));
-            args.first()
-                .map_or_else(Vec::new, |cmd| self.man_flags(cmd, sub, &prefix, span))
+            args.first().map_or_else(Vec::new, |cmd| {
+                self.man_flags(cmd, sub, prefix, span, fuzzy)
+            })
         } else if args.is_empty() {
+            let mut res = command_matches(data, prefix, span, fuzzy);
             // A full command name also lists its subcommands, as `docker build`.
-            let mut res = command_matches(&data, &prefix, span);
-            if let Some(subs) = data.subs.get(prefix.as_str()) {
+            if !fuzzy && let Some(subs) = data.subs.get(prefix) {
                 res.extend(
                     subs.iter()
                         .take(MAX_SUGGESTIONS)
@@ -543,22 +805,10 @@ impl Completer for ShellCompleter {
             }
             res
         } else if args.len() == 1 {
-            sub_matches(&data, args[0], &prefix, span)
+            sub_matches(data, args[0], prefix, span, fuzzy)
         } else {
             Vec::new()
-        };
-        // A command with no man page or bundle data, or a path prefix such as
-        // `src/`, still completes file names; `cd` lists only directories.
-        if found.is_empty() {
-            found = complete_files(&data, self.home.as_deref(), &prefix, span, quoted);
-            if found.is_empty() {
-                found = complete_files_nocase(&data, self.home.as_deref(), &prefix, span, quoted);
-            }
-            if matches!(cmd, "cd" | "pushd" | "rmdir") {
-                found.retain(|s| s.value.ends_with('/'));
-            }
         }
-        CompletionResult::fresh(found)
     }
 }
 
@@ -1445,6 +1695,48 @@ mod tests {
         assert_eq!((prefix.as_str(), quoted), ("x", false));
     }
 
+    /// Multibyte text, unclosed quotes, and here-documents at every cursor
+    /// position (also inside a character) never panic, and the highlighted
+    /// pieces always add up to the line.
+    #[test]
+    fn odd_input_never_panics_and_highlighting_keeps_the_text() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let data = comp(&["ls", "écho"], dir.path());
+        let h = ShellHighlighter {
+            data: Arc::new(RwLock::new(data.clone())),
+            home: None,
+        };
+        let mut c = completer(data.clone());
+        let mut hinter = XshHinter {
+            completer: completer(data),
+            style: Style::new(),
+            hint: String::new(),
+        };
+        let hist = FileBackedHistory::new(10)?;
+        for line in [
+            "echo 'éü",
+            "écho \"日本語",
+            "cat <<EOF\né\n",
+            "#ü comment",
+            "ls|ü&&ß;é>ê<ô(ÿ)",
+            "\u{a0}é\u{2003}x",
+            "😀😀 -😀 $😀 ${😀",
+            "\\",
+            "'",
+            "",
+        ] {
+            let styled = h.highlight(line, 0);
+            let joined: String = styled.buffer.iter().map(|(_, t)| t.as_str()).collect();
+            assert_eq!(joined, line);
+            for pos in 0..=line.len() + 1 {
+                let _ = word_at(line, pos);
+                let _ = c.complete(line, pos);
+                let _ = hinter.handle(line, pos, &hist, true, "");
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn words_keep_operators_and_drop_quotes() {
         assert_eq!(words("a 'b c' | d"), ["a", "b c", "|", "d"]);
@@ -1528,5 +1820,120 @@ mod tests {
         );
         // A command with no options falls back to file names instead of hanging.
         assert!(values(&c.complete("xsh-nothing --z", 15)).is_empty());
+    }
+
+    #[test]
+    fn fuzzy_matches_come_only_when_nothing_starts_with_the_word() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        for d in ["Desktop", "Documents", "Downloads"] {
+            std::fs::create_dir(dir.path().join(d))?;
+        }
+        std::fs::write(dir.path().join("notes-draft.md"), "")?;
+        std::fs::write(dir.path().join(".dwn-hidden"), "")?;
+        let mut data = comp(&["git", "docker"], dir.path());
+        data.subs.insert(
+            "docker".to_owned(),
+            vec!["build".to_owned(), "compose".to_owned()],
+        );
+        data.vars = vec!["HOME".into(), "LANG".into(), "XSH_DATA_DIR".into()];
+        let mut c = completer(data);
+        c.man.insert(
+            "git",
+            vec![
+                crate::man::Opt {
+                    flag: "--no-verify".to_owned(),
+                    help: String::new(),
+                },
+                crate::man::Opt {
+                    flag: "--verbose".to_owned(),
+                    help: String::new(),
+                },
+            ],
+        );
+
+        // Folders and files: a prefix wins, then any case, then fuzzy.
+        assert_eq!(
+            values(&c.complete("cd Do", 5)),
+            ["Documents/", "Downloads/"]
+        );
+        assert_eq!(
+            values(&c.complete("cd do", 5)),
+            ["Documents/", "Downloads/"]
+        );
+        assert_eq!(values(&c.complete("cd dwn", 6)), ["Downloads/"]);
+        assert_eq!(values(&c.complete("cat ntdr", 8)), ["notes-draft.md"]);
+        // `cd` keeps to folders when it matches fuzzily too.
+        assert!(values(&c.complete("cd ntdr", 7)).is_empty());
+        // A word without a match at all stays without suggestions.
+        assert!(values(&c.complete("cat qqq", 7)).is_empty());
+
+        // Flags, subcommands and variables match fuzzily as well.
+        assert_eq!(values(&c.complete("git --nv", 8)), ["--no-verify"]);
+        assert_eq!(values(&c.complete("git --ver", 9)), ["--verbose"]);
+        assert_eq!(values(&c.complete("docker cmps", 11)), ["compose"]);
+        assert_eq!(values(&c.complete("echo $xdd", 9)), ["$XSH_DATA_DIR"]);
+
+        // A command name: the folder that starts with the word comes before
+        // commands that only match it fuzzily (`auto_cd` runs folders).
+        assert_eq!(values(&c.complete("Do", 2)), ["Documents/", "Downloads/"]);
+        assert_eq!(values(&c.complete("dkr", 3)), ["docker"]);
+        Ok(())
+    }
+
+    #[test]
+    fn fuzzy_branches_come_after_file_names() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let heads = dir.path().join(".git/refs/heads/feature");
+        std::fs::create_dir_all(&heads)?;
+        std::fs::write(heads.join("login-page"), "")?;
+        std::fs::write(dir.path().join(".git/refs/heads/main"), "")?;
+        std::fs::write(dir.path().join("main.rs"), "")?;
+        let mut c = completer(comp(&["git"], dir.path()));
+        assert_eq!(values(&c.complete("git checkout ma", 15)), ["main"]);
+        assert_eq!(
+            values(&c.complete("git checkout flgn", 17)),
+            ["feature/login-page"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn completes_ai_modes_flags_and_models() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let ai = dir.path().join("ai.toml");
+        std::fs::write(
+            &ai,
+            "[default]\nprovider = \"anthropic\"\nmodel = \"my-claude\"\n",
+        )?;
+        let mut data = comp(&["ai"], dir.path());
+        data.ai_file = ai;
+        let mut c = completer(data);
+
+        let modes = c.complete("ai ", 3);
+        assert_eq!(
+            values(&modes),
+            ["agent", "claude", "explain", "fix", "suggest", "status"]
+        );
+        assert!(modes.suggestions()[0].description.is_some());
+        assert_eq!(values(&c.complete("ai ex", 5)), ["explain"]);
+
+        // The configured model comes first, then the provider's known models.
+        let listed = values(&c.complete("ai --model ", 11));
+        assert_eq!(listed.first().map(String::as_str), Some("my-claude"));
+        assert!(listed.iter().any(|m| m == "claude-opus-5-5"));
+        assert!(!listed.iter().any(|m| m == "gpt-4o"));
+        assert_eq!(
+            values(&c.complete("ai explain --model claude-son", 29)),
+            ["claude-sonnet-5-5", "claude-sonnet-4-5"]
+        );
+        // After the model, the modes again; `ai claude` takes Claude Code names.
+        assert_eq!(values(&c.complete("ai --model x a", 14)), ["agent"]);
+        assert_eq!(values(&c.complete("ai claude --model so", 20)), ["sonnet"]);
+        assert_eq!(
+            values(&c.complete("ai agent --", 11)),
+            ["--model", "--auto", "--help"]
+        );
+        assert_eq!(values(&c.complete("ai --", 5)), ["--model", "--help"]);
+        Ok(())
     }
 }

@@ -21,7 +21,7 @@ use rushy_tui::Theme;
 pub const EXTRA_BUILTINS: &[(&str, &str)] = &[
     (
         "ai",
-        "AI helpers: ai explain|fix|suggest|agent [--auto]|status",
+        "AI helpers: ai [--model M] explain|fix|suggest|agent [--auto]|claude [--auto]|status",
     ),
     (
         "bundle",
@@ -75,6 +75,8 @@ pub struct CompData {
     pub colors: crate::highlight::Colors,
     /// Host names from `~/.ssh/config` and `~/.ssh/known_hosts`.
     pub hosts: Vec<String>,
+    /// `ai.toml`, read when `ai --model` is completed.
+    pub ai_file: PathBuf,
 }
 
 /// A configured AI provider.
@@ -103,6 +105,8 @@ pub struct App {
     /// Options read from man pages, for flag completion.
     pub man: crate::man::ManCache,
     ai: Option<AiRuntime>,
+    /// `ai --model`: the model for the command that runs now.
+    model_override: Option<String>,
     last_env: Option<(PathBuf, String)>,
     warned_history: bool,
 }
@@ -226,6 +230,7 @@ impl App {
             comp: Arc::new(RwLock::new(CompData::default())),
             man: crate::man::ManCache::default(),
             ai: None,
+            model_override: None,
             last_env: None,
             warned_history: false,
         };
@@ -413,6 +418,7 @@ impl App {
         }
         c.subs = subs;
         c.cwd = self.shell.state().cwd().to_path_buf();
+        c.ai_file = self.paths.ai_file();
         if c.path_key != path {
             c.path_commands = scan_path(path);
             path.clone_into(&mut c.path_key);
@@ -457,8 +463,23 @@ impl App {
         )?)
     }
 
+    /// Uses `model` instead of the configured one until it is set back to
+    /// `None` (`ai --model`). Returns the previous value.
+    pub fn set_model_override(&mut self, model: Option<String>) -> Option<String> {
+        std::mem::replace(&mut self.model_override, model)
+    }
+
     /// The configured AI provider, created on first use.
     pub fn ai(&mut self) -> Result<AiRuntime> {
+        if let Some(model) = self.model_override.clone() {
+            // Not cached: the next command uses the configured model again.
+            let mut cfg = AiConfig::load(&self.paths.ai_file())?;
+            let name = cfg.default.provider.clone();
+            cfg.providers.entry(name).or_default().model = Some(model.clone());
+            cfg.default.model = Some(model);
+            let provider: Arc<dyn AiProvider> = Arc::from(rushy_ai::from_config(&cfg)?);
+            return Ok(AiRuntime { cfg, provider });
+        }
         if let Some(a) = &self.ai {
             return Ok(a.clone());
         }

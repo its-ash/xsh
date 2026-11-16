@@ -1,0 +1,545 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>xsh theme editor</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --ui-bg: #111318;
+    --ui-panel: #181b22;
+    --ui-line: #2a2f3a;
+    --ui-text: #d6dae3;
+    --ui-dim: #8a92a3;
+    --ui-accent: #4c8dff;
+    --mono: Consolas, "SF Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: var(--ui-bg);
+    color: var(--ui-text);
+    display: grid;
+    grid-template-columns: 360px 1fr;
+    height: 100vh;
+    overflow: hidden;
+  }
+  aside {
+    background: var(--ui-panel);
+    border-right: 1px solid var(--ui-line);
+    overflow-y: auto;
+    padding: 14px 16px 40px;
+  }
+  main { overflow-y: auto; padding: 18px 22px 40px; }
+  h1 { font-size: 15px; margin: 0 0 12px; }
+  h2 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--ui-dim); margin: 18px 0 8px;
+  }
+  label.field { display: block; margin: 6px 0; color: var(--ui-dim); }
+  input[type=text], select, textarea {
+    width: 100%; background: var(--ui-bg); color: var(--ui-text);
+    border: 1px solid var(--ui-line); border-radius: 6px; padding: 6px 8px;
+    font: 12px var(--mono);
+  }
+  textarea { height: 230px; resize: vertical; }
+  button {
+    background: #222733; color: var(--ui-text); border: 1px solid var(--ui-line);
+    border-radius: 6px; padding: 6px 10px; cursor: pointer; font-size: 12px;
+  }
+  button:hover { border-color: var(--ui-accent); }
+  button.primary { background: var(--ui-accent); border-color: var(--ui-accent); color: #fff; }
+  .row { display: flex; gap: 6px; flex-wrap: wrap; margin: 8px 0; }
+  .role {
+    display: grid; grid-template-columns: 30px 1fr 86px; gap: 8px; align-items: center;
+    padding: 6px; border-radius: 6px; border: 1px solid transparent;
+  }
+  .role.selected { border-color: var(--ui-accent); background: #1f2430; }
+  .role .name { font-weight: 600; }
+  .role .use { color: var(--ui-dim); font-size: 11px; }
+  .role .warn { color: #ffb44c; font-size: 11px; }
+  .role input[type=text] { padding: 4px 6px; }
+  input[type=color] {
+    width: 30px; height: 26px; padding: 0; border: 1px solid var(--ui-line);
+    border-radius: 5px; background: none; cursor: pointer;
+  }
+  .ansi { display: grid; grid-template-columns: repeat(8, 1fr); gap: 6px; }
+  .ansi .cell { text-align: center; font-size: 10px; color: var(--ui-dim); border-radius: 6px; padding: 3px 0; border: 1px solid transparent; }
+  .ansi .cell.selected { border-color: var(--ui-accent); }
+  .ansi input[type=color] { width: 100%; }
+  .hint { color: var(--ui-dim); font-size: 12px; }
+  code { font-family: var(--mono); font-size: 12px; }
+  .toast {
+    position: fixed; right: 18px; bottom: 18px; background: var(--ui-accent); color: #fff;
+    padding: 8px 12px; border-radius: 6px; opacity: 0; transition: opacity .2s; pointer-events: none;
+  }
+  .toast.show { opacity: 1; }
+
+  /* The terminal preview. Every colored piece has a data-role. */
+  .term {
+    background: var(--background);
+    color: var(--foreground);
+    font: 14px/1.5 var(--mono);
+    border-radius: 10px;
+    border: 1px solid var(--ui-line);
+    overflow: hidden;
+    margin-bottom: 18px;
+  }
+  .term .title {
+    background: #1d1f25; color: #9aa0ab; font: 12px -apple-system, sans-serif;
+    padding: 6px 12px; display: flex; gap: 7px; align-items: center;
+  }
+  .term .title i { width: 11px; height: 11px; border-radius: 50%; display: inline-block; }
+  .term pre { margin: 0; padding: 12px 16px; white-space: pre; overflow-x: auto; font: inherit; }
+  .term [data-role] { cursor: pointer; border-radius: 2px; }
+  .term [data-role]:hover { outline: 1px dashed rgba(127, 127, 127, .8); outline-offset: 1px; }
+  .term .b { font-weight: bold; }
+  .term .i { font-style: italic; }
+  .term .u { text-decoration: underline; }
+  .term .cur { display: inline-block; width: .6em; }
+  .term .status { display: block; padding: 2px 16px; }
+  .caption { color: var(--ui-dim); font-size: 12px; margin: 0 0 6px; }
+</style>
+</head>
+<body>
+<aside>
+  <h1>xsh theme editor</h1>
+  <p class="hint">Click any text in the preview to change the color it uses, or pick a color below.</p>
+
+  <label class="field">Start from
+    <select id="preset"></select>
+  </label>
+  <label class="field">Theme name
+    <input type="text" id="name" spellcheck="false">
+  </label>
+  <label class="field">Prompt format
+    <input type="text" id="format" spellcheck="false">
+  </label>
+  <div class="row">
+    <button id="import">Import .toml…</button>
+    <button id="reset">Reset to the start theme</button>
+    <input type="file" id="file" accept=".toml" hidden>
+  </div>
+
+  <h2>Theme colors</h2>
+  <div id="roles"></div>
+
+  <h2>Terminal colors (ANSI)</h2>
+  <p class="hint">Programs such as <code>ls</code>, <code>git</code> and <code>cargo</code> use these. Top: normal, bottom: bright.</p>
+  <div class="ansi" id="ansi"></div>
+
+  <h2>Export</h2>
+  <div class="row">
+    <button class="primary" id="download">Download .toml</button>
+    <button id="copy">Copy</button>
+  </div>
+  <p class="hint">To use it, put the file in your xsh themes folder and switch to it:</p>
+  <pre class="hint" id="install" style="white-space:pre-wrap;font:11px var(--mono)"></pre>
+  <textarea id="toml" readonly spellcheck="false"></textarea>
+</aside>
+
+<main id="preview"></main>
+<div class="toast" id="toast"></div>
+
+<!-- Written by `make theme` from crates/rushy-tui/themes and your own themes. -->
+<script src="themes.js"></script>
+<script>
+"use strict";
+
+const ROLES = [
+  ["background", "Background", "Terminal background; text in the status bar"],
+  ["foreground", "Text", "Normal text and menu entries; dimmed: operators, hints, descriptions"],
+  ["accent", "Accent", "Subcommands, folders in completions, status bar"],
+  ["error", "Error", "Unknown commands, exit status in the prompt, errors"],
+  ["success", "Success", "Known commands, quoted text, the typed part in the menu"],
+  ["prompt_user", "Prompt user", "User name in the prompt"],
+  ["prompt_path", "Prompt path", "Folder in the prompt, flags, variables"],
+  ["cursor", "Cursor", "Cursor in the app"],
+  ["selection", "Selection", "Background of selected text in the app"],
+];
+const ANSI = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"];
+const FALLBACK = {
+  background: "#1e1e1e", foreground: "#d4d4d4", accent: "#d4d4d4", error: "#d4d4d4",
+  success: "#d4d4d4", prompt_user: "#d4d4d4", prompt_path: "#d4d4d4", cursor: "", selection: "",
+};
+const DEFAULT_ANSI = [
+  "#000000", "#cd3131", "#0dbc79", "#e5e510", "#2472c8", "#bc3fbc", "#11a8cd", "#e5e5e5",
+  "#666666", "#f14c4c", "#23d18b", "#f5f543", "#3b8eea", "#d670d6", "#29b8db", "#ffffff",
+];
+const STORE = "xsh-theme-editor";
+
+// ---- TOML ----------------------------------------------------------------
+
+/** Reads the small TOML subset that xsh themes use. */
+function parseTheme(text) {
+  const t = { name: "", colors: {}, ansi: [], format: "" };
+  let section = "";
+  const lines = text.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line || line.startsWith("#")) continue;
+    const head = line.match(/^\[(\w+)\]$/);
+    if (head) { section = head[1]; continue; }
+    const kv = line.match(/^(\w+)\s*=\s*(.*)$/);
+    if (!kv) continue;
+    const [, key, rest] = kv;
+    if (key === "ansi") {
+      let body = rest;
+      while (!body.includes("]") && i + 1 < lines.length) body += lines[++i];
+      t.ansi = [...body.matchAll(/"([^"]*)"/g)].map((m) => m[1].toLowerCase());
+      continue;
+    }
+    const str = rest.match(/^"((?:[^"\\]|\\.)*)"/);
+    const value = str ? str[1].replace(/\\(["\\])/g, "$1") : rest;
+    if (section === "" && key === "name") t.name = value;
+    else if (section === "colors") t.colors[key] = value.toLowerCase();
+    else if (section === "prompt" && key === "format") t.format = value;
+  }
+  return t;
+}
+
+function tomlString(s) { return '"' + s.replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"'; }
+
+function writeTheme(t) {
+  const out = [`name = ${tomlString(t.name)}`, "", "[colors]"];
+  for (const [key] of ROLES) {
+    const v = t.colors[key] || "";
+    if (v || !["cursor", "selection"].includes(key)) out.push(`${key} = ${tomlString(v)}`);
+  }
+  if (t.ansi.length === 16) {
+    const q = (a) => a.map((c) => tomlString(c)).join(", ");
+    out.push("ansi = [", `    ${q(t.ansi.slice(0, 8))},`, `    ${q(t.ansi.slice(8))},`, "]");
+  }
+  out.push("", "[prompt]", `format = ${tomlString(t.format)}`, "");
+  return out.join("\n");
+}
+
+// ---- State ---------------------------------------------------------------
+
+const presets = (window.XSH_THEMES || []).map(parseTheme).filter((t) => t.name);
+if (!presets.length) {
+  presets.push(parseTheme(`name = "neon"
+[colors]
+background = "#05050a"
+foreground = "#00ff6e"
+accent = "#fcee0a"
+error = "#e32400"
+success = "#00ff9c"
+prompt_user = "#ffffff"
+prompt_path = "#fcee0a"
+cursor = "#00f0ff"
+selection = "#ff00cf"
+ansi = ["#05050a", "#ff3f73", "#00ff9c", "#fcee0a", "#2d7dff", "#d600ff", "#00f0ff", "#d0f8ff",
+"#3a3a4a", "#ff4d6d", "#5cffbe", "#fff35c", "#6ba4ff", "#e45cff", "#6cf8ff", "#ffffff"]
+[prompt]
+format = "{user} {path} {git}{node}{python}❯ "`));
+}
+
+let start = presets.find((p) => p.name === "neon") || presets[0];
+let theme = structuredClone(start);
+let selected = "foreground";
+try {
+  const saved = JSON.parse(localStorage.getItem(STORE) || "null");
+  if (saved && saved.theme && saved.theme.colors) {
+    theme = saved.theme;
+    start = presets.find((p) => p.name === saved.start) || start;
+  }
+} catch (_) { /* a broken save starts fresh */ }
+if (theme.ansi.length !== 16) theme.ansi = start.ansi.length === 16 ? [...start.ansi] : [...DEFAULT_ANSI];
+
+const isHex = (v) => /^#[0-9a-f]{6}$/i.test(v);
+
+/** The color a role shows with: its value, or what xsh uses in its place. */
+function shown(key) {
+  if (key.startsWith("ansi")) return theme.ansi[Number(key.slice(4))];
+  const v = theme.colors[key];
+  if (isHex(v)) return v;
+  if (key === "cursor") return shown("foreground");
+  if (key === "selection") return "#264f78";
+  return FALLBACK[key];
+}
+
+// ---- Contrast ------------------------------------------------------------
+
+function luminance(hex) {
+  const c = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255)
+    .map((v) => (v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4));
+  return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+}
+function contrast(a, b) {
+  const [x, y] = [luminance(a), luminance(b)].sort((p, q) => q - p);
+  return (x + 0.05) / (y + 0.05);
+}
+
+// ---- Side panel ----------------------------------------------------------
+
+const $ = (id) => document.getElementById(id);
+
+function buildPanel() {
+  $("preset").innerHTML = presets.map((p) => `<option>${p.name}</option>`).join("");
+  $("preset").value = start.name;
+
+  $("roles").innerHTML = ROLES.map(([key, label, use]) => `
+    <div class="role" data-key="${key}">
+      <input type="color" data-key="${key}">
+      <div><div class="name">${label} <code>${key}</code></div><div class="use">${use}</div><div class="warn"></div></div>
+      <input type="text" data-key="${key}" spellcheck="false">
+    </div>`).join("");
+
+  $("ansi").innerHTML = [...Array(16).keys()].map((i) => `
+    <div class="cell" data-key="ansi${i}">
+      <input type="color" data-key="ansi${i}" title="${i < 8 ? "" : "bright "}${ANSI[i % 8]} (ansi ${i})">
+      ${i < 8 ? "" : "br "}${ANSI[i % 8]}
+    </div>`).join("");
+
+  document.querySelectorAll("aside input[data-key]").forEach((input) => {
+    input.addEventListener("input", () => {
+      const v = input.value.trim().toLowerCase();
+      if (input.type === "text" && v !== "" && !isHex(v) && v !== "reset") return;
+      set(input.dataset.key, v);
+    });
+    input.addEventListener("focus", () => select(input.dataset.key, false));
+  });
+}
+
+function set(key, value) {
+  if (key.startsWith("ansi")) theme.ansi[Number(key.slice(4))] = value;
+  else theme.colors[key] = value;
+  render();
+}
+
+function select(key, openPicker) {
+  selected = key;
+  document.querySelectorAll(".role, .ansi .cell").forEach((el) =>
+    el.classList.toggle("selected", el.dataset.key === key));
+  const row = document.querySelector(`[data-key="${key}"].role, .cell[data-key="${key}"]`);
+  if (row) row.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  const picker = document.querySelector(`input[type=color][data-key="${key}"]`);
+  if (openPicker && picker) {
+    try { picker.showPicker(); } catch (_) { picker.click(); }
+  }
+}
+
+function syncPanel() {
+  $("name").value = theme.name;
+  $("format").value = theme.format;
+  const bg = shown("background");
+  for (const [key] of ROLES) {
+    const color = document.querySelector(`input[type=color][data-key="${key}"]`);
+    const text = document.querySelector(`input[type=text][data-key="${key}"]`);
+    color.value = shown(key);
+    if (document.activeElement !== text) text.value = theme.colors[key] || "";
+    const warn = document.querySelector(`.role[data-key="${key}"] .warn`);
+    const hard = !["background", "selection", "cursor"].includes(key) && contrast(shown(key), bg) < 3;
+    warn.textContent = hard ? `Hard to read on the background (contrast ${contrast(shown(key), bg).toFixed(1)}:1)` : "";
+  }
+  theme.ansi.forEach((c, i) => {
+    document.querySelector(`input[type=color][data-key="ansi${i}"]`).value = isHex(c) ? c : "#000000";
+  });
+  const toml = writeTheme(theme);
+  $("toml").value = toml;
+  $("install").textContent =
+    `mkdir -p ~/Library/Application\\ Support/xsh/themes\n` +
+    `mv ~/Downloads/${theme.name}.toml ~/Library/Application\\ Support/xsh/themes/\n` +
+    `xsh theme ${theme.name}`;
+}
+
+// ---- Preview -------------------------------------------------------------
+
+const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+/** Text in the color of `role`, with optional classes (b, i, u). */
+const c = (role, text, cls = "") =>
+  `<span data-role="${role}" class="${cls}" style="color:var(--${role})">${esc(text)}</span>`;
+/** Text in a dimmed role color, as xsh dims text (half towards the background). */
+const dim = (role, text) =>
+  `<span data-role="${role}" style="color:color-mix(in srgb, var(--${role}) 55%, var(--background))">${esc(text)}</span>`;
+/** Text with a background role color. */
+const on = (bgRole, fgRole, text, cls = "") =>
+  `<span data-role="${bgRole}" class="${cls}" style="background:var(--${bgRole})">` +
+  `<span data-role="${fgRole}" style="color:var(--${fgRole})">${esc(text)}</span></span>`;
+const plain = (text) => c("foreground", text);
+
+function prompt(status) {
+  const fields = {
+    user: c("prompt_user", "ashvini"),
+    host: c("foreground", "macbook"),
+    path: c("prompt_path", "~/code/xsh"),
+    git: c("ansi6", " main* "),
+    node: "",
+    python: c("ansi3", "🐍 3.12 "),
+    status: status ? c("error", `[${status}] `) : "",
+  };
+  const fmt = theme.format || "{user} {path} {git}{node}{python}❯ ";
+  return fmt.split(/(\{\w+\})/).map((part) => {
+    const m = part.match(/^\{(\w+)\}$/);
+    return m ? fields[m[1]] ?? "" : part ? plain(part) : "";
+  }).join("");
+}
+
+const cursor = () => `<span data-role="cursor" class="cur" style="background:var(--cursor)">&nbsp;</span>`;
+
+function term(title, body, extra = "") {
+  return `<div class="term"><div class="title"><i style="background:#ff5f57"></i><i style="background:#febc2e"></i><i style="background:#28c840"></i>&nbsp; ${esc(title)}</div><pre>${body}</pre>${extra}</div>`;
+}
+
+function render() {
+  const root = $("preview");
+  const vars = ROLES.map(([k]) => `--${k}:${shown(k)}`)
+    .concat(theme.ansi.map((_, i) => `--ansi${i}:${shown("ansi" + i)}`));
+  root.style.cssText = vars.join(";");
+
+  const a = (i, text, cls) => c("ansi" + i, text, cls);
+  const op = (text) => dim("foreground", text);
+
+  const typing = [
+    prompt(0) + c("success", "git", "b") + " " + c("accent", "commit", "b") + " " +
+      c("prompt_path", "-m") + " " + c("success", '"fix: full screen lag"') + " " +
+      op("&&") + " " + c("success", "git", "b") + " " + c("accent", "push", "b") + cursor() +
+      dim("foreground", " origin main"),
+    prompt(0) + c("success", "echo", "b") + " " + c("prompt_path", "$HOME") + " " + op("|") + " " +
+      c("error", "gti") + " " + c("prompt_path", "--version") + " " + op(">") + " " + c("foreground", "out.txt"),
+    c("error", "xsh: command not found: gti") + "  " + dim("foreground", "did you mean `git`?"),
+    prompt(127) + c("success", "cd", "b") + " " + c("foreground", "dwn") + cursor(),
+  ].join("\n");
+
+  const menu = [
+    on("foreground", "background", " Downloads/   ", "b") + "  " + dim("foreground", "folder"),
+    " " + c("accent", "Documents/") + "     " + dim("foreground", "folder"),
+    " " + c("accent", "Desktop/") + "       " + dim("foreground", "folder"),
+    dim("foreground", " ─────────────────────────"),
+    " " + c("success", "--no", "u") + c("foreground", "-verify") + "   " + dim("foreground", "bypass the pre-commit hook"),
+    " " + c("success", "--no", "u") + c("foreground", "-edit") + "     " + dim("foreground", "use the message as it is"),
+  ].join("\n");
+
+  const ls = [
+    prompt(0) + c("success", "ls", "b") + " " + c("prompt_path", "-la"),
+    a(4, "drwxr-xr-x") + "  " + plain("12 ashvini  staff   384 ") + a(4, "app/", "b"),
+    plain("-rw-r--r--   1 ashvini  staff  2.1K Cargo.toml"),
+    a(2, "-rwxr-xr-x", "b") + plain("   1 ashvini  staff   812 ") + a(2, "install.sh", "b"),
+    plain("lrwxr-xr-x   1 ashvini  staff    18 ") + a(6, "latest") + plain(" -> ") + plain("target/release"),
+    plain("-rw-r--r--   1 ashvini  staff  4.4M ") + a(1, "xsh-0.1.4.dmg", "b"),
+    plain("-rw-r--r--   1 ashvini  staff   96B ") + a(5, "logo.svg"),
+    plain("-rw-r--r--   1 ashvini  staff   64B ") + a(8, ".DS_Store"),
+  ].join("\n");
+
+  const git = [
+    prompt(0) + c("success", "git", "b") + " " + c("accent", "status", "b"),
+    plain("On branch ") + a(2, "main"),
+    plain("Changes to be committed:"),
+    "        " + a(2, "new file:   crates/rushy-tui/themes/neon.toml"),
+    plain("Changes not staged for commit:"),
+    "        " + a(1, "modified:   crates/rushy-cli/src/repl.rs"),
+    plain("Untracked files:"),
+    "        " + a(1, "scripts/theme-editor.html"),
+    "",
+    prompt(0) + c("success", "git", "b") + " " + c("accent", "diff", "b"),
+    plain("diff --git a/src/repl.rs b/src/repl.rs", "b"),
+    a(6, "@@ -160,7 +160,9 @@") + plain(" fn command_matches("),
+    a(1, "-        .filter(|c| c.starts_with(prefix))"),
+    a(2, "+    pick_words(&all, |c| c.as_str(), prefix, fuzzy)"),
+    a(2, "+        .into_iter()"),
+    "",
+    prompt(0) + c("success", "git", "b") + " " + c("accent", "log", "b") + " " + c("prompt_path", "--oneline"),
+    a(3, "879503b") + " " + a(6, "(HEAD -> ", "b") + a(2, "main", "b") + a(6, ", ", "b") + a(1, "origin/main", "b") + a(6, ")", "b") + plain(" Bump workspace version to 0.1.4"),
+    a(3, "affdaab") + plain(" Merge branch 'main'"),
+  ].join("\n");
+
+  const cargo = [
+    prompt(0) + c("success", "cargo", "b") + " " + c("accent", "test", "b"),
+    a(2, "   Compiling", "b") + plain(" rushy-cli v0.1.4"),
+    a(3, "warning", "b") + plain(": unused variable: `span`"),
+    a(12, "  --> ", "b") + plain("crates/rushy-cli/src/repl.rs:42:9"),
+    a(10, "    Finished", "b") + plain(" `test` profile in 3.21s"),
+    plain("test repl::tests::completes_files ... ") + a(2, "ok"),
+    plain("test repl::tests::fuzzy_branches ... ") + a(1, "FAILED"),
+    a(1, "error", "b") + plain(": test failed, to rerun pass `-p rushy-cli --bin xsh`"),
+    "",
+    prompt(0) + c("success", "cat", "b") + " " + c("foreground", "notes.md"),
+    plain("Select this line to see the ") + on("selection", "foreground", "selection color") + plain(" in the app."),
+    a(8, "# a comment in grey (bright black)", "i"),
+  ].join("\n");
+
+  const status = `<div class="status" data-role="accent" style="background:var(--accent)">` +
+    `<span data-role="background" style="color:var(--background)">[0] win 1/2 pane 1 │ bundles 4 │ AI: local · router/auto</span>` +
+    `<span data-role="background" style="color:var(--background);float:right">23:41</span></div>`;
+
+  const swatches = [0, 8].map((base) => ANSI.map((name, i) =>
+    a(base + i, (base ? "br-" : "") + name.padEnd(base ? 7 : 10).slice(0, base ? 7 : 10))).join(" ")).join("\n") +
+    "\n" + [0, 8].map((base) => ANSI.map((_, i) =>
+      `<span data-role="ansi${base + i}" style="background:var(--ansi${base + i})">${"    "}</span>`).join(" ")).join("\n");
+
+  root.innerHTML =
+    `<p class="caption">Typing, an unknown command, and Tab completion</p>` +
+    term("xsh — ~/code/xsh", typing + "\n" + menu, status) +
+    `<p class="caption">Files, git, and a build</p>` +
+    term("xsh — ls and git", ls + "\n\n" + git) +
+    term("xsh — cargo", cargo) +
+    `<p class="caption">The 16 terminal colors</p>` +
+    term("xsh — colors", swatches);
+  syncPanel();
+  select(selected, false);
+  localStorage.setItem(STORE, JSON.stringify({ theme, start: start.name }));
+}
+
+// ---- Events --------------------------------------------------------------
+
+$("preview").addEventListener("click", (e) => {
+  const el = e.target.closest("[data-role]");
+  if (el) select(el.dataset.role, true);
+});
+$("preset").addEventListener("change", () => {
+  start = presets.find((p) => p.name === $("preset").value) || start;
+  theme = structuredClone(start);
+  if (theme.ansi.length !== 16) theme.ansi = [...DEFAULT_ANSI];
+  render();
+});
+$("reset").addEventListener("click", () => {
+  theme = structuredClone(start);
+  if (theme.ansi.length !== 16) theme.ansi = [...DEFAULT_ANSI];
+  render();
+});
+$("name").addEventListener("input", () => {
+  theme.name = $("name").value.trim().toLowerCase().replace(/[^a-z0-9-]+/g, "-") || "my-theme";
+  syncPanel();
+});
+$("format").addEventListener("input", () => { theme.format = $("format").value; render(); });
+$("import").addEventListener("click", () => $("file").click());
+$("file").addEventListener("change", async () => {
+  const f = $("file").files[0];
+  if (!f) return;
+  const t = parseTheme(await f.text());
+  if (!t.name) t.name = f.name.replace(/\.toml$/, "");
+  if (t.ansi.length !== 16) t.ansi = [...DEFAULT_ANSI];
+  theme = t;
+  render();
+  toast(`Imported ${f.name}`);
+});
+$("download").addEventListener("click", () => {
+  const blob = new Blob([writeTheme(theme)], { type: "application/toml" });
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = `${theme.name}.toml`;
+  link.click();
+  URL.revokeObjectURL(link.href);
+  toast(`Saved ${theme.name}.toml to Downloads`);
+});
+$("copy").addEventListener("click", async () => {
+  await navigator.clipboard.writeText(writeTheme(theme));
+  toast("Copied");
+});
+
+let toastTimer;
+function toast(text) {
+  $("toast").textContent = text;
+  $("toast").classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => $("toast").classList.remove("show"), 1800);
+}
+
+buildPanel();
+render();
+</script>
+</body>
+</html>

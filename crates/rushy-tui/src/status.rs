@@ -2,7 +2,7 @@
 
 use ratatui::text::{Line, Span};
 
-use crate::prompt::truncate;
+use crate::prompt::{display_width, truncate};
 use crate::theme::Theme;
 
 /// State of the AI layer.
@@ -71,9 +71,9 @@ pub fn render_status(theme: &Theme, info: &StatusInfo, width: u16, ascii: bool) 
         info.ai.text()
     );
     let right = format!(" {} ", info.clock);
-    let room = width.saturating_sub(right.chars().count());
+    let room = width.saturating_sub(display_width(&right));
     let mut left = truncate(&left, room, ascii);
-    let pad = room.saturating_sub(left.chars().count());
+    let pad = room.saturating_sub(display_width(&left));
     left.push_str(&" ".repeat(pad));
     let style = if theme.plain {
         theme.focus()

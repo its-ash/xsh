@@ -10,6 +10,10 @@ use crate::pane::{Pane, PaneCommand, PaneEvent, PaneId};
 use crate::{Error, Result};
 
 const RESIZE_STEP: u16 = 5;
+/// Largest pane area accepted from a client; bigger sizes are clamped so a
+/// bogus `Resize` cannot make every pane allocate a giant screen.
+const MAX_COLS: u16 = crate::pane::MAX_COLS;
+const MAX_ROWS: u16 = crate::pane::MAX_ROWS;
 
 /// Session identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -159,7 +163,12 @@ impl SessionManager {
     }
 
     fn area(&self) -> Rect {
-        Rect::new(0, 0, self.size.0.max(4), self.size.1.max(3))
+        Rect::new(
+            0,
+            0,
+            self.size.0.clamp(4, MAX_COLS),
+            self.size.1.clamp(3, MAX_ROWS),
+        )
     }
 
     fn spawn_pane(&mut self, rect: Rect) -> Result<PaneId> {
@@ -475,7 +484,8 @@ impl SessionManager {
             return;
         };
         let mut windows = Vec::with_capacity(s.windows.len());
-        for w in std::mem::take(&mut s.windows) {
+        let mut active = s.active;
+        for (index, w) in std::mem::take(&mut s.windows).into_iter().enumerate() {
             if !w.layout.contains(id) {
                 windows.push(w);
                 continue;
@@ -487,10 +497,14 @@ impl SessionManager {
                     w.focused
                 };
                 windows.push(Window { layout, focused });
+            } else if index < s.active {
+                // A window before the active one closed: keep showing the
+                // same window, now one index lower.
+                active -= 1;
             }
         }
         s.windows = windows;
-        s.active = s.active.min(s.windows.len().saturating_sub(1));
+        s.active = active.min(s.windows.len().saturating_sub(1));
         if s.windows.is_empty() {
             self.sessions.remove(&sid);
             if self.attached == Some(sid) {

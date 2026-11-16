@@ -249,6 +249,20 @@ pub struct ShellState {
     cdpath: Option<Vec<String>>,
     umask: Option<u32>,
     last_bg: Option<u32>,
+    readonly: std::collections::BTreeSet<String>,
+    interactive: bool,
+    /// `getopts` progress: the `OPTIND` it last set and the character
+    /// offset inside that argument (for grouped options such as `-ab`).
+    getopts: (usize, usize),
+}
+
+/// Whether `a` and `b` are the same directory (same device and inode).
+fn same_dir(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(x), Ok(y)) => x.is_dir() && x.dev() == y.dev() && x.ino() == y.ino(),
+        _ => false,
+    }
 }
 
 impl ShellState {
@@ -281,6 +295,9 @@ impl ShellState {
             cdpath: None,
             umask: None,
             last_bg: None,
+            readonly: std::collections::BTreeSet::new(),
+            interactive: true,
+            getopts: (0, 0),
         }
     }
 
@@ -428,6 +445,41 @@ impl ShellState {
         self.last_bg = pid;
     }
 
+    /// Whether the shell reads commands from a person (the default). A
+    /// non-interactive shell (`-c`, a script) does not announce background
+    /// jobs.
+    #[must_use]
+    pub fn interactive(&self) -> bool {
+        self.interactive
+    }
+
+    /// Marks the shell interactive or not; see [`Self::interactive`].
+    pub fn set_interactive(&mut self, on: bool) {
+        self.interactive = on;
+    }
+
+    /// Whether `name` was marked with `readonly`.
+    #[must_use]
+    pub fn is_readonly(&self, name: &str) -> bool {
+        self.readonly.contains(name)
+    }
+
+    pub(crate) fn set_readonly(&mut self, name: &str) {
+        self.readonly.insert(name.to_owned());
+    }
+
+    pub(crate) fn readonly_names(&self) -> impl Iterator<Item = &String> {
+        self.readonly.iter()
+    }
+
+    pub(crate) fn getopts_pos(&self) -> (usize, usize) {
+        self.getopts
+    }
+
+    pub(crate) fn set_getopts_pos(&mut self, optind: usize, offset: usize) {
+        self.getopts = (optind, offset);
+    }
+
     /// Takes the output logs and recorded stderr of a subshell copy, which
     /// started as a clone of this state.
     pub(crate) fn adopt_logs(&mut self, child: &mut Self) {
@@ -535,7 +587,16 @@ impl ShellState {
     pub fn from_env() -> Result<Self> {
         let vars = std::env::vars_os()
             .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)));
-        Ok(Self::new(std::env::current_dir()?, vars))
+        let vars: Vec<(String, String)> = vars.collect();
+        let cwd = std::env::current_dir()?;
+        // Like other shells, keep the inherited `$PWD` (which may contain
+        // symbolic links, such as `/tmp`) when it names the same directory.
+        let logical = vars
+            .iter()
+            .find(|(k, _)| k == "PWD")
+            .map(|(_, v)| PathBuf::from(v))
+            .filter(|p| p.is_absolute() && same_dir(p, &cwd));
+        Ok(Self::new(logical.unwrap_or(cwd), vars))
     }
 
     /// Current working directory.
@@ -600,6 +661,12 @@ impl ShellState {
         self.vars
             .iter()
             .filter(|(k, _)| self.exported.contains(k.as_str()))
+    }
+
+    /// Removes the value of `name` but keeps its export mark, so a value
+    /// restored later (when a function returns) is exported again.
+    pub(crate) fn clear_var(&mut self, name: &str) {
+        self.vars.remove(name);
     }
 
     /// Removes variable `name` and its export mark.

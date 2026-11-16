@@ -15,8 +15,16 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// scripts, README files, and directories (bundle installs and removals).
 /// Databases, sockets, and caches that happen to live nearby are ignored, so
 /// the shell's own writes (such as the history) never look like an edit.
+/// Hidden files such as Finder's `.DS_Store` are ignored too.
 #[must_use]
 pub fn is_config_path(path: &Path) -> bool {
+    if path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with('.'))
+    {
+        return false;
+    }
     match path.extension().and_then(|e| e.to_str()) {
         None => true,
         Some(e) => matches!(e.to_ascii_lowercase().as_str(), "toml" | "rushy" | "md"),

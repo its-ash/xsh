@@ -397,6 +397,21 @@ OPTIONS
     }
 
     #[test]
+    fn odd_man_output_does_not_panic() {
+        assert_eq!(clean("\u{8}\u{8}a\u{1b}"), "a");
+        assert_eq!(clean("é\u{8}éx\u{1b}["), "éx");
+        let text = "\u{a0}\u{a0}-é  accent\n\u{2003}-a\u{3000}\u{3000}ideographic\n  --日本\n  -\n  -x\t\ttab ü\n";
+        let o = parse_options(text);
+        assert!(
+            o.iter().any(|o| o.flag == "-x" && o.help == "tab ü"),
+            "{o:?}"
+        );
+        let long = format!("  -v  {}\n", "é".repeat(5_000));
+        let o = parse_options(&long);
+        assert_eq!(o[0].help.chars().count(), MAX_HELP);
+    }
+
+    #[test]
     fn page_names_are_validated() {
         for ok in ["ls", "git-commit", "g++", "python3.12"] {
             assert!(valid_name(ok), "{ok}");

@@ -12,6 +12,22 @@ use crate::{Error, Result};
 
 const SCROLLBACK: usize = 2_000;
 const READ_CHUNK: usize = 8_192;
+/// Widest pane; larger requests are clamped to keep the emulator's screen small.
+pub(crate) const MAX_COLS: u16 = 2_000;
+/// Tallest pane; larger requests are clamped to keep the emulator's screen small.
+pub(crate) const MAX_ROWS: u16 = 1_000;
+
+/// Smallest pane side. `vt100` 0.15 panics when a line wraps on a one-row
+/// screen (or a wide character meets a one-column one), so every pane is at
+/// least 2 x 2.
+pub(crate) const MIN_SIDE: u16 = 2;
+
+fn clamp_size(cols: u16, rows: u16) -> (u16, u16) {
+    (
+        cols.clamp(MIN_SIDE, MAX_COLS),
+        rows.clamp(MIN_SIDE, MAX_ROWS),
+    )
+}
 
 /// Pane identifier, unique per server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -101,7 +117,7 @@ impl Pane {
         rows: u16,
         events: UnboundedSender<PaneEvent>,
     ) -> Result<Self> {
-        let (cols, rows) = (cols.max(1), rows.max(1));
+        let (cols, rows) = clamp_size(cols, rows);
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows,
@@ -186,7 +202,7 @@ impl Pane {
     ///
     /// Fails if the PTY rejects the new size.
     pub fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
-        let (cols, rows) = (cols.max(1), rows.max(1));
+        let (cols, rows) = clamp_size(cols, rows);
         if self.size == (cols, rows) {
             return Ok(());
         }
@@ -238,5 +254,26 @@ impl Pane {
 impl Drop for Pane {
     fn drop(&mut self) {
         self.kill();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smallest_screen_survives_wrapping_output() {
+        let (cols, rows) = clamp_size(1, 1);
+        let mut p = vt100::Parser::new(rows, cols, 0);
+        p.process("wrapping text 日本語\r\nmore\r\n".repeat(20).as_bytes());
+        assert_eq!(p.screen().size(), (2, 2));
+    }
+
+    #[test]
+    fn sizes_are_clamped() {
+        assert_eq!(clamp_size(0, 0), (2, 2));
+        assert_eq!(clamp_size(1, 1), (2, 2));
+        assert_eq!(clamp_size(80, 24), (80, 24));
+        assert_eq!(clamp_size(u16::MAX, u16::MAX), (MAX_COLS, MAX_ROWS));
     }
 }

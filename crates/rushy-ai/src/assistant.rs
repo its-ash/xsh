@@ -82,11 +82,31 @@ impl std::fmt::Debug for Assistant<'_> {
     }
 }
 
-/// Extracts the first JSON object from model text (tolerating code fences).
+/// Extracts the first JSON object of type `T` from model text, ignoring
+/// prose and code fences around it (even prose with its own braces).
 fn json_object<T: for<'de> Deserialize<'de>>(text: &str) -> Option<T> {
-    let start = text.find('{')?;
-    let end = text.rfind('}')?;
-    serde_json::from_str(text.get(start..=end)?).ok()
+    text.match_indices('{').find_map(|(i, _)| {
+        serde_json::Deserializer::from_str(text.get(i..)?)
+            .into_iter::<T>()
+            .next()?
+            .ok()
+    })
+}
+
+/// The first command line in a plain reply, skipping a code fence and its
+/// language tag.
+fn first_command_line(text: &str) -> String {
+    let t = text.trim();
+    let body = t
+        .strip_prefix("```")
+        .map_or(t, |rest| rest.split_once('\n').map_or(rest, |(_, b)| b));
+    body.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with("```"))
+        .unwrap_or_default()
+        .trim_matches('`')
+        .trim()
+        .to_owned()
 }
 
 /// The `run_command` tool used by agent mode.
@@ -158,15 +178,7 @@ impl<'a> Assistant<'a> {
             .complete(self.suggest_request(nl, ctx))
             .await?;
         Ok(json_object(&res.content).unwrap_or_else(|| Suggestion {
-            command: res
-                .content
-                .trim()
-                .trim_matches('`')
-                .lines()
-                .next()
-                .unwrap_or_default()
-                .trim()
-                .to_owned(),
+            command: first_command_line(&res.content),
             explanation: String::new(),
         }))
     }
@@ -256,5 +268,35 @@ impl<'a> Assistant<'a> {
                 reason: format!("the safety review failed: {e}"),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_object_ignores_surrounding_braces() {
+        let s: Option<Suggestion> = json_object(
+            "Here you go:\n```json\n{\"command\": \"ls -la\", \"explanation\": \"lists\"}\n```\nUse {braces} for globs.",
+        );
+        assert_eq!(s.map(|s| s.command), Some("ls -la".to_owned()));
+        let r: Option<Review> =
+            json_object("In {short}: {\"safe\": true, \"reason\": \"read only\"} done}");
+        assert!(r.is_some_and(|r| r.safe));
+        assert!(json_object::<Review>("{\"safe\": ").is_none());
+        assert!(json_object::<Review>("no json").is_none());
+        assert!(json_object::<Review>("{\"reason\": \"missing safe\"}").is_none());
+    }
+
+    #[test]
+    fn first_command_line_skips_fences() {
+        assert_eq!(first_command_line("```bash\nls -la\n```"), "ls -la");
+        assert_eq!(first_command_line("```\n\ncargo build\n```"), "cargo build");
+        assert_eq!(first_command_line("`git status`"), "git status");
+        assert_eq!(first_command_line("```ls```"), "ls");
+        assert_eq!(first_command_line("  pwd  \nmore"), "pwd");
+        assert_eq!(first_command_line(""), "");
+        assert_eq!(first_command_line("```"), "");
     }
 }

@@ -73,6 +73,113 @@ fn wrong_key_is_rejected() -> TestResult {
     Ok(())
 }
 
+/// Regression: two shells opening a fresh database at once could each write
+/// their own salt and check, leaving one of them encrypting with a key that
+/// no longer matched the stored check.
+#[test]
+fn concurrent_first_open_agrees_on_one_key() -> TestResult {
+    const N: usize = 6;
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("h.db");
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(N));
+    let handles: Vec<_> = (0..N)
+        .map(|i| {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || -> Result<(), String> {
+                let pass = KeySource::Passphrase(Zeroizing::new("same".to_owned()));
+                barrier.wait();
+                let mut store = HistoryStore::open(&path, &pass).map_err(|e| e.to_string())?;
+                store
+                    .record(&entry(&format!("cmd {i}")))
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().map_err(|_| "thread panicked")??;
+    }
+    let pass = KeySource::Passphrase(Zeroizing::new("same".to_owned()));
+    let store = HistoryStore::open(&path, &pass)?;
+    assert_eq!(store.all()?.len(), N);
+    Ok(())
+}
+
+#[test]
+fn unicode_huge_and_blank_commands() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut store = HistoryStore::open(&dir.path().join("h.db"), &KeySource::Key(Key::generate()))?;
+    assert!(store.record(&entry(""))?.is_none());
+    assert!(store.record(&entry("  \t\n"))?.is_none());
+    let uni = "echo '日本語 🦀 é\u{0}'";
+    let huge = "x".repeat(1 << 20);
+    store.record(&entry(uni))?;
+    store.record(&entry(&huge))?;
+    store.record(&entry("  padded  "))?;
+    let cmds: Vec<String> = store.all()?.into_iter().map(|e| e.command).collect();
+    assert_eq!(cmds, [uni, huge.as_str(), "padded"]);
+    assert_eq!(store.recent(0)?.len(), 0);
+    assert_eq!(store.recent(1)?.len(), 1);
+    assert_eq!(store.search("", 0)?.len(), 0);
+    assert_eq!(
+        store.search("🦀", 10)?.first().map(|e| e.command.as_str()),
+        Some(uni)
+    );
+    assert!(store.search("zzzz-nothing", 10)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn import_rejects_malformed_json_and_skips_blank_commands() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut store = HistoryStore::open(&dir.path().join("h.db"), &KeySource::Key(Key::generate()))?;
+    for bad in ["", "{}", "[{\"id\": 1}]", "[", "null"] {
+        assert!(store.import_json(bad.as_bytes()).is_err(), "{bad:?}");
+    }
+    assert!(store.all()?.is_empty(), "a failed import must add nothing");
+    let row = |cmd: &str| {
+        format!(
+            "{{\"id\":1,\"ts\":5,\"command\":{cmd:?},\"cwd\":\"/\",\"exit_code\":null,\"duration_ms\":null,\"host\":\"h\",\"session_id\":\"s\"}}"
+        )
+    };
+    let json = format!("[{},{},{}]", row("ls"), row("   "), row(" pwd "));
+    assert_eq!(store.import_json(json.as_bytes())?, 2);
+    let cmds: Vec<String> = store.all()?.into_iter().map(|e| e.command).collect();
+    assert_eq!(cmds, ["ls", "pwd"]);
+    // `pwd` is now the last command, so it is not recorded again.
+    assert!(store.record(&entry("pwd"))?.is_none());
+    Ok(())
+}
+
+#[test]
+fn clear_removes_everything() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("h.db");
+    let key = KeySource::Key(Key::generate());
+    let mut store = HistoryStore::open(&path, &key)?;
+    store.record(&entry("one"))?;
+    store.clear()?;
+    assert!(store.all()?.is_empty());
+    // After a clear the same command may be recorded again.
+    assert!(store.record(&entry("one"))?.is_some());
+    drop(store);
+    assert_eq!(HistoryStore::open(&path, &key)?.all()?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn not_a_database_is_an_error() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("h.db");
+    std::fs::write(
+        &path,
+        "this is not sqlite, just some text that is long enough",
+    )?;
+    assert!(HistoryStore::open(&path, &KeySource::Key(Key::generate())).is_err());
+    Ok(())
+}
+
 #[test]
 fn pause_export_import() -> TestResult {
     let dir = tempfile::tempdir()?;

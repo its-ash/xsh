@@ -267,6 +267,94 @@ fn mux_screenshot_ascii_with_focus_and_content() -> TestResult {
 }
 
 #[test]
+fn mux_view_larger_than_frame_is_clipped() -> TestResult {
+    // The client shrank and the server's smaller layout has not arrived yet.
+    let theme = Theme::mono()?;
+    let v = view();
+    let mut screens = Screens::new();
+    screens.sync(&v);
+    screens.output(PaneId(2), b"right side");
+    // A three-row pane has a one-row inside; wrapping output must not
+    // panic the emulator.
+    let mut tiny = view();
+    tiny.panes[0].rect = Rect::new(0, 0, 3, 3);
+    screens.sync(&tiny);
+    screens.output(
+        PaneId(1),
+        "a long line that wraps 日本語\r\n".repeat(10).as_bytes(),
+    );
+    screens.snapshot(PaneId(1), b"abcdefgh\r\nijkl");
+    for (w, h) in [(10, 3), (1, 1), (25, 2)] {
+        let buf = draw(w, h, |f| {
+            mux::draw(
+                f,
+                &v,
+                &screens,
+                &theme,
+                None,
+                Options {
+                    ascii: true,
+                    status_bar: true,
+                },
+            );
+        })?;
+        assert_eq!(buf.area.width, w);
+    }
+    Ok(())
+}
+
+#[test]
+fn wide_characters_respect_widths() -> TestResult {
+    // CJK characters are two columns wide.
+    assert_eq!(rushy_tui::truncate("日本語ブランチ", 7, true), "日本語~");
+    assert_eq!(rushy_tui::truncate("日本", 4, true), "日本");
+    assert_eq!(rushy_tui::truncate("日本", 3, true), "日~");
+    assert_eq!(rushy_tui::truncate("日本", 1, true), "~");
+    assert_eq!(rushy_tui::truncate("abc", 0, true), "");
+
+    let theme = Theme::mono()?;
+    let info = StatusInfo {
+        session: "仕事のセッション名前".into(),
+        window: 1,
+        windows: 1,
+        pane: "%1".into(),
+        bundles: 0,
+        ai: AiState::Off,
+        clock: "09:00".into(),
+    };
+    for w in [0, 1, 5, 8, 20, 33, 60] {
+        let line = render_status(&theme, &info, w, false);
+        assert!(
+            line.width() == usize::from(w) || usize::from(w) < 7,
+            "width {w}: {}",
+            line.width()
+        );
+    }
+
+    let input = PromptInput {
+        user: "ユーザー",
+        host: "box",
+        path: "~/プロジェクト/日本語のディレクトリ",
+        status: 0,
+    };
+    let theme = Theme::builtin("tokyo-night")?;
+    // 12 columns of fixed text (user, spaces, `❯ `) plus a shortened path.
+    for width in [16, 20, 30, 40] {
+        let p = plain(&render_prompt(
+            &theme,
+            &input,
+            &BTreeMap::new(),
+            &Values::new(),
+            RenderOpts { width, ascii: true },
+        ));
+        let cols = ratatui::text::Span::raw(p.as_str()).width();
+        assert!(cols <= usize::from(width), "{width}: {p} is {cols} wide");
+        assert!(p.contains('~') && p.ends_with("❯ "), "{p}");
+    }
+    Ok(())
+}
+
+#[test]
 fn mux_unicode_borders_without_ascii_flag() -> TestResult {
     let theme = Theme::mono()?;
     let v = view();
@@ -359,6 +447,9 @@ fn only_config_files_count_as_config_changes() {
         "mux/default.sock",
         "registry.json",
         "ai/17-agent.bin",
+        ".DS_Store",
+        "themes/.DS_Store",
+        "themes/.mine.toml.swp",
     ] {
         assert!(!rushy_tui::is_config_path(Path::new(no)), "{no}");
     }

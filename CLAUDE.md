@@ -13,7 +13,7 @@ AI-native terminal app and shell for macOS only, in Rust (edition 2024) and Swif
 - `crates/rushy-pty`: panes, layout tree, `SessionManager`, multiplexer server and protocol.
 - `crates/rushy-tui`: themes, prompt, palette, status bar, mux drawing, config watcher.
 - `crates/rushy-cli`: the `xsh` binary (`repl.rs`, `exec.rs`, `cmds.rs`, `client.rs`, `keys.rs`, `man.rs` for man-page option suggestions, `bridge.rs` for `xsh app`, `agent_pane.rs` for the agent's right pane in the app).
-- `app/`: `xsh.app` (AppKit, SwiftUI, SwiftTerm). `Store.swift` reads `xsh app state` and writes through the `xsh` binary. `SettingsCatalog.swift` lists every setting. `bundle.sh` creates `target/xsh.app`.
+- `app/`: `xsh.app` (AppKit, SwiftUI, SwiftTerm). `Store.swift` reads `xsh app state` and writes through the `xsh` binary. `SettingsCatalog.swift` lists every setting. `bundle.sh` creates `target/xsh.app`. `app/Vendor/SwiftTerm` is a patched copy of SwiftTerm; read its `PATCHES.md` before you change or upgrade it.
 - `plugins/`: 14 reference bundles. `registry.json` holds their SHA-256 hashes.
 - `docs/manual-tests.md`: checks that need a real terminal.
 - `assets/xsh.svg`: app icon. `assets/rust.svg`: project icon.

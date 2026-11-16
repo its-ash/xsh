@@ -74,6 +74,12 @@ impl BundleStore {
             return (ok, bad);
         };
         for e in entries.flatten() {
+            // Only directories with a bundle name: this skips the hidden
+            // `.NAME.tmp` folder an interrupted install leaves behind, which
+            // would otherwise load as a second copy of the bundle.
+            if !e.file_name().to_str().is_some_and(valid_name) {
+                continue;
+            }
             let path = e.path();
             if path.join("bundle.toml").is_file() {
                 match Self::load_dir(&path) {
@@ -132,9 +138,19 @@ impl BundleStore {
             }
             std::fs::write(tmp.join(file), bytes)?;
         }
-        if let Err(e) = Self::load_dir(&tmp) {
-            let _ = std::fs::remove_dir_all(&tmp);
-            return Err(e);
+        match Self::load_dir(&tmp) {
+            Ok(b) if b.name() == name => {}
+            Ok(b) => {
+                let _ = std::fs::remove_dir_all(&tmp);
+                return Err(Error::Invalid {
+                    bundle: name.clone(),
+                    reason: format!("bundle.toml is named `{}`", b.name()),
+                });
+            }
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&tmp);
+                return Err(e);
+            }
         }
         let _ = std::fs::remove_dir_all(&dest);
         std::fs::rename(&tmp, &dest)?;

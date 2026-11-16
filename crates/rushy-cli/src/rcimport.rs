@@ -71,13 +71,37 @@ fn unquote(v: &str) -> String {
     v.to_owned()
 }
 
+/// Whether `k` is a valid variable name.
+fn is_name(k: &str) -> bool {
+    k.chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The first `NAME=value` entry of `env -0`, without the text that the rc
+/// file printed in front of it.
+fn skip_banner(first: &str) -> &str {
+    let starts_entry = |s: &str| s.split_once('=').is_some_and(|(k, _)| is_name(k));
+    if starts_entry(first) {
+        return first;
+    }
+    first
+        .match_indices('\n')
+        .map(|(i, _)| &first[i + 1..])
+        .find(|s| starts_entry(s))
+        .unwrap_or(first)
+}
+
 fn parse(out: &[u8]) -> Option<(BTreeMap<String, String>, BTreeMap<String, String>)> {
     let text = String::from_utf8_lossy(out);
     let (env_part, alias_part) = text.split_once(SEP)?;
     let env = env_part
         .split('\0')
+        .enumerate()
+        .map(|(i, kv)| if i == 0 { skip_banner(kv) } else { kv })
         .filter_map(|kv| kv.split_once('='))
-        .filter(|(k, _)| !k.is_empty() && !SKIP.contains(k))
+        .filter(|(k, _)| is_name(k) && !SKIP.contains(k))
         .filter(|(k, v)| std::env::var(k).ok().as_deref() != Some(*v))
         .map(|(k, v)| (k.to_owned(), v.to_owned()))
         .collect();
@@ -172,6 +196,18 @@ mod tests {
         assert_eq!(al.get("ll").map(String::as_str), Some("ls -l"));
         assert_eq!(al.get("gs").map(String::as_str), Some("git status"));
         assert_eq!(al.get("q").map(String::as_str), Some("it's"));
+    }
+
+    /// An rc file that prints a banner must not turn it into a variable name.
+    #[test]
+    fn output_of_the_rc_file_is_not_a_variable() {
+        let mut out = b"Welcome \xff \xc3\xa9 = x\nmore text\nXSH_T_B=2\0".to_vec();
+        out.extend_from_slice(b"1BAD=x\0=y\0A B=z\0");
+        out.extend_from_slice(SEP.as_bytes());
+        let (env, _) = parse(&out).unwrap_or_default();
+        assert_eq!(env.get("XSH_T_B").map(String::as_str), Some("2"));
+        assert_eq!(env.len(), 1, "{env:?}");
+        assert!(parse(b"no separator at all").is_none());
     }
 
     #[test]

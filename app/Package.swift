@@ -5,7 +5,9 @@ let package = Package(
     name: "XshApp",
     platforms: [.macOS(.v14)],
     dependencies: [
-        .package(url: "https://github.com/migueldeicaza/SwiftTerm", exact: "1.99.2")
+        // SwiftTerm v1.99.2 with a fix for typing lag in full screen; see
+        // Vendor/SwiftTerm/PATCHES.md before you upgrade it.
+        .package(path: "Vendor/SwiftTerm")
     ],
     targets: [
         .executableTarget(

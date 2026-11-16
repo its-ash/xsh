@@ -25,7 +25,9 @@ pub mod safety;
 mod transcript;
 
 pub use assistant::{Assistant, Failure, Settings, Suggestion, run_command_tool};
-pub use config::{AiConfig, KeySpec, ProviderConfig, Secret, delete_api_key, store_api_key};
+pub use config::{
+    AiConfig, KeySpec, ProviderConfig, Secret, delete_api_key, known_models, store_api_key,
+};
 pub use context::Context;
 pub use error::{Error, Result};
 pub use provider::{

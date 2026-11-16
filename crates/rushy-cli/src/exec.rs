@@ -22,31 +22,57 @@ const OWN: &[&str] = &[
     "adb-connect",
 ];
 
-/// Splits `line` at `;` and newlines outside quotes.
+/// Splits `line` at `;` and newlines outside quotes, parentheses, and
+/// backquotes. A `#` comment is dropped up to the end of its line. A line
+/// with a here-document (`<<`) is not split, since its body is data.
 pub fn split_top_level(line: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
-    let (mut single, mut double, mut escaped) = (false, false, false);
-    for c in line.chars() {
+    let (mut single, mut double, mut escaped, mut back) = (false, false, false, false);
+    let mut depth = 0usize;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
         if escaped {
             escaped = false;
             cur.push(c);
             continue;
         }
+        let quoted = single || double || back;
         match c {
             '\\' if !single => {
                 escaped = true;
                 cur.push(c);
             }
-            '\'' if !double => {
+            '\'' if !double && !back => {
                 single = !single;
                 cur.push(c);
             }
-            '"' if !single => {
+            '"' if !single && !back => {
                 double = !double;
                 cur.push(c);
             }
-            ';' | '\n' if !single && !double => {
+            '`' if !single => {
+                back = !back;
+                cur.push(c);
+            }
+            '(' if !quoted => {
+                depth += 1;
+                cur.push(c);
+            }
+            ')' if !quoted => {
+                depth = depth.saturating_sub(1);
+                cur.push(c);
+            }
+            '<' if !quoted && chars.peek() == Some(&'<') => return vec![line.to_owned()],
+            '#' if !quoted
+                && cur
+                    .chars()
+                    .last()
+                    .is_none_or(|p| p.is_whitespace() || "|&;()".contains(p)) =>
+            {
+                while chars.next_if(|&n| n != '\n').is_some() {}
+            }
+            ';' | '\n' if !quoted && depth == 0 => {
                 if cur.trim().is_empty() {
                     cur.clear();
                 } else {
@@ -151,11 +177,17 @@ pub async fn execute(app: &mut App, line: &str) -> Result<Flow> {
     let mut pending: Vec<String> = Vec::new();
     let mut flow = Flow::Continue;
     let mut result = Ok(());
-    // A compound command is not split at `;`, so the core sees it whole.
+    // A compound command is not split at `;`, so the core sees it whole. A
+    // line without a built-in of the binary also goes to the core unchanged.
     let segs = if crate::hist::is_compound(line) {
         vec![line.to_owned()]
     } else {
-        split_top_level(line)
+        let segs = split_top_level(line);
+        if segs.iter().any(|s| intercept(s, app).is_some()) {
+            segs
+        } else {
+            vec![line.to_owned()]
+        }
     };
     'segments: {
         for seg in segs {
@@ -207,5 +239,30 @@ mod tests {
         );
         assert_eq!(split_top_level(" ;; "), Vec::<String>::new());
         assert_eq!(split_top_level("bundle list"), ["bundle list"]);
+    }
+
+    #[test]
+    fn comments_are_dropped_and_do_not_hide_a_split() {
+        assert_eq!(
+            split_top_level("bundle list # a; rm x\necho b"),
+            ["bundle list ", "echo b"]
+        );
+        assert_eq!(
+            split_top_level("echo a#b; echo ${#x}"),
+            ["echo a#b", " echo ${#x}"]
+        );
+        assert_eq!(split_top_level("# only a comment"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn substitutions_and_heredocs_stay_whole() {
+        assert_eq!(
+            split_top_level("echo $(date; ls); bundle list"),
+            ["echo $(date; ls)", " bundle list"]
+        );
+        assert_eq!(split_top_level("echo `a;b`"), ["echo `a;b`"]);
+        let doc = "cat <<EOF\na;b\nEOF";
+        assert_eq!(split_top_level(doc), [doc]);
+        assert_eq!(split_top_level("échо 'ü;' ; ß"), ["échо 'ü;' ", " ß"]);
     }
 }

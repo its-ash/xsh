@@ -16,8 +16,11 @@ All notable changes are listed here. The format follows
 - Updates from GitHub releases: a daily check and **Check for Updates…**. A download must match its checksum and contain a signed app of the right version, and xsh asks before it installs.
 - A new app icon: a dark terminal screen with a prompt, in a metal frame.
 - Split panes have a title bar with a close button. Panes without focus are no longer dim by default, and a click on any pane gives it the focus.
-- In the app, `ai agent` opens a pane to the right for its commands. The left pane shows the model's text and the approvals.
+- In the app, `ai agent` and `ai claude` open a pane to the right for their commands. The left pane shows the model's text and the approvals. The right pane closes when the agent stops.
 - Agent autopilot: `ai agent --auto`, `Alt-A`, or the `autopilot` setting. Commands run without a question, up to 50 steps, and the safety checks stay on.
+- `ai claude <goal>`: Claude Code as the agent. Its built-in tools are off; it acts only through the tools of `xsh mcp` (commands, file reads and edits inside the working directory, shell state), so every command passes the safety guard and your approval.
+- `make install` and `make uninstall`: install `xsh.app` in `/Applications` and link `xsh` in `/usr/local/bin` (both can be changed).
+- `ai --model NAME` picks the model for one command. `ai <Tab>` completes the modes, and `ai --model <Tab>` the models.
 - `Ctrl-C` stops an agent run in either pane, a wait for the model, and a question from the agent.
 - A `custom` AI provider for any OpenAI-compatible service. In Settings > AI, enter the endpoint (such as `http://127.0.0.1:9694/v1`), click Fetch Models, and select a model.
 - Themes can set `cursor`, `selection`, and 16 `ansi` colors. New built-in themes: `dracula`, `nord`, `solarized-dark`, `solarized-light`.
@@ -35,6 +38,10 @@ All notable changes are listed here. The format follows
 - Layered configuration with located error messages.
 - Release workflow for macOS (x86_64 and aarch64).
 - Option suggestions from man pages: `-` then `Tab` offers the options of the command being typed, with descriptions. Man pages are read in the background after each command.
+- Fuzzy Tab completion: when nothing starts with the word, commands, subcommands, flags, files, folders, git branches, make targets, npm scripts, hosts, variables, and `ai` modes match fuzzily (`cd dwn` finds `Downloads/`, `git --nv` finds `--no-verify`). Prefix matches still come first, so a unique prefix completes at once.
+- The `neon` theme, now the default: void black, neon green text, acid yellow, hot red, and cyan.
+- `make theme`: a theme editor in the browser with a live preview of terminal output. Click any text to change its color, then export the theme as TOML.
+- Consolas is the default font when it is installed.
 
 ### Changed
 
@@ -46,6 +53,9 @@ All notable changes are listed here. The format follows
 
 ### Fixed
 
+- Typing lag in full screen. macOS shows the frames of a terminal in a native full-screen Space hundreds of milliseconds late, so full screen now covers the screen in the current Space instead, with the window buttons kept and the menu bar and Dock hidden.
+- The GPU renderer was never turned on: it was switched on before the terminal joined its window, which failed silently.
+- A key press could wait for a frame: SwiftTerm held a lock while it waited for a drawable, and every key press took the same lock. The app now uses a copy of SwiftTerm with this fixed (`app/Vendor/SwiftTerm`).
 - "configuration reloaded" printed after every command on macOS: the data folder was inside the watched config folder, so each history write looked like a config edit. The folders are now separate, and the watcher ignores database, socket, and cache files.
 
 ### Known limits

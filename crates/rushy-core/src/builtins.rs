@@ -38,6 +38,7 @@ pub const BUILTINS: &[(&str, &str)] = &[
     ("export", "set or list variables: export [NAME[=value] ...]"),
     ("false", "do nothing and fail"),
     ("fg", "resume a job and wait for it: fg [%job]"),
+    ("getopts", "parse options: getopts optstring name [arg ...]"),
     ("help", "list built-in commands: help [name ...]"),
     ("history", "list or clear history: history [-c] [count]"),
     ("jobs", "list background jobs"),
@@ -45,6 +46,7 @@ pub const BUILTINS: &[(&str, &str)] = &[
         "kill",
         "signal jobs or processes: kill [-SIGNAL] %job|pid ...",
     ),
+    ("let", "evaluate arithmetic: let expr ..."),
     ("local", "make function variables: local NAME[=value] ..."),
     ("popd", "leave a pushed directory: popd [+N]"),
     ("printf", "print formatted text: printf format [args]"),
@@ -53,6 +55,10 @@ pub const BUILTINS: &[(&str, &str)] = &[
     (
         "read",
         "read a line into variables: read [-r] [-p prompt] [-d delim] [name ...]",
+    ),
+    (
+        "readonly",
+        "make variables read-only: readonly [NAME[=value] ...]",
     ),
     ("return", "return from a function: return [status]"),
     (
@@ -172,6 +178,9 @@ pub(crate) async fn run(
         "echo" => echo(args),
         "exit" => exit(args, state),
         "export" => export(args, state),
+        "getopts" => getopts(args, state),
+        "let" => let_cmd(args, state),
+        "readonly" => readonly(args, state),
         "fg" => fg(args, &state.foreground(), jobs).await,
         "help" => help(args),
         "history" => history(args, state),
@@ -180,6 +189,10 @@ pub(crate) async fn run(
         "popd" => popd(args, state).await,
         "printf" => printf(args),
         "pushd" => pushd(args, state).await,
+        "pwd" if physical_flag(args) => match std::fs::canonicalize(state.cwd()) {
+            Ok(p) => Output::out(format!("{}\n", p.display())),
+            Err(e) => Output::fail(1, format!("pwd: {e}")),
+        },
         "pwd" => Output::out(format!("{}\n", state.cwd().display())),
         "set" => set(args, state),
         "shift" => shift(args, state),
@@ -218,11 +231,42 @@ pub(crate) fn quote_if_needed(value: &str) -> String {
     }
 }
 
-/// Changes to `target`; returns the new directory.
-async fn change_dir(target: &str, state: &mut ShellState) -> Result<PathBuf, String> {
-    let dir = match tokio::fs::canonicalize(state.resolve(target)).await {
-        Ok(d) => d,
-        Err(e) => return Err(format!("cd: {target}: {e}")),
+/// Resolves `.` and `..` in an absolute path by text, the way `cd -L`
+/// does: `/tmp/..` is `/` even when `/tmp` is a symbolic link.
+fn normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        out.push("/");
+    }
+    out
+}
+
+/// Changes to `target`; returns the new directory. A logical change keeps
+/// symbolic links in the path (as `cd` and `cd -L` do); a physical one
+/// (`cd -P`) resolves them.
+async fn change_dir(
+    target: &str,
+    state: &mut ShellState,
+    physical: bool,
+) -> Result<PathBuf, String> {
+    let joined = state.resolve(target);
+    let dir = if physical {
+        match tokio::fs::canonicalize(&joined).await {
+            Ok(d) => d,
+            Err(e) => return Err(format!("cd: {target}: {e}")),
+        }
+    } else {
+        normalize(&joined)
     };
     match tokio::fs::metadata(&dir).await {
         Ok(m) if m.is_dir() => {}
@@ -234,6 +278,14 @@ async fn change_dir(target: &str, state: &mut ShellState) -> Result<PathBuf, Str
     state.set_env("PWD", dir.display().to_string());
     state.set_cwd(dir.clone());
     Ok(dir)
+}
+
+/// Whether the last of `-L` and `-P` in `args` is `-P`.
+fn physical_flag(args: &[String]) -> bool {
+    args.iter()
+        .rev()
+        .find(|a| *a == "-L" || *a == "-P")
+        .is_some_and(|a| a == "-P")
 }
 
 fn via_cdpath(target: &str, state: &ShellState) -> Option<String> {
@@ -257,6 +309,7 @@ fn via_cdpath(target: &str, state: &ShellState) -> Option<String> {
 }
 
 async fn cd(args: &[String], state: &mut ShellState) -> Output {
+    let physical = physical_flag(args);
     let args: Vec<&String> = args.iter().filter(|a| *a != "-L" && *a != "-P").collect();
     if args.len() > 1 {
         return Output::fail(1, "cd: too many arguments");
@@ -283,7 +336,7 @@ async fn cd(args: &[String], state: &mut ShellState) -> Output {
         via_cdpath(&target, state)
     };
     let print = dash || found.is_some();
-    match change_dir(found.as_deref().unwrap_or(&target), state).await {
+    match change_dir(found.as_deref().unwrap_or(&target), state, physical).await {
         Ok(dir) => Output::out(if print {
             format!("{}\n", dir.display())
         } else {
@@ -369,7 +422,7 @@ async fn pushd(args: &[String], state: &mut ShellState) -> Output {
             .map(|p| p.display().to_string())
             .unwrap_or_default(),
     };
-    if let Err(e) = change_dir(&dest, state).await {
+    if let Err(e) = change_dir(&dest, state, false).await {
         return Output::fail(1, e.replacen("cd:", "pushd:", 1));
     }
     let rest: Vec<PathBuf> = if target.is_some() {
@@ -403,7 +456,7 @@ async fn popd(args: &[String], state: &mut ShellState) -> Output {
         Some(a) => Output::fail(2, format!("popd: {a}: invalid argument")),
         None => {
             let next = state.dirs_mut().remove(0);
-            match change_dir(&next.display().to_string(), state).await {
+            match change_dir(&next.display().to_string(), state, false).await {
                 Ok(_) => Output::out(show_dirs(state)),
                 Err(e) => Output::fail(1, e.replacen("cd:", "popd:", 1)),
             }
@@ -449,6 +502,10 @@ fn export(args: &[String], state: &mut ShellState) -> Output {
             continue;
         }
         if let Some(v) = value {
+            if state.is_readonly(name) {
+                res.error(1, format!("export: {name}: readonly variable"));
+                continue;
+            }
             state.set_var(name, v);
         }
         state.set_exported(name, !unexport);
@@ -466,6 +523,9 @@ fn unset(args: &[String], state: &mut ShellState) -> Output {
             _ if funcs => {
                 state.remove_function(a);
             }
+            _ if state.is_readonly(a) => {
+                res.error(1, format!("unset: {a}: cannot unset: readonly variable"));
+            }
             _ if is_var_name(a) => {
                 if state.var(a).is_none() {
                     state.remove_function(a);
@@ -475,6 +535,157 @@ fn unset(args: &[String], state: &mut ShellState) -> Output {
             _ => res.error(1, format!("unset: `{a}`: not a valid identifier")),
         }
     }
+    res
+}
+
+/// `readonly [-p] [NAME[=value] ...]`.
+fn readonly(args: &[String], state: &mut ShellState) -> Output {
+    let names: Vec<&String> = args.iter().filter(|a| *a != "-p").collect();
+    if names.is_empty() {
+        let mut out = String::new();
+        for k in state.readonly_names() {
+            match state.var(k) {
+                Some(v) => {
+                    let _ = writeln!(out, "readonly {k}={}", quote(v));
+                }
+                None => {
+                    let _ = writeln!(out, "readonly {k}");
+                }
+            }
+        }
+        return Output::out(out);
+    }
+    let mut res = Output::default();
+    for a in names {
+        let (name, value) = a
+            .split_once('=')
+            .map_or((a.as_str(), None), |(n, v)| (n, Some(v)));
+        if !is_var_name(name) {
+            res.error(1, format!("readonly: `{a}`: not a valid identifier"));
+            continue;
+        }
+        if let Some(v) = value {
+            if state.is_readonly(name) {
+                res.error(1, format!("readonly: {name}: readonly variable"));
+                continue;
+            }
+            state.set_var(name, v);
+        }
+        state.set_readonly(name);
+    }
+    res
+}
+
+/// `let expr ...`: evaluates each arithmetic expression; fails when the
+/// last one is 0.
+fn let_cmd(args: &[String], state: &mut ShellState) -> Output {
+    if args.is_empty() {
+        return Output::fail(2, "let: expression expected");
+    }
+    let mut last = 0;
+    for a in args {
+        match crate::arith::eval(a, state) {
+            Ok(v) => last = v,
+            Err(e) => return Output::fail(1, format!("xsh: let: {e}")),
+        }
+    }
+    Output::status(i32::from(last == 0))
+}
+
+/// `getopts optstring name [arg ...]`: parses the next option from `arg`s
+/// (or the positional parameters) and advances `OPTIND`.
+fn getopts(args: &[String], state: &mut ShellState) -> Output {
+    let [spec, name, rest @ ..] = args else {
+        return Output::fail(2, "getopts: usage: getopts optstring name [arg ...]");
+    };
+    if !is_var_name(name) {
+        return Output::fail(2, format!("getopts: `{name}`: not a valid identifier"));
+    }
+    let words: Vec<String> = if rest.is_empty() {
+        state.positional().to_vec()
+    } else {
+        rest.to_vec()
+    };
+    let silent = spec.starts_with(':');
+    let spec: Vec<char> = spec.trim_start_matches(':').chars().collect();
+    let mut ind = state
+        .var("OPTIND")
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let (seen, mut offset) = state.getopts_pos();
+    if seen != ind {
+        offset = 0;
+    }
+    let finish = |state: &mut ShellState, ind: usize, offset: usize| {
+        state.set_var("OPTIND", ind.to_string());
+        state.set_getopts_pos(ind, offset);
+    };
+    let word: Vec<char> = match words.get(ind - 1) {
+        Some(w) if offset > 0 => w.chars().collect(),
+        Some(w) if w.len() > 1 && w.starts_with('-') && w != "--" => {
+            offset = 1;
+            w.chars().collect()
+        }
+        other => {
+            if other.is_some_and(|w| w == "--") {
+                ind += 1;
+            }
+            state.set_var(name.clone(), "?");
+            state.unset_var("OPTARG");
+            finish(state, ind, 0);
+            return Output::status(1);
+        }
+    };
+    let Some(&c) = word.get(offset) else {
+        // The saved offset is past this word; move on to the next one.
+        finish(state, ind + 1, 0);
+        return getopts(args, state);
+    };
+    offset += 1;
+    let at_end = offset >= word.len();
+    let mut res = Output::default();
+    let opt = c.to_string();
+    match spec.iter().position(|&s| s == c && s != ':') {
+        None => {
+            state.set_var(name.clone(), "?");
+            if silent {
+                state.set_var("OPTARG", opt);
+            } else {
+                state.unset_var("OPTARG");
+                res.stderr = format!("xsh: getopts: illegal option -- {c}\n");
+            }
+        }
+        Some(i) if spec.get(i + 1) == Some(&':') => {
+            if !at_end {
+                let value: String = word.get(offset..).unwrap_or_default().iter().collect();
+                state.set_var("OPTARG", value);
+                state.set_var(name.clone(), opt);
+            } else if let Some(value) = words.get(ind) {
+                state.set_var("OPTARG", value.clone());
+                state.set_var(name.clone(), opt);
+                ind += 1;
+            } else if silent {
+                state.set_var(name.clone(), ":");
+                state.set_var("OPTARG", opt);
+            } else {
+                state.set_var(name.clone(), "?");
+                state.unset_var("OPTARG");
+                res.stderr = format!("xsh: getopts: option requires an argument -- {c}\n");
+            }
+            // An option argument always ends the word.
+            offset = word.len();
+        }
+        Some(_) => {
+            state.set_var(name.clone(), opt);
+            state.unset_var("OPTARG");
+        }
+    }
+    if offset >= word.len() {
+        ind += 1;
+        offset = 0;
+    }
+    finish(state, ind, offset);
     res
 }
 

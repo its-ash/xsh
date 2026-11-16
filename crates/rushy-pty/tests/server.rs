@@ -136,7 +136,17 @@ async fn sessions_survive_detach_and_reattach() -> TestResult {
     let mut again = Vec::new();
     until_text(io, &mut again, "persisted-42").await?;
 
-    write_frame(io, &ClientMsg::Kill("work".into())).await?;
+    // Killing the session from another client tells the attached one.
+    let mut killer = server::connect(&mux).await?;
+    write_frame(&mut killer, &ClientMsg::Kill("work".into())).await?;
+    assert!(matches!(next(&mut killer).await?, ServerMsg::Ok));
+    loop {
+        match next(io).await? {
+            ServerMsg::Exited => break,
+            ServerMsg::Output(..) | ServerMsg::Snapshot(..) | ServerMsg::View(_) => {}
+            other => return Err(format!("expected Exited, got {other:?}").into()),
+        }
+    }
     task.abort();
     Ok(())
 }

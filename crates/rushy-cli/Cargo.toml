@@ -24,6 +24,7 @@ rushy-history = { path = "../rushy-history" }
 rushy-pty = { path = "../rushy-pty" }
 rushy-tui = { path = "../rushy-tui" }
 chrono.workspace = true
+globset.workspace = true
 reedline.workspace = true
 reqwest.workspace = true
 semver.workspace = true

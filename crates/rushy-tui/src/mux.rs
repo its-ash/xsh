@@ -67,7 +67,9 @@ impl Screens {
             .retain(|id, _| view.panes.iter().any(|p| p.id == *id));
         for p in &view.panes {
             let inner = p.rect.inner();
-            let (rows, cols) = (inner.height, inner.width);
+            // `vt100` 0.15 panics when a line wraps on a one-row screen;
+            // the server never makes a pane smaller than 2 x 2 either.
+            let (rows, cols) = (inner.height.max(2), inner.width.max(2));
             self.parsers
                 .entry(p.id)
                 .and_modify(|s| {
@@ -150,7 +152,12 @@ fn blit(buf: &mut Buffer, area: UiRect, screen: &vt100::Screen, plain: bool) {
 }
 
 fn draw_pane(f: &mut Frame<'_>, p: &PaneView, screens: &Screens, theme: &Theme, opts: Options) {
-    let area = ui_rect(p.rect);
+    // The view may describe a larger terminal than the frame (the client
+    // shrank and the server's new layout has not arrived yet): clip.
+    let area = ui_rect(p.rect).intersection(f.area());
+    if area.is_empty() {
+        return;
+    }
     let title = if p.focused {
         format!(" {} {} ", p.id, if opts.ascii { "[active]" } else { "●" })
     } else {

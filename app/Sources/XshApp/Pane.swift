@@ -161,7 +161,11 @@ final class Pane: NSView, LocalProcessTerminalViewDelegate {
     private let agentSocket: String?
     private var oscObservation: TerminalOscObservation?
     private var font: NSFont?
-    private var usingGPU: Bool?
+    /// The GPU switch still to apply, as `apply()` last read it. `nil` once it
+    /// took effect or when nothing was read yet; a failed attempt leaves it
+    /// set so the next `apply()` retries. The installed renderer is SwiftTerm's
+    /// `surface.isUsingMetalRenderer`.
+    private var pendingGPU: Bool?
     private var scrollback: Int?
     private(set) var title = ""
     private(set) var exited = false
@@ -307,16 +311,36 @@ final class Pane: NSView, LocalProcessTerminalViewDelegate {
             if scrollback != nil { t.changeScrollback(lines > 0 ? lines : nil) }
             scrollback = lines
         }
-        let gpu = s.bool("terminal.gpu")
-        if gpu != usingGPU {
-            try? t.setUseMetal(gpu)
-            usingGPU = gpu
-        }
+        pendingGPU = s.bool("terminal.gpu")
+        applyGPU()
         layer?.backgroundColor = NSColor.clear.cgColor
         updateDim()
         updateHeader()
         needsLayout = true
         needsDisplay = true
+    }
+
+    /// Turns the GPU renderer on or off.
+    ///
+    /// SwiftTerm owns a Metal surface bound to the pane's window: the switch
+    /// has to run after the pane joins one, and the retry flag clears as soon
+    /// as `setUseMetal` succeeds. GPU drawing saves a full CPU repaint of the
+    /// pane's pixels per keystroke, a cost that only shows at large sizes.
+    private func applyGPU() {
+        guard window != nil, let gpu = pendingGPU else { return }
+        pendingGPU = nil
+        do {
+            try surface.setUseMetal(gpu)
+        } catch let error {
+            let detail = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+            NSLog("%@", "xsh: GPU rendering unavailable: \(detail)")
+            // Keep `pendingGPU` set, so the next apply retries.
+        }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        applyGPU()
     }
 
     private func updateDim() {
@@ -384,7 +408,8 @@ final class Pane: NSView, LocalProcessTerminalViewDelegate {
     func processTerminated(source: TerminalView, exitCode: Int32?) {
         exited = true
         let mode = Store.shared.string("window.on_exit")
-        let close = mode == "close" || (mode == "close_clean" && exitCode == 0)
+        // The agent pane ends with its agent: it always closes.
+        let close = agentSocket != nil || mode == "close" || (mode == "close_clean" && exitCode == 0)
         if close {
             owner?.remove(self)
         } else {

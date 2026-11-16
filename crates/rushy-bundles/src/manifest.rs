@@ -137,7 +137,7 @@ pub fn valid_name(name: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
 }
 
-fn valid_alias(name: &str) -> bool {
+pub(crate) fn valid_alias(name: &str) -> bool {
     !name.is_empty()
         && !name
             .chars()

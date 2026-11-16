@@ -541,3 +541,154 @@ async fn background_jobs_are_reaped() -> TestResult {
     }
     Err("background job never finished".into())
 }
+
+#[tokio::test]
+async fn getopts_parses_options_like_posix() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut sh = shell(dir.path());
+    let script = r#"
+while getopts "ab:c" o -acb val -c -- -a; do echo "$o=${OPTARG-}"; done; echo "ind=$OPTIND"
+OPTIND=1
+while getopts "ab:" o -bval -x 2>/dev/null; do echo "$o=${OPTARG-unset}"; done; echo "ind=$OPTIND"
+OPTIND=1
+while getopts ":ab:" o -x -b; do echo "$o=${OPTARG-unset}"; done; echo "ind=$OPTIND"
+f() { local OPTIND; while getopts v o "$@"; do echo "f:$o"; done; shift $((OPTIND-1)); echo "rest=$*"; }
+f -v -v x y; f -v z
+OPTIND=1; getopts a o x; echo "$? $o $OPTIND"
+OPTIND=1; getopts é: o -éarg; echo "$o $OPTARG"
+getopts; echo "usage $?"
+"#;
+    let o = out(&mut sh, dir.path(), script).await?;
+    assert_eq!(
+        o,
+        "a=\nc=\nb=val\nc=\nind=5\n\
+         b=val\n?=unset\nind=3\n\
+         ?=x\n:=b\nind=3\n\
+         f:v\nf:v\nrest=x y\nf:v\nrest=z\n\
+         1 ? 1\n\
+         é arg\n\
+         usage 2\n"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn local_without_value_starts_unset_and_restores_exports() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut sh = shell(dir.path());
+    let script = r#"
+x=5; export XSH_T=outer
+f() { local x XSH_T; echo "[${x-unset}][${XSH_T-unset}]"; x=6; XSH_T=inner; }
+f; echo "$x"; sh -c 'echo "child=$XSH_T"'
+"#;
+    let o = out(&mut sh, dir.path(), script).await?;
+    assert_eq!(o, "[unset][unset]\n5\nchild=outer\n");
+    Ok(())
+}
+
+#[tokio::test]
+async fn cd_is_logical_by_default_and_physical_with_p() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let root = tokio::fs::canonicalize(dir.path()).await?;
+    tokio::fs::create_dir_all(root.join("real/sub")).await?;
+    tokio::fs::symlink(root.join("real/sub"), root.join("link")).await?;
+    let mut sh = shell(&root);
+    let r = root.display();
+    let o = out(
+        &mut sh,
+        &root,
+        &format!(
+            "cd {r}/link; pwd; pwd -P; cd ..; pwd; cd ./link/../link/.; pwd; cd -P link 2>/dev/null || cd -P {r}/link; pwd; cd -L -P {r}/link; pwd; cd /; cd ..; pwd"
+        ),
+    )
+    .await?;
+    assert_eq!(
+        o,
+        format!("{r}/link\n{r}/real/sub\n{r}\n{r}/link\n{r}/real/sub\n{r}/real/sub\n/\n")
+    );
+    sh.run_line(&format!("cd {r}/link/missing 2>/dev/null"))
+        .await?;
+    assert_eq!(sh.last_status(), 1);
+    assert_eq!(sh.state().cwd(), Path::new("/"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn let_evaluates_arithmetic() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut sh = shell(dir.path());
+    let o = out(
+        &mut sh,
+        dir.path(),
+        "let x=3+4 y=x*2; echo $x $y $?; let 0; echo $?; let '1/0' 2>/dev/null; echo $?",
+    )
+    .await?;
+    assert_eq!(o, "7 14 0\n1\n1\n");
+    Ok(())
+}
+
+#[tokio::test]
+async fn readonly_variables_cannot_change() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut sh = shell(dir.path());
+    let o = out(
+        &mut sh,
+        dir.path(),
+        "readonly r=1 q; unset r 2>/dev/null; echo $? $r; export r=3 2>/dev/null; echo $? $r; readonly r=4 2>/dev/null; echo $? $r",
+    )
+    .await?;
+    assert_eq!(o, "1 1\n1 1\n1 1\n");
+    // A plain assignment aborts the rest of the line, as in bash.
+    sh.run_line("r=2 2>/dev/null; echo never > never.txt")
+        .await?;
+    assert_eq!(sh.last_status(), 1);
+    assert!(read(dir.path(), "never.txt").await.is_err());
+    sh.run_line("r=2 true 2>/dev/null").await?;
+    assert_eq!(sh.last_status(), 1);
+    assert_eq!(sh.state().var("r"), Some("1"));
+    assert!(sh.state().is_readonly("r"));
+    Ok(())
+}
+
+/// Infinite recursion through functions or `source` stops at the nesting
+/// limit instead of overflowing the stack and aborting the process. Runs on
+/// a thread with a large stack, as the `xsh` binary does.
+#[test]
+fn runaway_recursion_hits_the_nesting_limit() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_path_buf();
+    let worker = std::thread::Builder::new()
+        .stack_size(512 * 1024 * 1024)
+        .spawn(move || -> Result<(), String> {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            rt.block_on(async {
+                let mut sh = shell(&root);
+                std::fs::write(root.join("self.sh"), "source ./self.sh\n")
+                    .map_err(|x| x.to_string())?;
+                // The limit aborts the rest of the line, so each case gets one.
+                for line in [
+                    "f() { f; }; f 2>/dev/null",
+                    "echo f=$? >> out.txt",
+                    "g() { echo $(g); }; g 2>/dev/null >/dev/null",
+                    "source ./self.sh 2>/dev/null",
+                    "echo s=$? >> out.txt",
+                    "n=0; h() { n=$((n+1)); [ $n -lt 900 ] && h; }; h; echo n=$n >> out.txt",
+                ] {
+                    sh.run_line(line).await.map_err(|x| x.to_string())?;
+                }
+                let o = std::fs::read_to_string(root.join("out.txt")).map_err(|x| x.to_string())?;
+                if o == "f=1\ns=1\nn=900\n" {
+                    Ok(())
+                } else {
+                    Err(format!("unexpected output: {o:?}"))
+                }
+            })
+        })?;
+    worker
+        .join()
+        .map_err(|_| "recursion test thread panicked")??;
+    Ok(())
+}

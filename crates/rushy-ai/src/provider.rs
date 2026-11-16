@@ -161,3 +161,17 @@ pub fn tail(text: &str, max: usize) -> &str {
     }
     text.get(start..).unwrap_or_default()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tail_keeps_char_boundaries() {
+        assert_eq!(tail("héllo", 100), "héllo");
+        assert_eq!(tail("héllo", 4), "llo");
+        assert_eq!(tail("日本語", 4), "語");
+        assert_eq!(tail("日本語", 2), "");
+        assert_eq!(tail("abc", 0), "");
+    }
+}

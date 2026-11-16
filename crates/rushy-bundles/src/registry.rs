@@ -12,6 +12,7 @@ use crate::{Error, Result};
 
 const MAX_DOWNLOAD: usize = 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_REDIRECTS: usize = 10;
 
 /// Files a bundle may ship besides `bundle.toml`.
 pub const EXTRA_FILES: &[&str] = &["init.rushy", "README.md"];
@@ -105,8 +106,28 @@ impl RegistryClient {
             url: url.to_owned(),
             reason: e.to_string(),
         })?;
+        // A redirect must stay on an allowlisted host, or a redirect from an
+        // allowed host would bypass `bundles.allowed_hosts`.
+        let hosts = allowed_hosts.to_vec();
+        let redirects = reqwest::redirect::Policy::custom(move |attempt| {
+            let host = attempt.url().host_str().unwrap_or_default();
+            if attempt.previous().len() >= MAX_REDIRECTS {
+                attempt.error("too many redirects")
+            } else if attempt.url().scheme() == "https"
+                && hosts.iter().any(|h| h.eq_ignore_ascii_case(host))
+            {
+                attempt.follow()
+            } else {
+                let msg = format!(
+                    "redirect to {} is not in bundles.allowed_hosts",
+                    attempt.url()
+                );
+                attempt.error(msg)
+            }
+        });
         let http = reqwest::Client::builder()
             .https_only(true)
+            .redirect(redirects)
             .timeout(TIMEOUT)
             .user_agent(concat!("xsh/", env!("CARGO_PKG_VERSION")))
             .build()?;
@@ -152,6 +173,10 @@ impl RegistryClient {
 
     async fn get(&self, url: &Url) -> Result<Vec<u8>> {
         self.check(url)?;
+        let too_large = || Error::Url {
+            url: url.to_string(),
+            reason: "file is larger than 1 MiB".into(),
+        };
         let bytes = if url.scheme() == "file" {
             let path = url.to_file_path().map_err(|()| Error::Url {
                 url: url.to_string(),
@@ -159,7 +184,7 @@ impl RegistryClient {
             })?;
             tokio::fs::read(path).await?
         } else {
-            let res = self
+            let mut res = self
                 .http
                 .get(url.clone())
                 .send()
@@ -169,18 +194,21 @@ impl RegistryClient {
                 .content_length()
                 .is_some_and(|n| n > MAX_DOWNLOAD as u64)
             {
-                return Err(Error::Url {
-                    url: url.to_string(),
-                    reason: "file is larger than 1 MiB".into(),
-                });
+                return Err(too_large());
             }
-            res.bytes().await?.to_vec()
+            // Read in chunks and stop at the limit: a server that sends no
+            // length (or a wrong one) must not make us buffer without end.
+            let mut body = Vec::new();
+            while let Some(chunk) = res.chunk().await? {
+                if body.len() + chunk.len() > MAX_DOWNLOAD {
+                    return Err(too_large());
+                }
+                body.extend_from_slice(&chunk);
+            }
+            body
         };
         if bytes.len() > MAX_DOWNLOAD {
-            return Err(Error::Url {
-                url: url.to_string(),
-                reason: "file is larger than 1 MiB".into(),
-            });
+            return Err(too_large());
         }
         Ok(bytes)
     }

@@ -122,22 +122,21 @@ impl HistoryStore {
         }
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
-        let salt = if let Some(s) = meta(&conn, "salt")? {
-            s
-        } else {
+        // Two shells can create the database at the same moment. The first
+        // salt and check written win and everyone reads them back, so no
+        // process keeps a key that no longer matches the stored check.
+        let salt = {
             let mut s = vec![0u8; 16];
             rand::rngs::OsRng.fill_bytes(&mut s);
-            set_meta(&conn, "salt", &s)?;
-            s
+            meta_or_insert(&conn, "salt", &s)?
         };
         let cipher = Cipher::new(&source.resolve(&salt)?);
-        match meta(&conn, "check")? {
-            Some(check) => {
-                if cipher.open(&check, AAD_CHECK).ok().as_deref() != Some(CHECK_PLAINTEXT) {
-                    return Err(Error::WrongKey);
-                }
-            }
-            None => set_meta(&conn, "check", &cipher.seal(CHECK_PLAINTEXT, AAD_CHECK)?)?,
+        let check = match meta(&conn, "check")? {
+            Some(check) => check,
+            None => meta_or_insert(&conn, "check", &cipher.seal(CHECK_PLAINTEXT, AAD_CHECK)?)?,
+        };
+        if cipher.open(&check, AAD_CHECK).ok().as_deref() != Some(CHECK_PLAINTEXT) {
+            return Err(Error::WrongKey);
         }
         let mut store = Self {
             conn,
@@ -262,7 +261,7 @@ impl HistoryStore {
     }
 
     /// Imports entries from a JSON array produced by [`HistoryStore::export_json`].
-    /// Returns the number of entries added.
+    /// Returns the number of entries added; blank commands are skipped.
     ///
     /// # Errors
     ///
@@ -270,7 +269,12 @@ impl HistoryStore {
     pub fn import_json(&mut self, input: impl std::io::Read) -> Result<usize> {
         let entries: Vec<Entry> = serde_json::from_reader(input)?;
         let tx = self.conn.unchecked_transaction()?;
+        let mut added = 0;
         for e in &entries {
+            let command = e.command.trim();
+            if command.is_empty() {
+                continue;
+            }
             let new = NewEntry {
                 command: e.command.clone(),
                 cwd: e.cwd.clone(),
@@ -280,11 +284,12 @@ impl HistoryStore {
                 session_id: e.session_id.clone(),
                 ts: Some(e.ts),
             };
-            self.insert(&new, e.command.trim())?;
+            self.insert(&new, command)?;
+            added += 1;
         }
         tx.commit()?;
         self.last = self.recent(1)?.pop().map(|e| e.command);
-        Ok(entries.len())
+        Ok(added)
     }
 
     /// Deletes every entry.
@@ -333,6 +338,16 @@ fn meta(conn: &Connection, key: &str) -> Result<Option<Vec<u8>>> {
     Ok(conn
         .query_row("SELECT v FROM meta WHERE k = ?1", [key], |r| r.get(0))
         .optional()?)
+}
+
+/// Stores `value` under `key` unless a value is already there, and returns
+/// the stored value.
+fn meta_or_insert(conn: &Connection, key: &str, value: &[u8]) -> Result<Vec<u8>> {
+    conn.execute(
+        "INSERT OR IGNORE INTO meta (k, v) VALUES (?1, ?2)",
+        params![key, value],
+    )?;
+    meta(conn, key)?.ok_or(Error::Db(rusqlite::Error::QueryReturnedNoRows))
 }
 
 fn set_meta(conn: &Connection, key: &str, value: &[u8]) -> Result<()> {

@@ -70,6 +70,90 @@ fn echo_pipe_wc_counts_six_bytes() -> TestResult {
 }
 
 #[test]
+fn exit_trap_runs_at_the_end_of_c_and_scripts() -> TestResult {
+    let e = Env::new()?;
+    let o = e.run(&["-c", "trap 'echo bye $?' EXIT; echo hi; false"])?;
+    assert_eq!(out(&o), "hi\nbye 1\n");
+    assert_eq!(o.status.code(), Some(1));
+    // `exit` runs the trap once, not again at the end.
+    let o = e.run(&["-c", "trap 'echo bye' EXIT; exit 3"])?;
+    assert_eq!(out(&o), "bye\n");
+    assert_eq!(o.status.code(), Some(3));
+    std::fs::write(e.path("t.sh"), "trap 'echo done' EXIT\necho body\n")?;
+    let o = e.run(&["t.sh"])?;
+    assert_eq!(out(&o), "body\ndone\n");
+    let mut child = e
+        .command()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .ok_or("no stdin")?
+        .write_all(b"trap 'echo piped' EXIT\necho in\n")?;
+    let o = child.wait_with_output()?;
+    assert_eq!(out(&o), "in\npiped\n");
+    Ok(())
+}
+
+#[test]
+fn scripts_do_not_announce_background_jobs() -> TestResult {
+    let e = Env::new()?;
+    let o = e.run(&["-c", "sleep 0.1 & { true; } & wait; echo ok"])?;
+    assert_eq!(out(&o), "ok\n");
+    assert_eq!(err(&o), "");
+    Ok(())
+}
+
+#[test]
+fn c_takes_name_and_positional_arguments() -> TestResult {
+    let e = Env::new()?;
+    let o = e.run(&["-c", "echo $0 $# $1 \"$2\"", "zero", "one", "two three"])?;
+    assert_eq!(out(&o), "zero 2 one two three\n");
+    Ok(())
+}
+
+#[test]
+fn script_files_with_bytes_that_are_not_utf8_still_run() -> TestResult {
+    let e = Env::new()?;
+    std::fs::write(e.path("bad.sh"), b"# caf\xe9\necho ran\n")?;
+    let o = e.run(&["bad.sh"])?;
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(out(&o), "ran\n");
+    Ok(())
+}
+
+/// Deep recursion stops at the core's limit with an error; it used to
+/// overflow the 8 MiB main-thread stack and abort the whole shell.
+#[test]
+fn runaway_recursion_reports_an_error_instead_of_crashing() -> TestResult {
+    let e = Env::new()?;
+    let o = e.run(&["-c", "f() { f; }; f"])?;
+    assert_eq!(o.status.code(), Some(1), "{}", err(&o));
+    assert!(err(&o).contains("maximum function nesting level exceeded"));
+    let o = e.run(&[
+        "-c",
+        "n=0; f(){ n=$((n+1)); if [ $n -lt 400 ]; then echo $(f); else echo $n; fi; }; f",
+    ])?;
+    assert_eq!(out(&o), "400\n", "{}", err(&o));
+    Ok(())
+}
+
+#[test]
+fn getopts_let_and_readonly_are_builtins() -> TestResult {
+    let e = Env::new()?;
+    let o = e.run(&[
+        "-c",
+        "while getopts ab: o -a -b v; do echo $o${OPTARG-}; done; let x=2*3; echo $x; readonly x; x=1; echo no",
+    ])?;
+    assert_eq!(out(&o), "a\nbv\n6\n");
+    assert!(err(&o).contains("x: readonly variable"));
+    assert_eq!(o.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
 fn exit_status_propagates() -> TestResult {
     let e = Env::new()?;
     assert_eq!(e.run(&["-c", "exit 3"])?.status.code(), Some(3));
@@ -109,6 +193,41 @@ fn script_mode_joins_continuation_lines() -> TestResult {
 }
 
 #[test]
+fn comments_and_heredocs_reach_the_core_unchanged() -> TestResult {
+    let e = Env::new()?;
+    let o = e.run(&["-c", "echo a # b; echo c"])?;
+    assert_eq!(out(&o), "a\n", "a comment hides the rest of the line");
+    let o = e.run(&["-c", "cat <<EOF\nx;y é\nEOF"])?;
+    assert_eq!(out(&o), "x;y é\n", "{}", err(&o));
+    // With a built-in of the binary on the line, the comment still counts.
+    let o = e.run(&["-c", "echo a; help # x; echo hidden"])?;
+    assert!(!out(&o).contains("hidden"), "{}", out(&o));
+    let o = e.run(&["-c", "echo $(echo p; echo q); theme"])?;
+    assert_eq!(out(&o).lines().next(), Some("p q"), "{}", err(&o));
+    Ok(())
+}
+
+#[test]
+fn stdin_scripts_survive_bytes_that_are_not_utf8() -> TestResult {
+    let e = Env::new()?;
+    let mut child = e
+        .command()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .ok_or("no stdin")?
+        .write_all(b"# caf\xe9\r\necho one\r\necho two\nexit 5\n")?;
+    let o = child.wait_with_output()?;
+    assert_eq!(o.status.code(), Some(5), "{}", err(&o));
+    assert_eq!(out(&o), "one\ntwo\n");
+    Ok(())
+}
+
+#[test]
 fn broken_config_reports_file_line_and_column() -> TestResult {
     let e = Env::new()?;
     std::fs::write(e.path("config/config.toml"), "[ui]\nthme = \"x\"\n")?;
@@ -135,7 +254,7 @@ fn theme_lists_switches_and_persists() -> TestResult {
     let e = Env::new()?;
     let list = out(&e.run(&["theme"])?);
     assert!(
-        list.contains("* tokyo-night") && list.contains("  mono"),
+        list.contains("* neon") && list.contains("  tokyo-night") && list.contains("  mono"),
         "{list}"
     );
     assert!(e.run(&["theme", "mono"])?.status.success());
@@ -437,7 +556,7 @@ fn mock_ollama() -> Option<String> {
                     r#"{"command": "echo suggested-ok", "explanation": "prints a marker"}"#
                         .to_owned()
                 }
-            } else if body.contains("Explain the given shell command") {
+            } else if body.contains("a shell command to explain, or asks a question") {
                 "MOCK EXPLANATION of the command.".to_owned()
             } else {
                 String::new()
@@ -480,6 +599,20 @@ fn ai_commands_with_a_local_provider() -> TestResult {
         out(&ex),
         err(&ex)
     );
+    // `ai <text>` with no subcommand explains too, as question and answer.
+    let ask = out(&e.run(&["ai", "what", "does", "tar", "-xzf", "do?"])?);
+    assert!(
+        ask.contains("Question") && ask.contains("what does tar -xzf do?"),
+        "{ask}"
+    );
+    assert!(
+        ask.contains("Answer") && ask.contains("MOCK EXPLANATION"),
+        "{ask}"
+    );
+    assert!(
+        !ask.contains("warning"),
+        "a question is not checked as a command: {ask}"
+    );
     let danger = e.run(&["ai", "explain", "rm", "-rf", "/"])?;
     assert!(
         out(&danger).contains("blocked (rm-recursive-root)"),
@@ -493,7 +626,7 @@ fn ai_commands_with_a_local_provider() -> TestResult {
         .map(|d| d.path())
         .filter(|p| p.extension().is_some_and(|x| x == "bin"))
         .collect();
-    assert_eq!(files.len(), 2, "one transcript per explain");
+    assert_eq!(files.len(), 3, "one transcript per explain");
     for f in files {
         assert!(!String::from_utf8_lossy(&std::fs::read(f)?).contains("MOCK EXPLANATION"));
     }

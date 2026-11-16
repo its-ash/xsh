@@ -236,14 +236,24 @@ fn divide(area: Rect, axis: Axis, ratio: u16) -> (Rect, Rect) {
             let w = share(area.width);
             (
                 Rect::new(area.x, area.y, w, area.height),
-                Rect::new(area.x + w, area.y, area.width - w, area.height),
+                Rect::new(
+                    area.x.saturating_add(w),
+                    area.y,
+                    area.width - w,
+                    area.height,
+                ),
             )
         }
         Axis::Vertical => {
             let h = share(area.height);
             (
                 Rect::new(area.x, area.y, area.width, h),
-                Rect::new(area.x, area.y + h, area.width, area.height - h),
+                Rect::new(
+                    area.x,
+                    area.y.saturating_add(h),
+                    area.width,
+                    area.height - h,
+                ),
             )
         }
     }
@@ -328,6 +338,75 @@ mod tests {
             ])
         );
         assert_eq!(Layout::Pane(PaneId(1)).remove(PaneId(1)), None);
+    }
+
+    #[test]
+    fn degenerate_areas_never_panic() {
+        let mut l = three();
+        l.split(PaneId(3), Axis::Horizontal, PaneId(4));
+        for area in [
+            Rect::new(0, 0, 0, 0),
+            Rect::new(0, 0, 1, 1),
+            Rect::new(0, 0, 2, 1),
+            Rect::new(u16::MAX, u16::MAX, u16::MAX, u16::MAX),
+            Rect::new(0, 0, u16::MAX, u16::MAX),
+        ] {
+            let rects = l.rects(area);
+            assert_eq!(rects.len(), 4);
+            for (_, r) in &rects {
+                assert!(r.width <= area.width && r.height <= area.height, "{area:?}");
+            }
+            let total: u32 = rects
+                .iter()
+                .map(|(_, r)| u32::from(r.width) * u32::from(r.height))
+                .sum();
+            assert_eq!(
+                total,
+                u32::from(area.width) * u32::from(area.height),
+                "panes tile {area:?}"
+            );
+            for id in 1..=4 {
+                for dir in [Dir::Left, Dir::Right, Dir::Up, Dir::Down] {
+                    let _ = neighbor(&rects, PaneId(id), dir);
+                }
+            }
+        }
+        assert_eq!(Rect::new(0, 0, 1, 1).inner(), Rect::new(1, 1, 1, 1));
+    }
+
+    #[test]
+    fn out_of_range_ratios_stay_inside_the_area() {
+        for ratio in [0, 1, 100, 200, u16::MAX] {
+            let l = Layout::Split {
+                axis: Axis::Vertical,
+                ratio,
+                first: Box::new(Layout::Pane(PaneId(1))),
+                second: Box::new(Layout::Pane(PaneId(2))),
+            };
+            let r = l.rects(Rect::new(0, 0, 10, 10));
+            assert_eq!(r[0].1.height + r[1].1.height, 10, "ratio {ratio}");
+        }
+    }
+
+    #[test]
+    fn resize_clamps_ratio() {
+        let mut l = three();
+        for _ in 0..20 {
+            l.resize(PaneId(1), Dir::Left, 7);
+        }
+        assert_eq!(l.rects(Rect::new(0, 0, 100, 10))[0].1.width, 10);
+        for _ in 0..20 {
+            l.resize(PaneId(1), Dir::Right, u16::MAX);
+        }
+        assert_eq!(l.rects(Rect::new(0, 0, 100, 10))[0].1.width, 90);
+        assert!(!l.resize(PaneId(9), Dir::Right, 5), "unknown pane");
+        assert!(!Layout::Pane(PaneId(1)).resize(PaneId(1), Dir::Right, 5));
+    }
+
+    #[test]
+    fn remove_unknown_pane_keeps_tree() {
+        let l = three();
+        assert_eq!(l.clone().remove(PaneId(9)), Some(l));
     }
 
     #[test]

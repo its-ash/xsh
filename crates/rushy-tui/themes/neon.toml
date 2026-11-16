@@ -1,0 +1,19 @@
+name = "neon"
+
+[colors]
+background = "#05050a"
+foreground = "#00ff6e"
+accent = "#fcee0a"
+error = "#e32400"
+success = "#00ff9c"
+prompt_user = "#ffffff"
+prompt_path = "#fcee0a"
+cursor = "#00f0ff"
+selection = "#ff00cf"
+ansi = [
+    "#05050a", "#ff3f73", "#00ff9c", "#fcee0a", "#2d7dff", "#d600ff", "#00f0ff", "#d0f8ff",
+    "#3a3a4a", "#ff4d6d", "#5cffbe", "#fff35c", "#6ba4ff", "#e45cff", "#6cf8ff", "#ffffff",
+]
+
+[prompt]
+format = "{user} {path} {git}{node}{python}❯ "

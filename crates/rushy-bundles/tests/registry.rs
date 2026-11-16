@@ -2,8 +2,8 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 
 use rushy_bundles::{
-    BundleStore, Effects, Index, IndexSource, RegistryClient, RegistryEntry, RegistryFile,
-    sha256_hex,
+    BundleStore, Download, Effects, Index, IndexSource, Installed, Manifest, RegistryClient,
+    RegistryEntry, RegistryFile, sha256_hex,
 };
 use rushy_core::ShellState;
 
@@ -137,6 +137,284 @@ async fn install_git_from_local_registry_defines_gs() -> TestResult {
     let outside = Effects::compute(&installed, tmp.path(), bin.as_os_str(), &[]);
     outside.apply(&fx, &mut state);
     assert!(state.aliases().get("gs").is_none());
+    Ok(())
+}
+
+fn manifest_text(name: &str) -> String {
+    format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n")
+}
+
+fn download(name: &str, toml_name: &str) -> Result<Download, Box<dyn Error>> {
+    Ok(Download {
+        manifest: Manifest::parse(Path::new("bundle.toml"), &manifest_text(name))?,
+        files: vec![("bundle.toml".into(), manifest_text(toml_name).into_bytes())],
+    })
+}
+
+/// Regression: an interrupted install leaves `.NAME.tmp/bundle.toml`, which
+/// `list` loaded as a second copy of the bundle.
+#[test]
+fn list_skips_leftover_temp_dirs() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let store = BundleStore::new(tmp.path());
+    store.install(&download("demo", "demo")?)?;
+    let leftover = tmp.path().join(".demo.tmp");
+    std::fs::create_dir_all(&leftover)?;
+    std::fs::write(leftover.join("bundle.toml"), manifest_text("demo"))?;
+    let (ok, bad) = store.list();
+    assert!(bad.is_empty(), "{bad:?}");
+    assert_eq!(ok.iter().map(Installed::name).collect::<Vec<_>>(), ["demo"]);
+    // A later install cleans the leftover up.
+    store.install(&download("demo", "demo")?)?;
+    assert!(!leftover.exists());
+    Ok(())
+}
+
+/// Regression: `install` used the name from `Download::manifest` for the
+/// directory but never checked that the `bundle.toml` it wrote agreed.
+#[test]
+fn install_rejects_a_manifest_name_mismatch() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let store = BundleStore::new(tmp.path());
+    assert!(matches!(
+        store.install(&download("demo", "other")?),
+        Err(rushy_bundles::Error::Invalid { .. })
+    ));
+    assert!(store.list().0.is_empty());
+    assert!(!tmp.path().join(".demo.tmp").exists());
+    assert!(!tmp.path().join("demo").exists());
+    Ok(())
+}
+
+#[test]
+fn install_rejects_unexpected_or_missing_files() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let store = BundleStore::new(tmp.path().join("bundles"));
+    for file in ["../escape", "/etc/passwd", "sub/x", "run.sh", ""] {
+        let mut d = download("demo", "demo")?;
+        d.files.push((file.into(), b"x".to_vec()));
+        assert!(store.install(&d).is_err(), "{file:?}");
+    }
+    assert!(!tmp.path().join("escape").exists());
+    let mut d = download("demo", "demo")?;
+    d.files.clear();
+    assert!(store.install(&d).is_err(), "no bundle.toml");
+    let mut d = download("demo", "demo")?;
+    d.files.push(("init.rushy".into(), b"rm -rf ~\n".to_vec()));
+    assert!(store.install(&d).is_err(), "bad init.rushy");
+    assert!(store.list().0.is_empty());
+    Ok(())
+}
+
+#[test]
+fn store_names_cannot_escape_the_bundles_dir() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let store = BundleStore::new(tmp.path().join("bundles"));
+    std::fs::create_dir_all(tmp.path().join("victim"))?;
+    for name in ["../victim", "..", ".", "", "/tmp", "a/b", "Demo", "démo"] {
+        assert!(store.get(name).is_err(), "{name:?}");
+        assert!(store.remove(name).is_err(), "{name:?}");
+    }
+    assert!(tmp.path().join("victim").is_dir());
+    assert!(matches!(
+        store.remove("missing"),
+        Err(rushy_bundles::Error::NotInstalled(_))
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn registry_entries_cannot_escape_or_leave_the_allowlist() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let reg = tmp.path().join("registry");
+    std::fs::create_dir_all(reg.join("demo"))?;
+    let manifest = manifest_text("demo");
+    std::fs::write(reg.join("demo/bundle.toml"), &manifest)?;
+    std::fs::write(tmp.path().join("secret"), "x")?;
+    let index_path = reg.join("registry.json");
+    std::fs::write(&index_path, "{\"version\":1,\"bundles\":[]}")?;
+    let client = RegistryClient::new(&file_url(&index_path)?, &[], tmp.path().join("cache.json"))?;
+    let entry = |name: &str, url: &str, files: Vec<RegistryFile>| RegistryEntry {
+        name: name.into(),
+        version: "0.1.0".into(),
+        description: String::new(),
+        repo: String::new(),
+        sha256: sha256_hex(manifest.as_bytes()),
+        url: url.into(),
+        files,
+    };
+    assert!(
+        client
+            .download(&entry("demo", "demo/bundle.toml", vec![]))
+            .await
+            .is_ok()
+    );
+    for name in ["../demo", "", "Demo", "a/b"] {
+        assert!(
+            client
+                .download(&entry(name, "demo/bundle.toml", vec![]))
+                .await
+                .is_err(),
+            "{name:?}"
+        );
+    }
+    // The registry name must match the manifest name.
+    assert!(
+        client
+            .download(&entry("other", "demo/bundle.toml", vec![]))
+            .await
+            .is_err()
+    );
+    // Remote URLs must be on the allowlist (empty here).
+    assert!(matches!(
+        client
+            .download(&entry("demo", "https://evil.example/bundle.toml", vec![]))
+            .await,
+        Err(rushy_bundles::Error::Url { .. })
+    ));
+    assert!(
+        client
+            .download(&entry("demo", "http://localhost/bundle.toml", vec![]))
+            .await
+            .is_err()
+    );
+    // Extra files are limited to the known names.
+    let extra = |path: &str| RegistryFile {
+        path: path.into(),
+        sha256: sha256_hex(b"x"),
+    };
+    for path in ["../../secret", "../secret", "/etc/passwd", "bundle.toml"] {
+        assert!(
+            client
+                .download(&entry("demo", "demo/bundle.toml", vec![extra(path)]))
+                .await
+                .is_err(),
+            "{path:?}"
+        );
+    }
+    // An uppercase or padded hash still matches; a short or empty one does not.
+    let mut e = entry("demo", "demo/bundle.toml", vec![]);
+    e.sha256 = format!(" {} ", e.sha256.to_uppercase());
+    assert!(client.download(&e).await.is_ok());
+    for bad in ["", "00", &sha256_hex(b"other")] {
+        e.sha256 = (*bad).to_owned();
+        assert!(matches!(
+            client.download(&e).await,
+            Err(rushy_bundles::Error::Checksum { .. })
+        ));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn oversized_local_file_is_refused() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let index_path = tmp.path().join("registry.json");
+    let mut big = b"{\"version\":1,\"bundles\":[]}".to_vec();
+    big.resize(1024 * 1024 + 1, b' ');
+    std::fs::write(&index_path, &big)?;
+    let client = RegistryClient::new(&file_url(&index_path)?, &[], tmp.path().join("cache.json"))?;
+    assert!(matches!(
+        client.index().await,
+        Err(rushy_bundles::Error::Url { .. })
+    ));
+    Ok(())
+}
+
+#[test]
+fn init_files_are_strictly_declarative() -> TestResult {
+    let ok = rushy_bundles::parse_init(
+        "init.rushy",
+        "\n# c\nalias ll='ls -l' la=\"ls -a\"\nexport A=1 B='x y' C=a=b\n",
+    )?;
+    assert_eq!(ok.aliases.len(), 2);
+    assert_eq!(ok.env.get("C").map(String::as_str), Some("a=b"));
+    assert_eq!(ok.env.get("B").map(String::as_str), Some("x y"));
+    for bad in [
+        "echo hi",
+        "alias a=b | sh",
+        "alias a=b &",
+        "alias a=b > /tmp/x",
+        "alias a=b && rm -rf ~",
+        "export A=$HOME",
+        "export ~",
+        "export A=$(id)",
+        "export A=`id`",
+        "export 1A=x",
+        "export A",
+        "alias =x",
+        "alias 'a b'=x",
+        "alias 'a;b'=x",
+        "alias a/b=x",
+        "alias 'x",
+        "if true; then alias a=b; fi",
+        "f() { alias a=b; }",
+        "A=1 alias a=b",
+    ] {
+        assert!(
+            rushy_bundles::parse_init("init.rushy", bad).is_err(),
+            "{bad:?} must be rejected"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn manifests_reject_bad_values() {
+    let base = "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n";
+    for extra in [
+        "[env]\n\"1BAD\" = \"x\"\n",
+        "[env]\n\"A-B\" = \"x\"\n",
+        "[aliases]\n\"a b\" = \"x\"\n",
+        "[aliases]\n\"\" = \"x\"\n",
+        "[prompt]\nsegment = \"\"\nformat = \"x\"\n",
+        "[prompt]\nsegment = \"a-b\"\nformat = \"x\"\n",
+        "[prompt]\nsegment = \"a\"\nformat = \"x\"\npriority = 300\n",
+        "[[hooks]]\non = \"activate\"\nrun = \"  \"\n",
+        "[[hooks]]\non = \"boot\"\nrun = \"x\"\n",
+        "[unknown]\n",
+        "[bundle]\nscript = \"rm -rf ~\"\n",
+    ] {
+        let text = format!("{base}{extra}");
+        assert!(
+            Manifest::parse(Path::new("b.toml"), &text).is_err(),
+            "{text:?}"
+        );
+    }
+    for package in [
+        "name = \"../x\"\nversion = \"0.1.0\"",
+        "name = \"\"\nversion = \"0.1.0\"",
+        "name = \"Demo\"\nversion = \"0.1.0\"",
+        "name = \"demo\"\nversion = \"1\"",
+        "name = \"demo\"\nversion = \"0.1.0\"\nmin_rushy_version = \"999.0.0\"",
+        "name = \"demo\"\nversion = \"0.1.0\"\nmin_rushy_version = \"x\"",
+    ] {
+        let text = format!("[package]\n{package}\n");
+        assert!(
+            Manifest::parse(Path::new("b.toml"), &text).is_err(),
+            "{text:?}"
+        );
+    }
+    let long = format!(
+        "[package]\nname = \"{}\"\nversion = \"0.1.0\"\n",
+        "a".repeat(65)
+    );
+    assert!(Manifest::parse(Path::new("b.toml"), &long).is_err());
+}
+
+#[test]
+fn detect_handles_odd_patterns() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    std::fs::write(tmp.path().join("Cargo.toml"), "")?;
+    assert!(rushy_bundles::detect("Cargo.toml", tmp.path()));
+    assert!(rushy_bundles::detect("*.toml", tmp.path()));
+    assert!(!rushy_bundles::detect("package.json", tmp.path()));
+    for bad in ["[", "**/[", "{a,", ""] {
+        assert!(!rushy_bundles::detect(bad, tmp.path()), "{bad:?}");
+    }
+    assert!(!rushy_bundles::detect("x", &tmp.path().join("missing")));
+    assert!(!rushy_bundles::on_path("", tmp.path().as_os_str()));
+    assert!(!rushy_bundles::on_path("../bin/sh", tmp.path().as_os_str()));
     Ok(())
 }
 

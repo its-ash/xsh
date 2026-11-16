@@ -102,6 +102,10 @@ pub async fn serve(dir: &Path, command: PaneCommand) -> Result<()> {
                         if let Some(tx) = out.filter(|_| ours) {
                             send_view(&mgr, tx, true);
                         }
+                        if mgr.attached().is_none() {
+                            // `send_view` told the client its session exited.
+                            attached = None;
+                        }
                     }
                 }
             }
@@ -180,11 +184,20 @@ fn handle(
         ClientMsg::List => {
             let _ = tx.send(ServerMsg::Sessions(mgr.list_sessions()));
         }
-        ClientMsg::Kill(name) => reply(
-            mgr.find(&name)
+        ClientMsg::Kill(name) => {
+            let killed = mgr
+                .find(&name)
                 .ok_or(Error::NoSession(name))
-                .and_then(|s| mgr.kill_session(s)),
-        ),
+                .and_then(|s| mgr.kill_session(s));
+            reply(killed);
+            // The attached session is gone: tell its client instead of
+            // leaving it attached to nothing.
+            if mgr.attached().is_none()
+                && let Some(c) = attached.take().and_then(|c| clients.get(&c))
+            {
+                let _ = c.send(ServerMsg::Exited);
+            }
+        }
         ClientMsg::Attach {
             session,
             create,

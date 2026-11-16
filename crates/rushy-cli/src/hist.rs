@@ -46,7 +46,8 @@ pub fn expand(line: &str, recent: &[String]) -> Result<Option<String>, String> {
             '\\' if !single => esc = true,
             '\'' if !double => single = !single,
             '"' if !single => double = !double,
-            '!' if !single => {
+            // `${!name}` is indirect expansion, not a history reference.
+            '!' if !single && (i < 2 || chars[i - 2] != '$' || chars[i - 1] != '{') => {
                 let next = chars.get(i + 1).copied();
                 let event = match next {
                     Some('!') => {
@@ -198,6 +199,14 @@ mod tests {
         assert_eq!(expand("echo a != b", &h()), Ok(None));
         assert!(expand("!nope", &h()).is_err());
         assert!(expand("!!", &[]).is_err());
+        assert_eq!(expand("echo ${!HOME} ${!p*}", &h()), Ok(None));
+        assert_eq!(
+            expand("echo é !! ü", &h()),
+            Ok(Some("echo é echo hi there ü".into()))
+        );
+        assert!(expand("!-", &h()).is_err());
+        assert!(expand("!0", &h()).is_err());
+        assert!(expand("!99999999999999999999999", &h()).is_err());
     }
 
     #[test]

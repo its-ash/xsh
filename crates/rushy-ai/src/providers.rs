@@ -30,6 +30,28 @@ fn validate_url(raw: &str) -> Result<Url> {
     }
 }
 
+/// Validates `raw` and makes sure its path ends in `/`, so that
+/// `https://host/v1` joins `chat/completions` to `https://host/v1/chat/completions`
+/// instead of replacing the last path segment.
+fn normalized_base(raw: &str) -> Result<Url> {
+    let mut url = validate_url(raw.trim())?;
+    if !url.path().ends_with('/') {
+        let path = format!("{}/", url.path());
+        url.set_path(&path);
+    }
+    Ok(url)
+}
+
+/// Tool-call arguments, sent as a JSON string by OpenAI or as an object by
+/// Ollama and some compatible servers. Anything else becomes `null`.
+fn tool_arguments(v: &Value) -> Value {
+    match v {
+        Value::String(s) => serde_json::from_str(s).unwrap_or(Value::Null),
+        Value::Object(_) => v.clone(),
+        _ => Value::Null,
+    }
+}
+
 fn client(https_only: bool) -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .https_only(https_only)
@@ -164,7 +186,7 @@ impl OpenAiProvider {
     ///
     /// Fails on a disallowed URL or client setup error.
     pub fn new(key: Secret, model: impl Into<String>, base_url: Option<&str>) -> Result<Self> {
-        let base = validate_url(base_url.unwrap_or("https://api.openai.com/v1/"))?;
+        let base = normalized_base(base_url.unwrap_or("https://api.openai.com/v1/"))?;
         Ok(Self {
             name: "openai",
             http: client(base.scheme() == "https")?,
@@ -181,7 +203,7 @@ impl OpenAiProvider {
     ///
     /// Fails on a disallowed URL or client setup error.
     pub fn custom(key: Option<Secret>, model: impl Into<String>, base_url: &str) -> Result<Self> {
-        let base = validate_url(base_url)?;
+        let base = normalized_base(base_url)?;
         Ok(Self {
             name: "custom",
             http: client(base.scheme() == "https")?,
@@ -255,10 +277,7 @@ impl AiProvider for OpenAiProvider {
                             .as_str()
                             .unwrap_or_default()
                             .to_owned(),
-                        arguments: c["function"]["arguments"]
-                            .as_str()
-                            .and_then(|s| serde_json::from_str(s).ok())
-                            .unwrap_or(Value::Null),
+                        arguments: tool_arguments(&c["function"]["arguments"]),
                     })
                     .collect()
             })
@@ -305,7 +324,7 @@ impl AnthropicProvider {
     ///
     /// Fails on a disallowed URL or client setup error.
     pub fn new(key: Secret, model: impl Into<String>, base_url: Option<&str>) -> Result<Self> {
-        let base = validate_url(base_url.unwrap_or("https://api.anthropic.com/v1/"))?;
+        let base = normalized_base(base_url.unwrap_or("https://api.anthropic.com/v1/"))?;
         Ok(Self {
             http: client(base.scheme() == "https")?,
             base,
@@ -442,7 +461,7 @@ impl OllamaProvider {
     ///
     /// Fails on a disallowed URL or client setup error.
     pub fn new(model: impl Into<String>, base_url: Option<&str>) -> Result<Self> {
-        let base = validate_url(base_url.unwrap_or("http://localhost:11434/"))?;
+        let base = normalized_base(base_url.unwrap_or("http://localhost:11434/"))?;
         Ok(Self {
             http: client(base.scheme() == "https")?,
             base,
@@ -502,7 +521,7 @@ impl AiProvider for OllamaProvider {
                             .as_str()
                             .unwrap_or_default()
                             .to_owned(),
-                        arguments: c["function"]["arguments"].clone(),
+                        arguments: tool_arguments(&c["function"]["arguments"]),
                     })
                     .collect()
             })
@@ -643,6 +662,56 @@ mod tests {
         assert!(validate_url("http://localhost:11434/").is_ok());
         assert!(validate_url("http://example.com/").is_err());
         assert!(validate_url("ftp://localhost/").is_err());
+    }
+
+    #[test]
+    fn base_urls_keep_their_path() -> Result<()> {
+        for raw in ["https://proxy.example/v1", "https://proxy.example/v1/"] {
+            let p = OpenAiProvider::new(Secret::new("k"), "m", Some(raw))?;
+            let url = p
+                .base
+                .join("chat/completions")
+                .map_err(|_| Error::Url(raw.into()))?;
+            assert_eq!(url.as_str(), "https://proxy.example/v1/chat/completions");
+        }
+        let a = AnthropicProvider::new(
+            Secret::new("k"),
+            "m",
+            Some("https://gw.example/anthropic/v1"),
+        )?;
+        assert_eq!(a.base.as_str(), "https://gw.example/anthropic/v1/");
+        let o = OllamaProvider::new("m", Some("http://localhost:11434"))?;
+        assert_eq!(o.base.as_str(), "http://localhost:11434/");
+        Ok(())
+    }
+
+    #[test]
+    fn tool_arguments_accept_strings_and_objects() {
+        assert_eq!(
+            tool_arguments(&json!("{\"command\":\"ls\"}")),
+            json!({"command": "ls"})
+        );
+        assert_eq!(
+            tool_arguments(&json!({"command": "ls"})),
+            json!({"command": "ls"})
+        );
+        assert_eq!(tool_arguments(&json!("{not json")), Value::Null);
+        assert_eq!(tool_arguments(&Value::Null), Value::Null);
+        assert_eq!(tool_arguments(&json!("[1]")), json!([1]));
+    }
+
+    #[test]
+    fn model_names_accept_every_shape() {
+        assert_eq!(
+            model_names(&json!({"data": [{"id": "b"}, {"id": "a"}, {"id": "a"}]})),
+            ["a", "b"]
+        );
+        assert_eq!(
+            model_names(&json!({"models": [{"name": "x"}, {"model": ""}]})),
+            ["x"]
+        );
+        assert_eq!(model_names(&json!(["m", 3])), ["m"]);
+        assert!(model_names(&json!({"error": "no"})).is_empty());
     }
 
     #[test]

@@ -4,7 +4,8 @@
 //! token of the app and the socket path. The app opens a pane to the right that
 //! runs `xsh app agent-runner <socket>`. The left pane keeps the plan, the text
 //! of the model, and the approvals. The right pane runs each approved command,
-//! then becomes a normal shell when the agent stops.
+//! and exits when the agent stops, so the app closes it. The left pane already
+//! shows the end of each command's output.
 
 use std::fmt::Write as _;
 use std::io::IsTerminal as _;
@@ -176,18 +177,14 @@ async fn serve_link(shell: &mut Shell, stream: UnixStream) -> Result<()> {
     }
 }
 
-/// `xsh app agent-runner`: runs the commands of the agent, then a normal shell.
+/// `xsh app agent-runner`: runs the commands of the agent, and exits when the
+/// agent stops (the app then closes the pane).
 pub async fn serve(app: &mut App, socket: &Path) -> Result<i32> {
     crate::repl::forward_signals(&app.shell.state().foreground());
     crate::term::set_title("xsh agent");
-    match UnixStream::connect(socket).await {
-        Ok(stream) => {
-            if let Err(e) = serve_link(&mut app.shell, stream).await {
-                eprintln!("xsh: {e:#}");
-            }
-            eprintln!("\nxsh: the agent stopped; this pane is a normal shell now");
-        }
-        Err(e) => eprintln!("xsh: no agent at {}: {e}", socket.display()),
-    }
-    Box::pin(crate::repl::run(app)).await
+    let stream = UnixStream::connect(socket)
+        .await
+        .with_context(|| format!("no agent at {}", socket.display()))?;
+    serve_link(&mut app.shell, stream).await?;
+    Ok(0)
 }

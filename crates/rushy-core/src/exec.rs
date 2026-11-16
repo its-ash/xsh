@@ -534,8 +534,10 @@ impl<'a> Ctx<'a> {
                 if !children.is_empty() {
                     let (id, pids) = self.jobs.add(&self.text, children);
                     self.state.set_last_bg(pids.last().copied());
-                    let pid = pids.last().map_or_else(String::new, u32::to_string);
-                    self.write_sink(&Sink::Stderr, format!("[{id}] {pid}\n").as_bytes())?;
+                    if self.state.interactive() {
+                        let pid = pids.last().map_or_else(String::new, u32::to_string);
+                        self.write_sink(&Sink::Stderr, format!("[{id}] {pid}\n").as_bytes())?;
+                    }
                 }
                 self.state.set_last_status(0);
                 return Ok(Ctl::Normal);
@@ -630,7 +632,9 @@ impl<'a> Ctx<'a> {
             });
             let id = self.jobs.add_task(&self.text, handle, result);
             self.state.set_last_bg(None);
-            self.write_sink(&Sink::Stderr, format!("[{id}]\n").as_bytes())?;
+            if self.state.interactive() {
+                self.write_sink(&Sink::Stderr, format!("[{id}]\n").as_bytes())?;
+            }
             self.state.set_last_status(0);
             Ok(Ctl::Normal)
         })
@@ -792,6 +796,9 @@ impl<'a> Ctx<'a> {
                 } else {
                     v
                 };
+                if self.state.is_readonly(&a.name) {
+                    return self.abort(io, &format!("xsh: {}: readonly variable", a.name));
+                }
                 assigns.push((a.name.clone(), v));
             }
             if self.state.options().xtrace {
@@ -1517,14 +1524,12 @@ impl<'a> Ctx<'a> {
                             out.error(1, format!("local: `{a}`: not a valid identifier"));
                             continue;
                         }
-                        let keep = v
-                            .is_none()
-                            .then(|| self.state.var(n).map(str::to_owned))
-                            .flatten();
+                        // As in bash, `local x` starts out unset; it does
+                        // not inherit the caller's value.
                         self.state.make_local(n);
-                        match v.map(str::to_owned).or(keep) {
+                        match v {
                             Some(v) => self.state.set_var(n, v),
-                            None => self.state.unset_var(n),
+                            None => self.state.clear_var(n),
                         }
                     }
                     self.emit(out, io)
@@ -1558,9 +1563,15 @@ impl<'a> Ctx<'a> {
                 return self.emit(out, io);
             }
         };
+        if self.depth >= MAX_NESTING {
+            let out = Output::fail(1, format!("xsh: {name}: maximum nesting level exceeded"));
+            return self.emit(out, io);
+        }
         let saved = (!rest.is_empty()).then(|| self.state.replace_positional(rest.to_vec()));
         self.sources += 1;
+        self.depth += 1;
         let res = self.run_script(&text, io).await;
+        self.depth -= 1;
         self.sources -= 1;
         if let Some(old) = saved {
             self.state.replace_positional(old);

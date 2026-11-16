@@ -52,6 +52,33 @@ indirect enum Layout {
     }
 }
 
+/// Sends full screen (the menu item, its shortcut and the green button) to
+/// xsh's own full screen; see `TerminalWindow.toggleScreenFill()`.
+final class TerminalNSWindow: NSWindow {
+    override func toggleFullScreen(_ sender: Any?) {
+        guard let controller = windowController as? TerminalWindow else {
+            super.toggleFullScreen(sender)
+            return
+        }
+        controller.toggleScreenFill()
+    }
+
+    /// macOS keeps a titled window clear of the Dock and the menu bar. In
+    /// full screen both are hidden, and the window must cover their space.
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+        if (windowController as? TerminalWindow)?.fillsScreen == true { return frameRect }
+        return super.constrainFrameRect(frameRect, to: screen)
+    }
+
+    override func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        if item.action == #selector(toggleFullScreen(_:)), let controller = windowController as? TerminalWindow {
+            item.title = controller.fillsScreen ? "Exit Full Screen" : "Enter Full Screen"
+            return true
+        }
+        return super.validateMenuItem(item)
+    }
+}
+
 /// One native window, which macOS shows as one tab of a tab group.
 final class TerminalWindow: NSWindowController, NSWindowDelegate {
     static private(set) var all: [TerminalWindow] = []
@@ -62,6 +89,11 @@ final class TerminalWindow: NSWindowController, NSWindowDelegate {
     private var settings: NSObjectProtocol?
     private var skipConfirm = false
     private(set) var active: Pane?
+    /// The frame to go back to, while the window fills its screen.
+    private var screenFillRestore: NSRect?
+
+    /// Whether the window is in xsh's full screen.
+    var fillsScreen: Bool { screenFillRestore != nil }
 
     private var panes: [Pane] {
         func walk(_ v: NSView) -> [Pane] {
@@ -75,7 +107,7 @@ final class TerminalWindow: NSWindowController, NSWindowDelegate {
     // MARK: Open
 
     init(layout: Layout, sizedFrom other: NSWindow? = nil) {
-        let window = NSWindow(
+        let window = TerminalNSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 800, height: 500),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
@@ -190,7 +222,7 @@ final class TerminalWindow: NSWindowController, NSWindowDelegate {
     private var hostFrame: NSRect {
         guard let window, let root = window.contentView else { return .zero }
         // With a transparent title bar, the text stays below the traffic lights.
-        return Store.shared.string("window.titlebar") == "transparent"
+        return Store.shared.string("window.titlebar") == "transparent" || fillsScreen
             ? root.convert(window.contentLayoutRect, from: nil)
             : root.bounds
     }
@@ -198,9 +230,11 @@ final class TerminalWindow: NSWindowController, NSWindowDelegate {
     private func applyWindowSettings() {
         guard let window else { return }
         let s = Store.shared
-        let bar = s.string("window.titlebar")
+        // Full screen keeps the window buttons, on a transparent bar.
+        let bar = fillsScreen ? "transparent" : s.string("window.titlebar")
+        window.isMovable = !fillsScreen
         window.titlebarAppearsTransparent = bar != "native"
-        window.titleVisibility = bar == "hidden" ? .hidden : .visible
+        window.titleVisibility = bar == "hidden" || fillsScreen ? .hidden : .visible
         if bar == "native" {
             window.styleMask.remove(.fullSizeContentView)
         } else {
@@ -400,6 +434,7 @@ final class TerminalWindow: NSWindowController, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
+        if fillsScreen { NSApp.presentationOptions = [] }
         panes.forEach { $0.shutdown() }
         observer = nil
         Self.all.removeAll { $0 === self }
@@ -410,10 +445,58 @@ final class TerminalWindow: NSWindowController, NSWindowDelegate {
 
     func windowDidBecomeKey(_ notification: Notification) {
         panes.forEach { $0.focused = $0 === active }
+        updatePresentation()
     }
 
     func windowDidResize(_ notification: Notification) {
         host.frame = hostFrame
+    }
+
+    // MARK: Full screen
+
+    /// xsh's full screen: the window covers its screen (below the camera
+    /// housing) with a transparent title bar that keeps the window buttons,
+    /// and the menu bar and Dock hide until the pointer reaches them.
+    ///
+    /// It does not use the native full screen. macOS shows the frames of a
+    /// terminal in a native full-screen Space hundreds of milliseconds late,
+    /// with the GPU and with the CPU renderer, while a window of the same
+    /// size outside such a Space shows them at once.
+    func toggleScreenFill() {
+        guard let window else { return }
+        let group = (window.tabbedWindows ?? [window]).compactMap { $0.windowController as? TerminalWindow }
+        if let restore = screenFillRestore {
+            for w in group {
+                w.screenFillRestore = nil
+                w.applyWindowSettings()
+            }
+            updatePresentation()
+            window.setFrame(restore, display: true)
+        } else {
+            guard let screen = window.screen ?? NSScreen.main else { return }
+            let restore = window.frame
+            for w in group {
+                w.screenFillRestore = restore
+                w.applyWindowSettings()
+            }
+            // Hide the Dock and the menu bar first, so the frame can cover them.
+            updatePresentation()
+            var frame = screen.frame
+            frame.size.height -= screen.safeAreaInsets.top
+            window.setFrame(frame, display: true)
+        }
+        host.frame = hostFrame
+    }
+
+    /// A new tab in a window that fills the screen fills it too.
+    func adoptScreenFill(from other: TerminalWindow) {
+        guard let restore = other.screenFillRestore else { return }
+        screenFillRestore = restore
+        applyWindowSettings()
+    }
+
+    private func updatePresentation() {
+        NSApp.presentationOptions = fillsScreen ? [.autoHideMenuBar, .autoHideDock] : []
     }
 
     // MARK: Tabs
@@ -483,6 +566,7 @@ enum Terminals {
         let w = TerminalWindow(
             layout: .pane(cwd: dir ?? directory(), profile: profile?.name),
             sizedFrom: cur.window)
+        w.adoptScreenFill(from: cur)
         cur.addTab(w)
         return w
     }

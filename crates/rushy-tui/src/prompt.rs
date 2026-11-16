@@ -45,7 +45,17 @@ pub struct Piece {
     pub color: Color,
 }
 
-/// Cuts `text` to `max` columns, ending with an ellipsis when cut.
+/// Display width of `text` in terminal columns (wide characters count 2).
+pub(crate) fn display_width(text: &str) -> usize {
+    Span::raw(text).width()
+}
+
+fn char_width(c: char) -> usize {
+    display_width(c.encode_utf8(&mut [0u8; 4]))
+}
+
+/// Cuts `text` to `max` columns, ending with an ellipsis when cut. Wide
+/// characters such as CJK count as two columns.
 ///
 /// ```
 /// assert_eq!(rushy_tui::truncate("feature/long-branch", 8, true), "feature~");
@@ -53,12 +63,19 @@ pub struct Piece {
 /// ```
 #[must_use]
 pub fn truncate(text: &str, max: usize, ascii: bool) -> String {
-    if text.chars().count() <= max {
+    if display_width(text) <= max {
         return text.to_owned();
     }
     let mark = if ascii { '~' } else { '…' };
-    let keep = max.saturating_sub(1);
-    let mut out: String = text.chars().take(keep).collect();
+    let room = max.saturating_sub(1);
+    let mut used = 0;
+    let mut out: String = text
+        .chars()
+        .take_while(|&c| {
+            used += char_width(c);
+            used <= room
+        })
+        .collect();
     if max > 0 {
         out.push(mark);
     }
@@ -165,7 +182,7 @@ pub fn render_prompt(
     let total = |items: &[Item]| {
         items
             .iter()
-            .map(|i| i.piece.text.chars().count())
+            .map(|i| display_width(&i.piece.text))
             .sum::<usize>()
     };
     while total(&items) > width {
@@ -185,14 +202,23 @@ pub fn render_prompt(
     let over = total(&items).saturating_sub(width);
     if over > 0 {
         if let Some(item) = items.iter_mut().find(|i| i.is_path) {
-            let chars: Vec<char> = item.piece.text.chars().collect();
-            let keep = chars.len().saturating_sub(over).max(1);
+            // Keep the end of the path in `target` columns, one of them
+            // taken by the mark.
+            let target = display_width(&item.piece.text).saturating_sub(over).max(1);
             let mark = if opts.ascii { '~' } else { '…' };
-            let tail: String = chars
-                .iter()
-                .skip(chars.len() - keep.min(chars.len()))
+            let mut used = 1;
+            let mut tail: Vec<char> = item
+                .piece
+                .text
+                .chars()
+                .rev()
+                .take_while(|&c| {
+                    used += char_width(c);
+                    used <= target
+                })
                 .collect();
-            item.piece.text = format!("{mark}{}", tail.chars().skip(1).collect::<String>());
+            tail.push(mark);
+            item.piece.text = tail.into_iter().rev().collect();
         }
     }
     items.into_iter().map(|i| i.piece).collect()

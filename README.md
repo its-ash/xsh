@@ -8,7 +8,8 @@ An AI-native terminal app and shell for macOS. It replaces Terminal and iTerm. T
 - **AI help** in the prompt: a command from a description, an agent that asks before every step, `explain`, and `fix`. Every AI command passes a safety guard first.
 - A tmux-style **multiplexer**: sessions, windows, split panes, detach and re-attach.
 - **Encrypted history** with fuzzy `Ctrl-R` search.
-- Themes, a command palette, a status bar, and hot reload of config.
+- **Fuzzy Tab completion** for commands, flags, folders, files, branches, and more: `cd dwn` finds `Downloads/`.
+- Themes (the default is `neon`), a **theme editor** in the browser (`make theme`), a command palette, a status bar, and hot reload of config.
 
 ```text
 ash@laptop ~/code/rushy  main* ❯ gs
@@ -36,9 +37,10 @@ xsh runs on macOS 14 or later, on Apple silicon and Intel. From source (needs Ru
 ```sh
 git clone https://github.com/its-ash/xsh
 cd xsh
-make build                 # creates target/xsh.app
-cp -R target/xsh.app /Applications/
+make install               # builds, copies xsh.app to /Applications, links /usr/local/bin/xsh
 ```
+
+`make install` builds the release app, puts it in `/Applications`, and makes `/usr/local/bin/xsh` a link to the `xsh` inside it, so app updates update the command too. It asks for your password (sudo) only if `/usr/local/bin` is not writable, and it refuses to replace a `/usr/local/bin/xsh` that is not xsh. Choose other places with `make install APP_DIR=~/Applications BIN_DIR=~/.local/bin`. `make uninstall` removes both and keeps your settings, history, and bundles. `make build` alone only creates `target/xsh.app`.
 
 For the shell only: `cargo install --path crates/rushy-cli --locked`.
 
@@ -66,7 +68,11 @@ Open **xsh.app**, then press `⌘,` for Settings. All settings are in the file `
 | AI | provider with its own model, address, and API key fields (keys are in the Keychain), model list for custom providers, safety review, request context |
 | Advanced | open the files, every setting as raw TOML, reset |
 
-With more than one pane in a tab, each pane has a bar with its title and a close button. Click a pane to type in it. In the app, `ai agent` opens a pane to the right: the left pane shows the model's text and asks for approval, and the right pane runs the commands, then stays as a normal shell.
+**Full screen** (`⌃⌘F`, the View menu, or the green button) makes the window cover the screen below the camera housing, hides the title and the window drag, and hides the menu bar and Dock until the pointer reaches them. The close, minimize, and zoom buttons stay. xsh does not use the separate full-screen Space of macOS: there, macOS showed typed characters hundreds of milliseconds late.
+
+The default font is Consolas when it is installed (it comes with Microsoft Office), and the system monospaced font otherwise.
+
+With more than one pane in a tab, each pane has a bar with its title and a close button. Click a pane to type in it. In the app, `ai agent` and `ai claude` open a pane to the right: the left pane shows the model's text and asks for approval, and the right pane runs the commands. The right pane closes when the agent stops; the left pane keeps the end of each command's output.
 
 The search field finds a setting on any page. **General > Make xsh the Default** opens scripts (`.command`, `.tool`) and `ssh://` links in xsh. Finder also gets a **New xsh Tab Here** service, and you can drop files on a pane to paste their paths.
 
@@ -89,6 +95,7 @@ xsh attach work            # come back to it later
 | Shell | pipes, `>` `>>` `<`, quotes, `\` continuation, `&` jobs, `jobs`/`fg`/`bg`/`kill`, `cd` `pwd` `exit` `export` `unset` `alias` `unalias` `history` `help` | automated tests |
 | Signals | `SIGTERM` is forwarded to the running command; `Ctrl-C` reaches it through the terminal | automated test (`SIGTERM`); manual (`Ctrl-C`) |
 | Line editor | editing, multi-line input, Tab completion, `Ctrl-R`, `Ctrl-K` | manual checklist |
+| Completion | prefix, any-case, and fuzzy matches for commands, subcommands, flags, files, folders, branches, make targets, npm scripts, hosts, variables | automated tests |
 | Bundles | `install` `remove` `list` `search` `update` `info`, registry cache with offline fallback, SHA-256 and host checks | automated tests |
 | Reference bundles | git, rsync, adb, npm, pip, postgres, sbt, scala, ubuntu, node, python, history, vscode, docker | automated tests |
 | AI | `Ctrl-Space`, `Ctrl-Shift-Space` / `Alt-G`, `ai explain`, `ai fix`, safety guard, 10-step cap, encrypted transcripts | automated tests for the logic; the CLI flow runs in CI only where sockets are allowed; keys are manual |
@@ -121,7 +128,7 @@ Layers, later ones win: defaults, `config.toml`, `.xsh.toml` in the working dire
 capture_stderr = true       # lets `ai fix` see error text (see the note below)
 
 [ui]
-theme = "tokyo-night"
+theme = "neon"
 screen_reader = false
 status_bar = true
 hot_reload = true
@@ -183,11 +190,27 @@ Store a key in the OS keychain with the platform tool, for example on macOS:
 
 Every request includes the context you enable above. Prompts and transcripts are stored only on your machine, encrypted. xsh never logs API keys and prints them nowhere.
 
+`ai --model NAME ...` uses another model for one command, such as `ai --model gpt-4o explain ls`. At the prompt, `ai <Tab>` lists the modes and `ai --model <Tab>` lists the models of the configured provider (for Ollama, also the models you pulled).
+
+### Claude Code as the agent
+
+`ai claude <goal>` (or `ai claude --auto <goal>`, `ai claude --model sonnet <goal>`) gives the goal to [Claude Code](https://claude.com/claude-code), which must be installed and signed in. Claude Code starts with all of its own tools turned off: no Bash, no file tools, no web access, and no MCP servers but one. That one is `xsh mcp`, which sends every tool call back to your xsh session:
+
+| Tool | What it does | Approval |
+| --- | --- | --- |
+| `run_command` | runs a command in your shell (or the app's agent pane) | safety guard, then you (unless `--auto`) |
+| `write_file`, `edit_file` | change a file inside the working directory | you (unless `--auto`) |
+| `read_file`, `list_dir`, `find_files`, `search_text` | read inside the working directory | none |
+| `shell_info` | working directory, last failure, recent commands, active bundles | none |
+| `check_command` | asks the safety guard about a command without running it | none |
+
+The file tools refuse paths outside the working directory, including through symbolic links. Set `XSH_CLAUDE` to use a `claude` program that is not on `PATH`.
+
 ## Keys
 
 | Key | Action |
 | --- | --- |
-| `Tab` | complete commands, bundle subcommands, files |
+| `Tab` | complete commands, bundle subcommands, files; when nothing starts with the word, fuzzy matches (`cd dwn` → `Downloads/`) |
 | `-` then `Tab` | options of the command you are typing, read from its man page, each with a short description |
 | `Ctrl-R` | fuzzy history search under the prompt |
 | `Ctrl-K` | command palette: built-ins, bundles, aliases, themes, AI actions, recent commands |
@@ -211,7 +234,7 @@ After you run a command, xsh reads its man page in the background and keeps the 
 --create  create a new archive    -x  extract files from an archive    ...
 ```
 
-For `git commit -<Tab>` it uses the `git-commit` page when one exists. If a page was not read yet, xsh reads it on the spot (at most 2 seconds). There is no cache on disk, and nothing is sent anywhere. If the command has no man page, `Tab` completes file names as before.
+Options match fuzzily too: `git commit --nv<Tab>` finds `--no-verify`. For `git commit -<Tab>` it uses the `git-commit` page when one exists. If a page was not read yet, xsh reads it on the spot (at most 2 seconds). There is no cache on disk, and nothing is sent anywhere. If the command has no man page, `Tab` completes file names as before.
 
 ## Bundles
 
@@ -286,7 +309,11 @@ ansi = []                    # optional, for the app: 16 colors
 format = "{user} {path} {git}{node}{python}❯ "
 ```
 
-Built-in themes: `tokyo-night`, `dracula`, `nord`, `solarized-dark`, `solarized-light`, and `mono`.
+Built-in themes: `neon` (the default), `tokyo-night`, `dracula`, `nord`, `solarized-dark`, `solarized-light`, and `mono`.
+
+### Theme editor
+
+`make theme` opens a theme editor in the browser. It shows a prompt, highlighted commands, the completion menu, the status bar, `ls`, `git`, and `cargo` output, and the 16 terminal colors in the colors of the theme. Click any text to change the color it uses, or edit the colors in the side panel; colors that are hard to read on the background get a warning. Start from a built-in theme or one of yours, or import a `.toml` file. **Download .toml** saves the theme; put it in `~/Library/Application Support/xsh/themes/` and run `xsh theme <name>`.
 
 `{status}`, `{user}`, `{host}`, `{path}`, and any bundle segment name are available. Run `theme mine` to switch (the choice is saved).
 
@@ -303,12 +330,15 @@ External commands in the plain shell inherit your terminal directly, so they see
 ```sh
 make run              # build target/xsh.app (debug) and open it
 make build            # build target/xsh.app (release)
+make theme            # open the theme editor
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) and [docs/manual-tests.md](docs/manual-tests.md).
+
+The app uses a copy of [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm) in `app/Vendor/SwiftTerm` with a small fix; [`PATCHES.md`](app/Vendor/SwiftTerm/PATCHES.md) lists the changes and how to upgrade.
 
 ## License
 

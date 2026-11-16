@@ -18,6 +18,7 @@ use rushy_core::Shell;
 use crate::agent_pane::{self, Link};
 use crate::app::{App, user_themes};
 use crate::cli::{AiCmd, BundleCmd, ConfigCmd, HistoryArgs, HistoryCmd};
+use crate::pretty::{Pal, StepLog};
 
 // ---------------------------------------------------------------- config
 
@@ -537,51 +538,84 @@ pub async fn suggest(app: &mut App, text: &str, allow_insert: bool) -> Result<Ch
             ChatMessage::assistant(format!("{} -- {}", s.command, s.explanation), Vec::new()),
         ],
     );
+    let pal = Pal::for_app(app);
     if s.command.trim().is_empty() {
-        println!("no command: {}", s.explanation);
+        print!("{}", pal.answer(&format!("no command: {}", s.explanation)));
         return Ok(Choice::Cancel);
     }
-    println!("  {}", s.command);
-    if !s.explanation.is_empty() {
-        println!("  # {}", s.explanation);
-    }
+    print!("{}", pal.suggestion(&s.command, &s.explanation));
     Ok(confirm(&assistant, &ctx, &s.command, allow_insert).await)
 }
 
-struct CliHost<'a> {
-    shell: &'a mut Shell,
-    ask_each: bool,
+/// The terminal side of an agent run: step cards, approvals, and the shell
+/// (or the app's right pane) that runs each command. `ai agent` and
+/// `ai claude` share it.
+pub(crate) struct CliHost<'a> {
+    pub(crate) shell: &'a mut Shell,
+    pub(crate) ask_each: bool,
     /// The right pane in `xsh.app`. Without it, commands run in this pane.
-    link: Option<Link>,
+    pub(crate) link: Option<Link>,
     /// The right pane closed during the run.
-    pane_closed: bool,
+    pub(crate) pane_closed: bool,
     /// A command runs in this pane, so Ctrl-C reaches it first.
-    busy: Arc<AtomicBool>,
+    pub(crate) busy: Arc<AtomicBool>,
     /// The user pressed Ctrl-C during a command in this pane.
-    interrupted: Arc<AtomicBool>,
+    pub(crate) interrupted: Arc<AtomicBool>,
+    /// Colors, glyphs, and width for the step cards.
+    pub(crate) pal: Pal,
+    /// A "thinking" line is on the screen without a newline.
+    pub(crate) thinking: bool,
+    /// Every step so far, for the report at the end.
+    pub(crate) steps: Vec<StepLog>,
 }
+
+impl CliHost<'_> {
+    /// Erases the "thinking" line before anything else is printed.
+    pub(crate) fn clear_thinking(&mut self) {
+        if std::mem::take(&mut self.thinking) {
+            eprint!("\r\x1b[2K");
+            let _ = std::io::stderr().flush();
+        }
+    }
+}
+
+/// Lines of output shown in a step card when the command ran in the agent pane.
+const PREVIEW_LINES: usize = 6;
 
 #[async_trait]
 impl AgentHost for CliHost<'_> {
     async fn approve(&mut self, step: usize, command: &str, reason: &str) -> Approval {
-        eprintln!("\nstep {step}: {command}");
-        if !reason.is_empty() {
-            eprintln!("  why: {reason}");
-        }
+        self.clear_thinking();
+        eprint!("{}", self.pal.card_head(step, command, reason));
         if !self.ask_each {
             return Approval::Run;
         }
-        match ask("[y]es run, [n]o skip, [a]bort (default: no)? ")
+        let answer = match ask("[y]es run, [n]o skip, [a]bort (default: no)? ")
             .await
             .as_str()
         {
             "y" | "yes" => Approval::Run,
             "a" | "abort" | "q" | INTERRUPTED => Approval::Abort,
             _ => Approval::Skip,
-        }
+        };
+        let note = match answer {
+            Approval::Run => return answer,
+            Approval::Skip => "skipped",
+            Approval::Abort => "stopped",
+        };
+        eprint!("{}", self.pal.card_note(answer == Approval::Abort, note));
+        self.steps.push(StepLog {
+            command: command.to_owned(),
+            result: note.to_owned(),
+            output: String::new(),
+        });
+        answer
     }
 
     async fn run(&mut self, command: &str) -> CommandOutput {
+        // The output follows this line: live here, or as a preview from the
+        // agent pane when the command ends.
+        eprint!("{}", self.pal.card_response());
         let Some(link) = &mut self.link else {
             self.busy.store(true, Ordering::SeqCst);
             let out = agent_pane::run_logged(self.shell, command).await;
@@ -602,11 +636,58 @@ impl AgentHost for CliHost<'_> {
     }
 
     fn event(&mut self, event: StepEvent<'_>) {
+        self.clear_thinking();
         match event {
-            StepEvent::Thinking => eprintln!("\nthinking..."),
-            StepEvent::Said { text } => eprintln!("{text}"),
-            StepEvent::Blocked { reason, .. } => eprintln!("  refused: {reason}"),
-            StepEvent::Ran { output, .. } => eprintln!("  exit status {}", output.status),
+            StepEvent::Thinking => {
+                let dots = self.pal.dim("⋯ thinking");
+                // On a terminal the line is erased when the next output comes.
+                if std::io::stderr().is_terminal() {
+                    eprint!("\n{dots}");
+                    let _ = std::io::stderr().flush();
+                    self.thinking = true;
+                } else {
+                    eprintln!("\n{dots}");
+                }
+            }
+            StepEvent::Said { text } => eprint!("\n{}", self.pal.said(text)),
+            StepEvent::Blocked {
+                step,
+                command,
+                reason,
+            } => {
+                eprint!("{}", self.pal.card_head(step, command, ""));
+                eprint!(
+                    "{}",
+                    self.pal.card_note(true, &format!("refused: {reason}"))
+                );
+                self.steps.push(StepLog {
+                    command: command.to_owned(),
+                    result: "refused".to_owned(),
+                    output: reason,
+                });
+            }
+            StepEvent::Ran {
+                command, output, ..
+            } => {
+                self.steps.push(StepLog {
+                    command: command.to_owned(),
+                    result: if output.status == 0 {
+                        "ok (exit 0)".to_owned()
+                    } else {
+                        format!("failed (exit {})", output.status)
+                    },
+                    output: StepLog::last_line(&output.stdout, &output.stderr),
+                });
+                // In the app the command ran in the right pane, so show the
+                // end of its output here too. Otherwise it is already above.
+                if output.stdout.trim().is_empty() && output.stderr.trim().is_empty() {
+                    eprint!("{}", self.pal.card_no_output());
+                } else if self.link.is_some() {
+                    let text = format!("{}\n{}", output.stdout, output.stderr);
+                    eprint!("{}", self.pal.card_preview(&text, PREVIEW_LINES));
+                }
+                eprint!("{}", self.pal.card_status(output.status));
+            }
         }
     }
 
@@ -643,19 +724,26 @@ fn ai_status(app: &App) -> Result<i32> {
     Ok(0)
 }
 
-/// `ai ...`
-pub async fn ai(app: &mut App, cmd: AiCmd) -> Result<i32> {
+/// `ai ...`. `model` is `ai --model`; the other modes read it through
+/// [`App::ai`], and `ai claude` passes it to Claude Code.
+pub async fn ai(app: &mut App, cmd: AiCmd, model: Option<String>) -> Result<i32> {
     match cmd {
+        AiCmd::Claude { auto, goal } => {
+            crate::claude::run(app, &goal.join(" "), auto, model.as_deref()).await
+        }
         AiCmd::Status => ai_status(app),
-        AiCmd::Explain { command } => {
+        // `ai <text>` with no subcommand explains too.
+        AiCmd::Explain { command } | AiCmd::Ask(command) => {
             let command = command.join(" ");
             let rt = app.ai()?;
             let ctx = app.ai_context(&rt.cfg).await;
             let assistant = Assistant::new(&*rt.provider, Settings::from(&rt.cfg));
             let text = until_interrupt(assistant.explain(&command, &ctx)).await??;
-            println!("{text}");
+            let report = format!("### Question\n{}\n\n### Answer\n{text}", command.trim());
+            print!("\n{}", Pal::for_app(app).bubble(&report, "xsh"));
+            // A question is not a command: only warn about text that parses.
             let verdict = rushy_ai::check_command(&command);
-            if !verdict.is_allowed() {
+            if !verdict.is_allowed() && verdict.rule() != Some("unparseable") {
                 println!("\nwarning: {verdict}");
             }
             app.save_transcript(
@@ -710,11 +798,12 @@ pub async fn ai(app: &mut App, cmd: AiCmd) -> Result<i32> {
                     ),
                 ],
             );
-            println!("{}", s.explanation);
+            let pal = Pal::for_app(app);
             if s.command.trim().is_empty() {
+                print!("{}", pal.answer(&s.explanation));
                 return Ok(0);
             }
-            println!("  {}", s.command);
+            print!("{}", pal.suggestion(&s.command, &s.explanation));
             run_choice(app, confirm(&assistant, &ctx, &s.command, false).await).await
         }
         AiCmd::Suggest { description } => {
@@ -752,6 +841,8 @@ pub async fn agent_goal(app: &mut App, goal: &str, auto: bool) -> Result<i32> {
         agent::MAX_STEPS
     };
     let tty = std::io::stdin().is_terminal();
+    let pal = Pal::for_app(app);
+    eprint!("{}", pal.question(goal));
     if auto {
         eprintln!(
             "autopilot: commands run without a question, at most {limit} steps; the safety checks stay on; Ctrl-C stops"
@@ -770,6 +861,9 @@ pub async fn agent_goal(app: &mut App, goal: &str, auto: bool) -> Result<i32> {
         pane_closed: false,
         busy: Arc::clone(&busy),
         interrupted: Arc::clone(&interrupted),
+        pal: pal.clone(),
+        thinking: false,
+        steps: Vec::new(),
     };
     let finished = {
         let work = agent::run_limited(&assistant, goal, &ctx, &mut host, limit);
@@ -791,17 +885,22 @@ pub async fn agent_goal(app: &mut App, goal: &str, auto: bool) -> Result<i32> {
             }
         }
     };
+    host.clear_thinking();
+    let steps = std::mem::take(&mut host.steps);
     drop(host);
     let Some(out) = finished else {
-        eprintln!("\nstopped");
+        let answer = format!("*Stopped with Ctrl-C after {} step(s).*", steps.len());
+        print!("\n{}", pal.agent_report(goal, &answer, &steps));
         return Ok(130);
     };
     let out = out?;
     app.save_transcript("agent", rt.provider.name(), out.messages.clone());
-    match out.stop {
-        Stop::Done => println!("\n{}", out.summary),
-        Stop::StepLimit => println!("\nstopped after {limit} steps (the limit)"),
-        Stop::Aborted => println!("\nstopped by you after {} step(s)", out.steps),
-    }
+    let answer = match out.stop {
+        Stop::Done if out.summary.trim().is_empty() => "*The agent gave no summary.*".to_owned(),
+        Stop::Done => out.summary,
+        Stop::StepLimit => format!("*Stopped after {limit} steps (the limit).*"),
+        Stop::Aborted => format!("*Stopped by you after {} step(s).*", out.steps),
+    };
+    print!("\n{}", pal.agent_report(goal, &answer, &steps));
     Ok(0)
 }

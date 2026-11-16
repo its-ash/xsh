@@ -35,6 +35,35 @@ pub const OPENAI_MODEL: &str = "gpt-4o-mini";
 /// Default Ollama model.
 pub const OLLAMA_MODEL: &str = "llama3.1:8b";
 
+/// Well-known models of `provider`, newest first, for completion and the app.
+/// Any other name the service accepts works too.
+#[must_use]
+pub fn known_models(provider: &str) -> &'static [&'static str] {
+    match provider {
+        "anthropic" => &[
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "claude-fable-5-1",
+            "claude-opus-4-1",
+            "claude-sonnet-4-5",
+            "claude-haiku-4-5",
+        ],
+        "openai" => &[
+            "gpt-5",
+            "gpt-5-mini",
+            "gpt-4.1",
+            "gpt-4.1-mini",
+            "gpt-4o",
+            "gpt-4o-mini",
+            "o4-mini",
+            "o3",
+        ],
+        "ollama" => &[OLLAMA_MODEL],
+        _ => &[],
+    }
+}
+
 /// A secret string that never appears in `Debug` or `Display` output.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Secret(String);
@@ -308,6 +337,9 @@ model = "llama3.1:8b"
         assert_eq!(cfg.model("openai"), "gpt-4o-mini");
         assert_eq!(cfg.model("ollama"), "llama3.1:8b");
         assert_eq!(cfg.model("anthropic"), ANTHROPIC_MODEL);
+        assert!(known_models("anthropic").contains(&ANTHROPIC_MODEL));
+        assert!(known_models("openai").contains(&OPENAI_MODEL));
+        assert!(known_models("custom").is_empty());
         assert_eq!(
             cfg.provider("openai").api_key,
             Some(KeySpec::Keyring {

@@ -21,6 +21,7 @@ use serde::Deserialize;
 
 use crate::{Error, Result};
 
+const NEON: &str = include_str!("../themes/neon.toml");
 const TOKYO_NIGHT: &str = include_str!("../themes/tokyo-night.toml");
 const MONO: &str = include_str!("../themes/mono.toml");
 const DRACULA: &str = include_str!("../themes/dracula.toml");
@@ -30,6 +31,7 @@ const SOLARIZED_LIGHT: &str = include_str!("../themes/solarized-light.toml");
 
 /// Built-in theme names.
 pub const BUILTIN: &[&str] = &[
+    "neon",
     "tokyo-night",
     "mono",
     "dracula",
@@ -53,7 +55,8 @@ pub const BUILTIN: &[&str] = &[
 pub fn parse_color(s: &str) -> Result<Color> {
     let bad = || Error::Color(s.to_owned());
     if let Some(hex) = s.strip_prefix('#') {
-        if hex.len() != 6 || !hex.is_ascii() {
+        // `from_str_radix` accepts a leading `+`, so check the digits first.
+        if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(bad());
         }
         let n = |i: usize| {
@@ -183,6 +186,7 @@ impl Theme {
     /// Returns [`Error::NoTheme`] for unknown names.
     pub fn builtin(name: &str) -> Result<Self> {
         let (text, plain) = match name {
+            "neon" => (NEON, false),
             "tokyo-night" => (TOKYO_NIGHT, false),
             "mono" => (MONO, true),
             "dracula" => (DRACULA, false),
@@ -249,5 +253,38 @@ impl Theme {
         } else {
             self.style(self.accent).add_modifier(Modifier::BOLD)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn colors_reject_malformed_hex() {
+        for bad in [
+            "#+1+2+3", "#12345", "#1234567", "#gggggg", "#ééé", "#-1-2-3", "teal",
+        ] {
+            assert!(parse_color(bad).is_err(), "{bad}");
+        }
+        assert_eq!(parse_color("#FFfF00").ok(), Some(Color::Rgb(255, 255, 0)));
+        assert_eq!(parse_color("GREY").ok(), Some(Color::Gray));
+        assert_eq!(parse_color("").ok(), Some(Color::Reset));
+    }
+
+    #[test]
+    fn every_builtin_theme_parses() {
+        for name in BUILTIN {
+            assert!(Theme::builtin(name).is_ok(), "{name}");
+        }
+    }
+
+    #[test]
+    fn ansi_lists_need_sixteen_colors() {
+        let text = "name=\"t\"\n[colors]\nbackground=\"red\"\nforeground=\"red\"\naccent=\"red\"\nerror=\"red\"\nsuccess=\"red\"\nprompt_user=\"red\"\nprompt_path=\"red\"\nansi=[\"red\"]\n[prompt]\nformat=\"$ \"\n";
+        assert!(matches!(
+            Theme::parse(Path::new("t.toml"), text),
+            Err(Error::Color(_))
+        ));
     }
 }

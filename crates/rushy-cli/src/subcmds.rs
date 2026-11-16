@@ -7,6 +7,10 @@
 /// `(command, subcommands)`.
 pub const TABLE: &[(&str, &[&str])] = &[
     (
+        "ai",
+        &["agent", "claude", "explain", "fix", "status", "suggest"],
+    ),
+    (
         "git",
         &[
             "add",

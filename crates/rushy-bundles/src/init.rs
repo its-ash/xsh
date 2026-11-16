@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use rushy_core::parser::{self, WordPart};
 
+use crate::manifest::valid_alias;
 use crate::{Error, Result};
 
 /// Aliases and variables declared by an `init.rushy` file.
@@ -75,6 +76,9 @@ pub fn parse_init(file: &str, text: &str) -> Result<InitFile> {
                 };
                 if head == "export" && !parser::is_var_name(k) {
                     return Err(fail(&format!("`{k}` is not a valid variable name")));
+                }
+                if head == "alias" && !valid_alias(k) {
+                    return Err(fail(&format!("`{k}` is not a valid alias name")));
                 }
                 target.insert(k.to_owned(), v.to_owned());
             }

@@ -167,7 +167,8 @@ impl Default for WindowConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FontConfig {
-    /// Font family; empty uses the system monospaced font.
+    /// Font family; empty, or a family that is not installed, uses the
+    /// system monospaced font.
     pub family: String,
     /// Size in points.
     pub size: u16,
@@ -186,7 +187,7 @@ pub struct FontConfig {
 impl Default for FontConfig {
     fn default() -> Self {
         Self {
-            family: String::new(),
+            family: "Consolas".to_owned(),
             size: 13,
             line_spacing: 100,
             smoothing: true,
@@ -469,7 +470,7 @@ pub struct UiConfig {
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
-            theme: "tokyo-night".to_owned(),
+            theme: "neon".to_owned(),
             screen_reader: false,
             no_color: false,
             status_bar: true,
@@ -715,7 +716,10 @@ pub fn parse_toml<T: DeserializeOwned>(path: &Path, text: &str) -> Result<T> {
         let start = e.span().map_or(0, |s| s.start).min(text.len());
         let before = text.get(..start).unwrap_or_default();
         let line = before.matches('\n').count() + 1;
-        let column = before.rfind('\n').map_or(start, |i| start - i - 1) + 1;
+        // Columns count characters, not bytes, so non-ASCII text before the
+        // error does not push the column past where an editor shows it.
+        let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+        let column = before.get(line_start..).map_or(0, |s| s.chars().count()) + 1;
         Error::Invalid {
             path: path.to_path_buf(),
             line,
@@ -738,9 +742,7 @@ pub fn set_theme(paths: &Paths, name: &str) -> Result<()> {
     let mut doc = text
         .parse::<toml_edit::DocumentMut>()
         .map_err(|e| Error::Extract(e.to_string()))?;
-    if !doc.contains_table("ui") {
-        doc["ui"] = toml_edit::table();
-    }
+    ensure_section(&mut doc, "ui");
     doc["ui"]["theme"] = toml_edit::value(name);
     std::fs::create_dir_all(paths.config_dir())?;
     std::fs::write(&file, doc.to_string())?;
@@ -798,6 +800,14 @@ fn to_doc(cfg: &Config) -> Result<toml_edit::DocumentMut> {
     toml_edit::ser::to_document(cfg).map_err(|e| Error::Extract(e.to_string()))
 }
 
+/// Makes `section` a table unless it already is one. An inline table
+/// (`ui = { theme = "x" }`) counts as one, so its other keys are kept.
+fn ensure_section(doc: &mut toml_edit::DocumentMut, section: &str) {
+    if !doc.get(section).is_some_and(toml_edit::Item::is_table_like) {
+        doc[section] = toml_edit::table();
+    }
+}
+
 fn split_key(key: &str) -> Result<(&str, &str)> {
     key.split_once('.')
         .filter(|(s, k)| !s.is_empty() && !k.is_empty() && !k.contains('.'))
@@ -836,12 +846,21 @@ pub fn set_value(paths: &Paths, key: &str, raw: &str) -> Result<()> {
     let value = raw
         .parse::<toml_edit::Value>()
         .unwrap_or_else(|_| toml_edit::Value::from(raw));
-    if !doc.contains_table(section) {
-        doc[section] = toml_edit::table();
-    }
+    let is_str = value.is_str();
+    ensure_section(&mut doc, section);
     doc[section][name] = toml_edit::Item::Value(value);
-    let new = doc.to_string();
-    parse_toml::<Config>(&file, &new)?;
+    let mut new = doc.to_string();
+    if let Err(e) = parse_toml::<Config>(&file, &new) {
+        // `1984` or `true` for a text setting: keep the text as typed.
+        if is_str {
+            return Err(e);
+        }
+        doc[section][name] = toml_edit::value(raw);
+        new = doc.to_string();
+        if parse_toml::<Config>(&file, &new).is_err() {
+            return Err(e);
+        }
+    }
     std::fs::create_dir_all(paths.config_dir())?;
     std::fs::write(&file, new)?;
     Ok(())
@@ -861,7 +880,10 @@ pub fn unset_value(paths: &Paths, key: &str) -> Result<()> {
     let mut doc = text
         .parse::<toml_edit::DocumentMut>()
         .map_err(|e| Error::Extract(e.to_string()))?;
-    if let Some(t) = doc.get_mut(section).and_then(toml_edit::Item::as_table_mut) {
+    if let Some(t) = doc
+        .get_mut(section)
+        .and_then(toml_edit::Item::as_table_like_mut)
+    {
         t.remove(name);
     }
     std::fs::write(&file, doc.to_string())?;
@@ -965,6 +987,156 @@ mod tests {
         let cfg = Loader::new(paths).env(false).load()?;
         assert_eq!(cfg.shell.edit_mode, "emacs");
         assert!(keys()?.iter().any(|k| k == "ui.highlight"));
+        Ok(())
+    }
+
+    /// Regression: `set_value` and `set_theme` replaced an inline-table
+    /// section with an empty table, dropping the user's other settings.
+    #[test]
+    fn set_value_keeps_inline_table_section() -> std::result::Result<(), Box<dyn std::error::Error>>
+    {
+        let (_dir, paths) = setup()?;
+        std::fs::write(
+            paths.config_file(),
+            "ui = { theme = \"nord\", status_bar = false }\n",
+        )?;
+        set_value(&paths, "ui.highlight", "false")?;
+        let cfg = Loader::new(paths.clone()).env(false).load()?;
+        assert_eq!(cfg.ui.theme, "nord");
+        assert!(!cfg.ui.status_bar);
+        assert!(!cfg.ui.highlight);
+        set_theme(&paths, "mono")?;
+        let cfg = Loader::new(paths.clone()).env(false).load()?;
+        assert_eq!(cfg.ui.theme, "mono");
+        assert!(!cfg.ui.status_bar);
+        unset_value(&paths, "ui.status_bar")?;
+        let cfg = Loader::new(paths).env(false).load()?;
+        assert!(
+            cfg.ui.status_bar,
+            "unset must remove keys from inline tables too"
+        );
+        assert_eq!(cfg.ui.theme, "mono");
+        Ok(())
+    }
+
+    /// Regression: a text setting whose value looks like a number or a
+    /// boolean was rejected as the wrong type.
+    #[test]
+    fn set_value_keeps_number_like_text() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let (_dir, paths) = setup()?;
+        set_value(&paths, "ui.theme", "1984")?;
+        set_value(&paths, "mux.shell", "true")?;
+        let cfg = Loader::new(paths.clone()).env(false).load()?;
+        assert_eq!(cfg.ui.theme, "1984");
+        assert_eq!(cfg.mux.shell, "true");
+        // Typed settings still reject text and out-of-range numbers.
+        assert!(set_value(&paths, "window.opacity", "300").is_err());
+        assert!(set_value(&paths, "ui.highlight", "maybe").is_err());
+        assert!(set_value(&paths, "font.size", "-1").is_err());
+        let cfg = Loader::new(paths).env(false).load()?;
+        assert_eq!(cfg.window.opacity, 100);
+        Ok(())
+    }
+
+    /// Regression: the column counted bytes, so text such as `é` before the
+    /// error moved it to the right.
+    #[test]
+    fn error_column_counts_characters() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let path = Path::new("x.toml");
+        match parse_toml::<Config>(path, "[ui]\ntheme = \"é\" x\n") {
+            Err(Error::Invalid { line, column, .. }) => {
+                assert_eq!((line, column), (2, 13));
+                Ok(())
+            }
+            other => Err(format!("expected an Invalid error, got {other:?}").into()),
+        }
+    }
+
+    #[test]
+    fn malformed_files_are_errors_not_panics() -> std::result::Result<(), Box<dyn std::error::Error>>
+    {
+        let path = Path::new("x.toml");
+        for text in [
+            "[ui",
+            "[ui]\ntheme = ",
+            "[ui]\ntheme = \"unterminated",
+            "[ui]\n[ui]\n",
+            "[ui]\nopacity = 1\n",
+            "[window]\nopacity = 1000\n",
+            "[window]\ncolumns = -1\n",
+            "\u{feff}[ui]\ntheme = 3\n",
+            "profiles = 3\n",
+            "[[ui]]\n",
+        ] {
+            assert!(
+                matches!(parse_toml::<Config>(path, text), Err(Error::Invalid { .. })),
+                "{text:?} should be rejected"
+            );
+        }
+        // Empty and comment-only files are the defaults.
+        assert_eq!(parse_toml::<Config>(path, "")?, Config::default());
+        assert_eq!(parse_toml::<Config>(path, "# hi\n\n")?, Config::default());
+        Ok(())
+    }
+
+    #[test]
+    fn bad_keys_are_rejected() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let (_dir, paths) = setup()?;
+        for key in [
+            "",
+            ".",
+            "ui",
+            "ui.",
+            ".theme",
+            "ui.theme.x",
+            "profiles.name",
+        ] {
+            assert!(set_value(&paths, key, "x").is_err(), "{key:?}");
+        }
+        assert!(!paths.config_file().exists() || load_toml::<Config>(&paths.config_file()).is_ok());
+        let cfg = Config::default();
+        assert!(get_value(&cfg, "ui.theme.x").is_err());
+        assert!(get_value(&cfg, "profiles.name").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn profiles_round_trip() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let (_dir, paths) = setup()?;
+        std::fs::write(paths.config_file(), "# keep\n[ui]\ntheme = \"nord\"\n")?;
+        let p = Profile {
+            name: "Ünïcode ✓".into(),
+            args: vec!["-l".into()],
+            ..Profile::default()
+        };
+        set_profiles(&paths, std::slice::from_ref(&p))?;
+        let cfg = Loader::new(paths.clone()).env(false).load()?;
+        assert_eq!(cfg.profiles, vec![p]);
+        assert_eq!(cfg.ui.theme, "nord");
+        set_profiles(&paths, &[])?;
+        let cfg = Loader::new(paths.clone()).env(false).load()?;
+        assert!(cfg.profiles.is_empty());
+        assert!(std::fs::read_to_string(paths.config_file())?.contains("# keep"));
+        Ok(())
+    }
+
+    #[test]
+    fn project_may_set_ui_but_not_history() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let (dir, paths) = setup()?;
+        std::fs::write(
+            dir.path().join(PROJECT_FILE),
+            "[history]\nenabled = false\n",
+        )?;
+        let res = Loader::new(paths.clone())
+            .env(false)
+            .project(dir.path())
+            .load();
+        assert!(matches!(res, Err(Error::Invalid { .. })));
+        // A missing project file is fine.
+        let empty = dir.path().join("empty");
+        std::fs::create_dir_all(&empty)?;
+        let cfg = Loader::new(paths).env(false).project(&empty).load()?;
+        assert_eq!(cfg, Config::default());
         Ok(())
     }
 
