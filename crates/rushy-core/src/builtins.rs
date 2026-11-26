@@ -122,7 +122,7 @@ const SIGNALS: &[(u32, &str)] = &[
 /// Whether `name` is a built-in command.
 #[must_use]
 pub fn is_builtin(name: &str) -> bool {
-    BUILTINS.iter().any(|(n, _)| *n == name)
+    BUILTINS.binary_search_by_key(&name, |(n, _)| *n).is_ok()
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -161,18 +161,16 @@ impl Output {
     }
 }
 
-pub(crate) async fn run(
+pub(crate) fn run_sync(
     name: &str,
     args: &[String],
     state: &mut ShellState,
     jobs: &mut JobTable,
-) -> Output {
-    match name {
+) -> Option<Output> {
+    Some(match name {
         ":" | "true" => Output::default(),
         "false" => Output::status(1),
         "alias" => alias(args, state),
-        "bg" => bg(args, jobs).await,
-        "cd" => cd(args, state).await,
         "dirs" => dirs(args, state),
         "disown" => disown(args, jobs),
         "echo" => echo(args),
@@ -181,14 +179,10 @@ pub(crate) async fn run(
         "getopts" => getopts(args, state),
         "let" => let_cmd(args, state),
         "readonly" => readonly(args, state),
-        "fg" => fg(args, &state.foreground(), jobs).await,
         "help" => help(args),
         "history" => history(args, state),
         "jobs" => list_jobs(jobs),
-        "kill" => kill(args, state, jobs).await,
-        "popd" => popd(args, state).await,
         "printf" => printf(args),
-        "pushd" => pushd(args, state).await,
         "pwd" if physical_flag(args) => match std::fs::canonicalize(state.cwd()) {
             Ok(p) => Output::out(format!("{}\n", p.display())),
             Err(e) => Output::fail(1, format!("pwd: {e}")),
@@ -204,12 +198,32 @@ pub(crate) async fn run(
         },
         "trap" => trap(args, state),
         "type" => type_cmd(args, state),
-        "ulimit" => ulimit(args, state).await,
-        "umask" => umask(args, state).await,
         "unalias" => unalias(args, state),
         "unset" => unset(args, state),
-        "wait" => wait(args, jobs).await,
         "which" => which(args, state),
+        _ => return None,
+    })
+}
+
+pub(crate) async fn run(
+    name: &str,
+    args: &[String],
+    state: &mut ShellState,
+    jobs: &mut JobTable,
+) -> Output {
+    if let Some(out) = run_sync(name, args, state, jobs) {
+        return out;
+    }
+    match name {
+        "bg" => bg(args, jobs).await,
+        "cd" => cd(args, state).await,
+        "fg" => fg(args, &state.foreground(), jobs).await,
+        "kill" => kill(args, state, jobs).await,
+        "popd" => popd(args, state).await,
+        "pushd" => pushd(args, state).await,
+        "ulimit" => ulimit(args, state).await,
+        "umask" => umask(args, state).await,
+        "wait" => wait(args, jobs).await,
         _ => Output::fail(127, format!("xsh: {name}: not a built-in")),
     }
 }
@@ -273,6 +287,9 @@ async fn change_dir(
         Ok(_) => return Err(format!("cd: {target}: not a directory")),
         Err(e) => return Err(format!("cd: {target}: {e}")),
     }
+    if let Err(e) = rustix::fs::access(&dir, rustix::fs::Access::EXEC_OK) {
+        return Err(format!("cd: {target}: {}", std::io::Error::from(e)));
+    }
     let old = state.cwd().display().to_string();
     state.set_env("OLDPWD", old);
     state.set_env("PWD", dir.display().to_string());
@@ -309,15 +326,28 @@ fn via_cdpath(target: &str, state: &ShellState) -> Option<String> {
 }
 
 async fn cd(args: &[String], state: &mut ShellState) -> Output {
-    let physical = physical_flag(args);
-    let args: Vec<&String> = args.iter().filter(|a| *a != "-L" && *a != "-P").collect();
-    if args.len() > 1 {
+    let mut physical = false;
+    let mut i = 0;
+    while let Some(a) = args.get(i) {
+        match a.as_str() {
+            "-L" => physical = false,
+            "-P" => physical = true,
+            "--" => {
+                i += 1;
+                break;
+            }
+            _ => break,
+        }
+        i += 1;
+    }
+    let rest = args.get(i..).unwrap_or_default();
+    if rest.len() > 1 {
         return Output::fail(1, "cd: too many arguments");
     }
-    let dash = args.first().is_some_and(|a| *a == "-");
-    let target = match args.first() {
+    let dash = rest.first().is_some_and(|a| a == "-");
+    let target = match rest.first() {
         Some(_) if dash => state.var("OLDPWD").map(str::to_owned),
-        Some(a) => Some((*a).clone()),
+        Some(a) => Some(a.clone()),
         None => state.home(),
     };
     let Some(target) = target else {
@@ -600,6 +630,11 @@ fn getopts(args: &[String], state: &mut ShellState) -> Output {
     };
     if !is_var_name(name) {
         return Output::fail(2, format!("getopts: `{name}`: not a valid identifier"));
+    }
+    for ro in [name.as_str(), "OPTIND", "OPTARG"] {
+        if state.is_readonly(ro) {
+            return Output::fail(1, format!("getopts: {ro}: readonly variable"));
+        }
     }
     let words: Vec<String> = if rest.is_empty() {
         state.positional().to_vec()
@@ -1045,15 +1080,29 @@ fn echo(args: &[String]) -> Output {
         }
         i += 1;
     }
-    let text = args.get(i..).unwrap_or_default().join(" ");
+    let rest = args.get(i..).unwrap_or_default();
     if escapes {
+        let text = rest.join(" ");
         let (mut s, stop) = unescape(&text, true);
         if !stop && newline {
             s.push('\n');
         }
         return Output::out(s);
     }
-    Output::out(if newline { format!("{text}\n") } else { text })
+    let cap = rest.iter().map(String::len).sum::<usize>()
+        + rest.len().saturating_sub(1)
+        + usize::from(newline);
+    let mut out = String::with_capacity(cap);
+    for (k, part) in rest.iter().enumerate() {
+        if k > 0 {
+            out.push(' ');
+        }
+        out.push_str(part);
+    }
+    if newline {
+        out.push('\n');
+    }
+    Output::out(out)
 }
 
 #[allow(
@@ -1070,13 +1119,15 @@ struct Spec {
     prec: Option<usize>,
 }
 
+const MAX_PRINTF_PAD: usize = 1_048_576;
+
 fn pad(s: String, spec: &Spec, numeric: bool) -> String {
-    let w = spec.width.unwrap_or(0);
+    let w = spec.width.unwrap_or(0).min(MAX_PRINTF_PAD);
     let len = s.chars().count();
     if len >= w {
         return s;
     }
-    let fill = w - len;
+    let fill = (w - len).min(MAX_PRINTF_PAD);
     if spec.left {
         format!("{s}{}", " ".repeat(fill))
     } else if spec.zero && numeric {
@@ -1098,17 +1149,27 @@ fn int_arg(a: &str) -> Result<i64, String> {
     if t.is_empty() {
         return Ok(0);
     }
-    let (neg, body) = t.strip_prefix('-').map_or((false, t), |b| (true, b));
-    let body = body.strip_prefix('+').unwrap_or(body);
-    let v = if let Some(h) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
-        i64::from_str_radix(h, 16)
-    } else if body.len() > 1 && body.starts_with('0') {
-        i64::from_str_radix(&body[1..], 8)
+    let (sign, body) = if let Some(b) = t.strip_prefix('-') {
+        ("-", b)
+    } else if let Some(b) = t.strip_prefix('+') {
+        ("", b)
     } else {
-        body.parse()
-    }
-    .map_err(|_| format!("printf: {a}: invalid number"))?;
-    Ok(if neg { -v } else { v })
+        ("", t)
+    };
+    let parsed = if let Some(h) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+        if h.starts_with(['+', '-']) {
+            return Err(format!("printf: {a}: invalid number"));
+        }
+        i64::from_str_radix(&format!("{sign}{h}"), 16)
+    } else if body.len() > 1 && body.starts_with('0') {
+        if body[1..].starts_with(['+', '-']) {
+            return Err(format!("printf: {a}: invalid number"));
+        }
+        i64::from_str_radix(&format!("{sign}{}", &body[1..]), 8)
+    } else {
+        t.parse::<i64>()
+    };
+    parsed.map_err(|_| format!("printf: {a}: invalid number"))
 }
 
 fn exp_format(v: f64, prec: usize, upper: bool) -> String {
@@ -1242,27 +1303,43 @@ fn printf(args: &[String]) -> Output {
                 if w < 0 {
                     spec.left = true;
                 }
-                spec.width = usize::try_from(w.unsigned_abs()).ok();
+                spec.width = Some(
+                    usize::try_from(w.unsigned_abs())
+                        .unwrap_or(MAX_PRINTF_PAD)
+                        .min(MAX_PRINTF_PAD),
+                );
             } else {
                 let mut w = String::new();
                 while let Some(&d) = fmt.get(i).filter(|d| d.is_ascii_digit()) {
                     w.push(d);
                     i += 1;
                 }
-                spec.width = w.parse().ok();
+                spec.width = (!w.is_empty()).then(|| {
+                    w.parse::<usize>()
+                        .unwrap_or(MAX_PRINTF_PAD)
+                        .min(MAX_PRINTF_PAD)
+                });
             }
             if fmt.get(i) == Some(&'.') {
                 i += 1;
                 if fmt.get(i) == Some(&'*') {
                     i += 1;
-                    spec.prec = usize::try_from(int_arg(&next_arg(&mut ai)).unwrap_or(0)).ok();
+                    spec.prec = usize::try_from(int_arg(&next_arg(&mut ai)).unwrap_or(0))
+                        .ok()
+                        .map(|p| p.min(MAX_PRINTF_PAD));
                 } else {
                     let mut p = String::new();
                     while let Some(&d) = fmt.get(i).filter(|d| d.is_ascii_digit()) {
                         p.push(d);
                         i += 1;
                     }
-                    spec.prec = Some(p.parse().unwrap_or(0));
+                    spec.prec = Some(if p.is_empty() {
+                        0
+                    } else {
+                        p.parse::<usize>()
+                            .unwrap_or(MAX_PRINTF_PAD)
+                            .min(MAX_PRINTF_PAD)
+                    });
                 }
             }
             while matches!(fmt.get(i), Some('l' | 'h' | 'q' | 'j' | 'z' | 't' | 'L'))
@@ -1502,8 +1579,35 @@ fn shopt(args: &[String], state: &mut ShellState) -> Output {
 }
 
 fn test_cmd(args: &[String], state: &ShellState) -> Output {
-    let toks: Vec<Tok> = args.iter().map(|a| Tok::plain(a)).collect();
-    match test::eval(&toks, false, state.cwd(), &|n| state.var(n).is_some()) {
+    let is_set = |n: &str| state.var(n).is_some();
+    let res = match args {
+        [a] => test::eval(
+            &[Tok::plain(a)],
+            false,
+            state.cwd(),
+            state.options(),
+            &is_set,
+        ),
+        [a, b] => test::eval(
+            &[Tok::plain(a), Tok::plain(b)],
+            false,
+            state.cwd(),
+            state.options(),
+            &is_set,
+        ),
+        [a, b, c] => test::eval(
+            &[Tok::plain(a), Tok::plain(b), Tok::plain(c)],
+            false,
+            state.cwd(),
+            state.options(),
+            &is_set,
+        ),
+        _ => {
+            let toks: Vec<Tok<'_>> = args.iter().map(|a| Tok::plain(a)).collect();
+            test::eval(&toks, false, state.cwd(), state.options(), &is_set)
+        }
+    };
+    match res {
         Ok(true) => Output::default(),
         Ok(false) => Output::status(1),
         Err(e) => Output::fail(2, format!("test: {e}")),
@@ -1867,6 +1971,14 @@ mod tests {
         }
         assert_eq!(printf(&args(&["%d", "x"])).status, 1);
         assert_eq!(printf(&[]).status, 2);
+        assert_eq!(
+            printf(&args(&["%d", "-9223372036854775808"])).stdout,
+            "-9223372036854775808"
+        );
+        assert_eq!(
+            printf(&args(&["%999999999999s", "a"])).stdout.len(),
+            MAX_PRINTF_PAD
+        );
     }
 
     #[test]

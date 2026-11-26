@@ -4,6 +4,7 @@
 //! server. A download must match its `.sha256` file and contain a correctly
 //! signed app of that version. The app then replaces itself.
 
+use std::os::unix::fs::DirBuilderExt as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -19,6 +20,11 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(20);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(10);
 const MAX_ARCHIVE_BYTES: usize = 400 * 1024 * 1024;
 const NOTES_LIMIT: usize = 1_500;
+const ALLOWED_REDIRECT_HOSTS: &[&str] = &[
+    "github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+];
 
 fn target() -> &'static str {
     if cfg!(target_arch = "aarch64") {
@@ -28,9 +34,30 @@ fn target() -> &'static str {
     }
 }
 
+fn redirect_allowed(url: &reqwest::Url) -> bool {
+    url.scheme() == "https"
+        && url.host_str().is_some_and(|h| {
+            ALLOWED_REDIRECT_HOSTS
+                .iter()
+                .any(|allowed| h.eq_ignore_ascii_case(allowed))
+        })
+}
+
 fn client(timeout: Duration) -> Result<reqwest::Client> {
+    let policy = reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 10 {
+            return attempt.error("too many redirects");
+        }
+        if redirect_allowed(attempt.url()) {
+            attempt.follow()
+        } else {
+            let msg = format!("disallowed redirect target: {}", attempt.url());
+            attempt.error(msg)
+        }
+    });
     Ok(reqwest::Client::builder()
         .https_only(true)
+        .redirect(policy)
         .timeout(timeout)
         .user_agent(concat!("xsh/", env!("CARGO_PKG_VERSION")))
         .build()?)
@@ -74,7 +101,7 @@ pub async fn check() -> Result<()> {
 }
 
 async fn fetch(http: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
-    let res = http
+    let mut res = http
         .get(url)
         .send()
         .await
@@ -87,11 +114,14 @@ async fn fetch(http: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
     {
         bail!("the download is too large");
     }
-    let bytes = res.bytes().await?;
-    if bytes.len() > MAX_ARCHIVE_BYTES {
-        bail!("the download is too large");
+    let mut data = Vec::new();
+    while let Some(chunk) = res.chunk().await? {
+        if data.len().saturating_add(chunk.len()) > MAX_ARCHIVE_BYTES {
+            bail!("the download is too large");
+        }
+        data.extend_from_slice(&chunk);
     }
-    Ok(bytes.to_vec())
+    Ok(data)
 }
 
 fn run(program: &str, args: &[&str]) -> Result<String> {
@@ -141,6 +171,10 @@ fn check_app(app: &Path, version: &Version) -> Result<()> {
 /// Downloads and checks `version`, and prints the path of the new app as JSON.
 pub async fn download(app: &App, version: &str) -> Result<()> {
     let version = Version::parse(version).context("bad version")?;
+    let current = Version::parse(env!("CARGO_PKG_VERSION")).context("bad current version")?;
+    if version <= current {
+        bail!("version {version} is not newer than current version {current}");
+    }
     let tag = format!("v{version}");
     let name = format!("xsh-{tag}-{}", target());
     let url = format!("https://github.com/{REPO}/releases/download/{tag}/{name}.tar.gz");
@@ -163,12 +197,17 @@ pub async fn download(app: &App, version: &str) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e).context("cannot clear the old update"),
     }
-    std::fs::create_dir_all(&dir)?;
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
     let archive = dir.join("update.tar.gz");
     std::fs::write(&archive, &data)?;
     run(
         "/usr/bin/tar",
         &[
+            "--no-same-owner",
+            "--no-same-permissions",
             "-xzf",
             &archive.to_string_lossy(),
             "-C",
@@ -180,4 +219,29 @@ pub async fn download(app: &App, version: &str) -> Result<()> {
     check_app(&new_app, &version)?;
     println!("{}", json!({ "app": new_app }));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redirect_policy_allows_only_github_https() {
+        for ok in [
+            "https://github.com/its-ash/xsh/releases/download/v1.0.0/a.tar.gz",
+            "https://objects.githubusercontent.com/github-production-release-asset/foo",
+            "https://release-assets.githubusercontent.com/foo",
+        ] {
+            let u = reqwest::Url::parse(ok).ok();
+            assert!(u.as_ref().is_some_and(redirect_allowed), "{ok}");
+        }
+        for bad in [
+            "http://github.com/its-ash/xsh",
+            "https://evil.example.com/a.tar.gz",
+            "https://github.com.evil.com/a.tar.gz",
+        ] {
+            let u = reqwest::Url::parse(bad).ok();
+            assert!(!u.as_ref().is_some_and(redirect_allowed), "{bad}");
+        }
+    }
 }

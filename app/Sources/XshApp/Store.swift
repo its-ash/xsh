@@ -17,34 +17,53 @@ enum XshCLI {
         return Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/xsh")
     }()
 
-    static func run(_ args: [String], stdin: Data? = nil) -> Result {
+    static func run(_ args: [String], stdin: Data? = nil, timeout: TimeInterval = 30) -> Result {
         let p = Process()
         p.executableURL = binary
         p.arguments = args
-        let (out, err, input) = (Pipe(), Pipe(), Pipe())
+        let (out, err) = (Pipe(), Pipe())
+        let input = stdin == nil ? nil : Pipe()
         p.standardOutput = out
         p.standardError = err
-        p.standardInput = stdin == nil ? FileHandle.nullDevice : input
+        p.standardInput = input ?? FileHandle.nullDevice
         do {
             try p.run()
         } catch {
             return Result(status: 127, out: Data(), err: "cannot start \(binary.path): \(error.localizedDescription)")
         }
-        if let stdin {
-            input.fileHandleForWriting.write(stdin)
-            try? input.fileHandleForWriting.close()
+        if let stdin, let input {
+            // A child that exits early must give EPIPE, not a SIGPIPE that ends
+            // the app; a child that writes first must not block the caller.
+            let h = input.fileHandleForWriting
+            _ = fcntl(h.fileDescriptor, F_SETNOSIGPIPE, 1)
+            DispatchQueue.global().async {
+                try? h.write(contentsOf: stdin)
+                try? h.close()
+            }
         }
         // Read both pipes at the same time: a full pipe blocks the child.
+        var outData = Data()
         var errData = Data()
-        let group = DispatchGroup()
-        group.enter()
+        let done = DispatchSemaphore(value: 0)
         DispatchQueue.global().async {
-            errData = err.fileHandleForReading.readDataToEndOfFile()
-            group.leave()
+            let group = DispatchGroup()
+            group.enter()
+            DispatchQueue.global().async {
+                errData = err.fileHandleForReading.readDataToEndOfFile()
+                group.leave()
+            }
+            outData = out.fileHandleForReading.readDataToEndOfFile()
+            group.wait()
+            p.waitUntilExit()
+            done.signal()
         }
-        let outData = out.fileHandleForReading.readDataToEndOfFile()
-        group.wait()
-        p.waitUntilExit()
+        if done.wait(timeout: .now() + timeout) == .timedOut {
+            if p.isRunning { p.terminate() }
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.5) {
+                if p.isRunning { kill(p.processIdentifier, SIGKILL) }
+            }
+            return Result(status: 124, out: Data(), err: "command timed out: xsh \(args.joined(separator: " "))")
+        }
         return Result(status: p.terminationStatus, out: outData, err: String(decoding: errData, as: UTF8.self))
     }
 }
@@ -63,6 +82,10 @@ final class Store: ObservableObject {
 
     private let writer = DispatchQueue(label: "xsh.settings.writer")
     private var pending: [String: (work: DispatchWorkItem, value: Any)] = [:]
+    private var inFlight: [String: (id: UUID, value: Any)] = [:]
+    private var flat: [String: Any] = [:]
+    private var lastOut = Data()
+    private var watchedFiles: [String] = []
     private var stamp = ""
     private var timer: Timer?
 
@@ -82,14 +105,7 @@ final class Store: ObservableObject {
 
     func path(_ name: String) -> String { paths[name] as? String ?? "" }
 
-    func value(_ key: String) -> Any? {
-        let parts = key.split(separator: ".").map(String.init)
-        var cur: Any? = parts.first == "ai" ? ai : config
-        for p in parts.first == "ai" ? Array(parts.dropFirst()) : parts {
-            cur = (cur as? [String: Any])?[p]
-        }
-        return cur
-    }
+    func value(_ key: String) -> Any? { flat[key] }
 
     func bool(_ key: String) -> Bool { value(key) as? Bool ?? false }
     func int(_ key: String) -> Int { (value(key) as? NSNumber)?.intValue ?? 0 }
@@ -101,7 +117,11 @@ final class Store: ObservableObject {
 
     func start() {
         reloadNow()
-        stamp = fileStamp()
+        let files = currentWatchFiles()
+        writer.async { [weak self] in
+            self?.watchedFiles = files
+            self?.stamp = Self.fileStamp(for: files)
+        }
         let t = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.poll() }
         t.tolerance = 0.3
         RunLoop.main.add(t, forMode: .common)
@@ -119,22 +139,49 @@ final class Store: ObservableObject {
         }
     }
 
+    private static func flatten(_ root: [String: Any]) -> [String: Any] {
+        var out: [String: Any] = [:]
+        func walk(_ dict: [String: Any], prefix: String) {
+            for (k, v) in dict {
+                let full = prefix.isEmpty ? k : "\(prefix).\(k)"
+                out[full] = v
+                if let nested = v as? [String: Any] {
+                    walk(nested, prefix: full)
+                }
+            }
+        }
+        if let cfg = root["config"] as? [String: Any] { walk(cfg, prefix: "") }
+        if let ai = root["ai"] as? [String: Any] { walk(ai, prefix: "ai") }
+        return out
+    }
+
     private func apply(_ r: XshCLI.Result) {
+        if error == nil, r.status == 0, r.out == lastOut, pending.isEmpty, inFlight.isEmpty {
+            return
+        }
         guard r.status == 0,
               var next = (try? JSONSerialization.jsonObject(with: r.out)) as? [String: Any]
         else {
             error = r.err.isEmpty ? "`xsh app state` failed" : r.err.trimmingCharacters(in: .whitespacesAndNewlines)
             return
         }
+        lastOut = r.out
         // A value still waiting to be saved wins over the older value on disk.
+        for (key, f) in inFlight { Self.put(&next, key, f.value) }
         for (key, p) in pending { Self.put(&next, key, p.value) }
         root = next
+        flat = Self.flatten(next)
+        let files = currentWatchFiles()
+        writer.async { [weak self] in self?.watchedFiles = files }
         NotificationCenter.default.post(name: .xshSettingsChanged, object: nil)
     }
 
-    private func fileStamp() -> String {
+    private func currentWatchFiles() -> [String] {
+        ["config_file", "ai_file", "themes_dir"].map { path($0) } + [path("config_dir") + "/bundles"]
+    }
+
+    private static func fileStamp(for files: [String]) -> String {
         let fm = FileManager.default
-        let files = ["config_file", "ai_file", "themes_dir"].map { path($0) } + [path("config_dir") + "/bundles"]
         return files.map { f in
             let d = (try? fm.attributesOfItem(atPath: f))?[.modificationDate] as? Date
             return String(d?.timeIntervalSince1970 ?? 0)
@@ -142,10 +189,13 @@ final class Store: ObservableObject {
     }
 
     private func poll() {
-        let now = fileStamp()
-        if now != stamp {
-            stamp = now
-            reload()
+        writer.async { [weak self] in
+            guard let self, !self.watchedFiles.isEmpty else { return }
+            let now = Self.fileStamp(for: self.watchedFiles)
+            guard now != self.stamp else { return }
+            self.stamp = now
+            let r = XshCLI.run(["app", "state"])
+            DispatchQueue.main.async { self.apply(r) }
         }
     }
 
@@ -180,6 +230,8 @@ final class Store: ObservableObject {
     /// or a typed word gives one write and not one per step.
     func set(_ key: String, _ value: Any) {
         Self.put(&root, key, value)
+        flat[key] = value
+        lastOut = Data()
         NotificationCenter.default.post(name: .xshSettingsChanged, object: nil)
         pending[key]?.work.cancel()
         let isAI = key.hasPrefix("ai.")
@@ -191,8 +243,13 @@ final class Store: ObservableObject {
             ? (value as? String == "" ? ["app", "ai-unset", name] : ["app", "ai-set", name, raw])
             : ["config", "set", name, raw]
         let work = DispatchWorkItem { [weak self] in
-            self?.pending[key] = nil
-            self?.save(args)
+            guard let self else { return }
+            self.pending[key] = nil
+            let token = UUID()
+            self.inFlight[key] = (token, value)
+            self.save(args) { _ in
+                if self.inFlight[key]?.id == token { self.inFlight[key] = nil }
+            }
         }
         pending[key] = (work, value)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
@@ -210,11 +267,11 @@ final class Store: ObservableObject {
         writer.async { [weak self] in
             let r = XshCLI.run(args, stdin: stdin)
             let state = XshCLI.run(["app", "state"])
+            if let self { self.stamp = Self.fileStamp(for: self.watchedFiles) }
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.error = r.status == 0 ? nil : r.err.trimmingCharacters(in: .whitespacesAndNewlines)
                 self.apply(state)
-                self.stamp = self.fileStamp()
                 done?(r)
             }
         }

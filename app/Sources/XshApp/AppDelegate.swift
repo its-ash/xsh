@@ -9,8 +9,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSWindow.allowsAutomaticWindowTabbing = false
+        Session.warmLoginPath()
         Store.shared.start()
-        _ = Session.loginPath
         NSApp.servicesProvider = self
         rebuildMenu()
         applyAppWide()

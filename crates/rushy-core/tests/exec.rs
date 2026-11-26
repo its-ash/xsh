@@ -692,3 +692,49 @@ fn runaway_recursion_hits_the_nesting_limit() -> TestResult {
         .map_err(|_| "recursion test thread panicked")??;
     Ok(())
 }
+
+#[tokio::test]
+async fn unclosed_bracket_does_not_glob_with_failglob() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut sh = shell(dir.path());
+    let o = out(
+        &mut sh,
+        dir.path(),
+        "shopt -s failglob; i=0; while [ $i -lt 5 ]; do i=$((i + 1)); done; echo $i",
+    )
+    .await?;
+    assert_eq!(o, "5\n");
+    Ok(())
+}
+
+#[tokio::test]
+async fn buffered_read_rewinds_for_external_command() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join("lines.txt"), "one\ntwo\nthree\nfour")?;
+    let mut sh = shell(dir.path());
+    let o = out(
+        &mut sh,
+        dir.path(),
+        "{ IFS= read -r first; echo \"first=$first\"; cat; } < lines.txt",
+    )
+    .await?;
+    assert_eq!(o, "first=one\ntwo\nthree\nfour");
+    Ok(())
+}
+
+#[tokio::test]
+async fn string_concat_and_append_fast_paths() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut sh = shell(dir.path());
+    let o = out(
+        &mut sh,
+        dir.path(),
+        "s=''; i=0; while [ $i -lt 4 ]; do s=\"$s$i,\"; i=$((i+1)); done; s+=end; echo \"$s\"; a=1; a=\"$a $((a+2))\"; echo \"$a\"; readonly r=x",
+    )
+    .await?;
+    assert_eq!(o, "0,1,2,3,end\n1 3\n");
+    sh.run_line("r+=y 2>/dev/null").await?;
+    assert_eq!(sh.last_status(), 1);
+    assert_eq!(sh.state().var("r"), Some("x"));
+    Ok(())
+}

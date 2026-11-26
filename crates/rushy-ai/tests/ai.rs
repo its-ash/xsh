@@ -98,7 +98,8 @@ fn provider_body_snapshots() -> TestResult {
     ));
     req.messages.push(rushy_ai::ChatMessage::tool("c1", "ok"));
     let openai = OpenAiProvider::new(Secret::new("k"), "gpt-4o-mini", None)?;
-    let anthropic = AnthropicProvider::new(Secret::new("k"), "claude-opus-5-5", None)?;
+    let anthropic =
+        AnthropicProvider::new(Secret::new("k"), rushy_ai::config::ANTHROPIC_MODEL, None)?;
     let ollama = OllamaProvider::new("llama3.1:8b", None)?;
     json_snap("openai_body", &openai.body(&req));
     json_snap("anthropic_body", &anthropic.body(&req));

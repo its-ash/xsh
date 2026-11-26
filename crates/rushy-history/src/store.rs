@@ -117,20 +117,50 @@ impl HistoryStore {
     /// Returns [`Error::WrongKey`] when the key differs from the one the
     /// database was created with, and database or key errors otherwise.
     pub fn open(path: &Path, source: &KeySource) -> Result<Self> {
-        if let Some(dir) = path.parent() {
+        if let Some(dir) = path.parent()
+            && !dir.as_os_str().is_empty()
+        {
             std::fs::create_dir_all(dir)?;
+            restrict_permissions(dir, 0o700)?;
         }
         let conn = Connection::open(path)?;
+        restrict_permissions(path, 0o600)?;
+        conn.execute_batch("PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL;")?;
         conn.execute_batch(SCHEMA)?;
+        let user_version: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if user_version == 0 {
+            conn.execute_batch("PRAGMA user_version = 1;")?;
+        }
         // Two shells can create the database at the same moment. The first
         // salt and check written win and everyone reads them back, so no
         // process keeps a key that no longer matches the stored check.
+        let is_new = meta(&conn, "check")?.is_none();
         let salt = {
             let mut s = vec![0u8; 16];
             rand::rngs::OsRng.fill_bytes(&mut s);
             meta_or_insert(&conn, "salt", &s)?
         };
-        let cipher = Cipher::new(&source.resolve(&salt)?);
+        let stored_params = read_argon2_params(&conn)?;
+        let params = stored_params.clone().unwrap_or_default();
+        let (key, used_passphrase) = source.resolve_with_params(&salt, params.clone())?;
+        if is_new && used_passphrase && stored_params.is_none() {
+            meta_or_insert(
+                &conn,
+                "argon2_m_cost",
+                params.m_cost().to_string().as_bytes(),
+            )?;
+            meta_or_insert(
+                &conn,
+                "argon2_t_cost",
+                params.t_cost().to_string().as_bytes(),
+            )?;
+            meta_or_insert(
+                &conn,
+                "argon2_p_cost",
+                params.p_cost().to_string().as_bytes(),
+            )?;
+        }
+        let cipher = Cipher::new(&key);
         let check = match meta(&conn, "check")? {
             Some(check) => check,
             None => meta_or_insert(&conn, "check", &cipher.seal(CHECK_PLAINTEXT, AAD_CHECK)?)?,
@@ -237,16 +267,29 @@ impl HistoryStore {
     ///
     /// Fails on database or decryption errors.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<Entry>> {
-        let mut seen = std::collections::HashSet::new();
         let mut entries: Vec<Entry> = self.all()?;
         entries.reverse();
-        entries.retain(|e| seen.insert(e.command.clone()));
-        let commands: Vec<&str> = entries.iter().map(|e| e.command.as_str()).collect();
-        let order = fuzzy::rank(query, &commands);
+        let (keep, order) = {
+            let mut seen = std::collections::HashSet::new();
+            let keep: Vec<usize> = (0..entries.len())
+                .filter(|&i| {
+                    entries
+                        .get(i)
+                        .is_some_and(|e| seen.insert(e.command.as_str()))
+                })
+                .collect();
+            let commands: Vec<&str> = keep
+                .iter()
+                .filter_map(|&i| entries.get(i).map(|e| e.command.as_str()))
+                .collect();
+            let order = fuzzy::rank(query, &commands);
+            (keep, order)
+        };
+        let mut slots: Vec<Option<Entry>> = entries.into_iter().map(Some).collect();
         Ok(order
             .into_iter()
             .take(limit)
-            .filter_map(|i| entries.get(i).cloned())
+            .filter_map(|i| keep.get(i).and_then(|&j| slots.get_mut(j)?.take()))
             .collect())
     }
 
@@ -348,6 +391,47 @@ fn meta_or_insert(conn: &Connection, key: &str, value: &[u8]) -> Result<Vec<u8>>
         params![key, value],
     )?;
     meta(conn, key)?.ok_or(Error::Db(rusqlite::Error::QueryReturnedNoRows))
+}
+
+#[cfg(unix)]
+fn restrict_permissions(path: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_permissions(_path: &Path, _mode: u32) -> Result<()> {
+    Ok(())
+}
+
+fn read_u32_meta(conn: &Connection, key: &str) -> Result<Option<u32>> {
+    let Some(bytes) = meta(conn, key)? else {
+        return Ok(None);
+    };
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|e| Error::Crypto(format!("invalid {key} metadata: {e}")))?;
+    let val = text
+        .parse::<u32>()
+        .map_err(|e| Error::Crypto(format!("invalid {key} metadata: {e}")))?;
+    Ok(Some(val))
+}
+
+fn read_argon2_params(conn: &Connection) -> Result<Option<argon2::Params>> {
+    match (
+        read_u32_meta(conn, "argon2_m_cost")?,
+        read_u32_meta(conn, "argon2_t_cost")?,
+        read_u32_meta(conn, "argon2_p_cost")?,
+    ) {
+        (Some(m), Some(t), Some(p)) => Ok(Some(
+            argon2::Params::new(m, t, p, None).map_err(|e| Error::Crypto(e.to_string()))?,
+        )),
+        (None, None, None) => Ok(None),
+        _ => Err(Error::Crypto(
+            "incomplete Argon2id parameters in history metadata".into(),
+        )),
+    }
 }
 
 fn set_meta(conn: &Connection, key: &str, value: &[u8]) -> Result<()> {

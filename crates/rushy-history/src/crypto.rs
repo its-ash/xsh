@@ -54,10 +54,21 @@ impl Key {
     ///
     /// # Errors
     ///
-    /// Fails if the salt is shorter than 8 bytes.
+    /// Fails if the passphrase is empty or the salt is shorter than 8 bytes.
     pub fn from_passphrase(passphrase: &str, salt: &[u8]) -> Result<Self> {
+        Self::from_passphrase_with_params(passphrase, salt, argon2::Params::default())
+    }
+
+    pub(crate) fn from_passphrase_with_params(
+        passphrase: &str,
+        salt: &[u8],
+        params: argon2::Params,
+    ) -> Result<Self> {
+        if passphrase.is_empty() {
+            return Err(Error::Crypto("passphrase must not be empty".into()));
+        }
         let mut bytes = Zeroizing::new([0u8; 32]);
-        argon2::Argon2::default()
+        argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
             .hash_password_into(passphrase.as_bytes(), salt, bytes.as_mut())
             .map_err(|e| Error::Crypto(e.to_string()))?;
         Ok(Self(bytes))
@@ -73,20 +84,23 @@ impl Key {
         let entry = keyring::Entry::new(service, KEYRING_USER)?;
         match entry.get_password() {
             Ok(encoded) => {
+                let encoded = Zeroizing::new(encoded);
                 let raw = Zeroizing::new(
                     STANDARD
                         .decode(encoded.trim())
                         .map_err(|e| Error::Crypto(e.to_string()))?,
                 );
-                let bytes: [u8; 32] = raw
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| Error::Crypto("keychain key has the wrong length".into()))?;
-                Ok(Self::from_bytes(bytes))
+                if raw.len() != 32 {
+                    return Err(Error::Crypto("keychain key has the wrong length".into()));
+                }
+                let mut bytes = Zeroizing::new([0u8; 32]);
+                bytes.copy_from_slice(&raw);
+                Ok(Self(bytes))
             }
             Err(keyring::Error::NoEntry) => {
                 let key = Self::generate();
-                entry.set_password(&STANDARD.encode(key.0.as_ref()))?;
+                let encoded = Zeroizing::new(STANDARD.encode(key.0.as_ref()));
+                entry.set_password(&encoded)?;
                 Ok(key)
             }
             Err(e) => Err(e.into()),
@@ -130,9 +144,15 @@ impl KeySource {
         match mode {
             "auto" => Ok(Self::Auto(service.to_owned())),
             "keyring" => Ok(Self::Keyring(service.to_owned())),
-            "passphrase" => std::env::var("XSH_HISTORY_PASSPHRASE")
-                .map(|p| Self::Passphrase(Zeroizing::new(p)))
-                .map_err(|_| Error::NoKey),
+            "passphrase" => {
+                let pass = Zeroizing::new(
+                    std::env::var("XSH_HISTORY_PASSPHRASE").map_err(|_| Error::NoKey)?,
+                );
+                if pass.is_empty() {
+                    return Err(Error::Crypto("passphrase must not be empty".into()));
+                }
+                Ok(Self::Passphrase(pass))
+            }
             other => Err(Error::Crypto(format!(
                 "unknown key_source `{other}` (expected auto, keyring, or passphrase)"
             ))),
@@ -146,16 +166,33 @@ impl KeySource {
     /// Returns [`Error::NoKey`] when `Auto` finds neither a keychain nor a
     /// passphrase, and other errors from the keychain or derivation.
     pub fn resolve(&self, salt: &[u8]) -> Result<Key> {
+        let (key, _) = self.resolve_with_params(salt, argon2::Params::default())?;
+        Ok(key)
+    }
+
+    pub(crate) fn resolve_with_params(
+        &self,
+        salt: &[u8],
+        params: argon2::Params,
+    ) -> Result<(Key, bool)> {
         match self {
-            Self::Key(k) => Ok(k.clone()),
-            Self::Keyring(service) => Key::from_keyring(service),
-            Self::Passphrase(p) => Key::from_passphrase(p, salt),
-            Self::Auto(service) => Key::from_keyring(service).or_else(|_| {
-                let pass = Zeroizing::new(
-                    std::env::var("XSH_HISTORY_PASSPHRASE").map_err(|_| Error::NoKey)?,
-                );
-                Key::from_passphrase(&pass, salt)
-            }),
+            Self::Key(k) => Ok((k.clone(), false)),
+            Self::Keyring(service) => Ok((Key::from_keyring(service)?, false)),
+            Self::Passphrase(p) => Ok((Key::from_passphrase_with_params(p, salt, params)?, true)),
+            Self::Auto(service) => match Key::from_keyring(service) {
+                Ok(k) => Ok((k, false)),
+                Err(Error::Keyring(
+                    keyring::Error::NoEntry
+                    | keyring::Error::PlatformFailure(_)
+                    | keyring::Error::NoStorageAccess(_),
+                )) => {
+                    let pass = Zeroizing::new(
+                        std::env::var("XSH_HISTORY_PASSPHRASE").map_err(|_| Error::NoKey)?,
+                    );
+                    Ok((Key::from_passphrase_with_params(&pass, salt, params)?, true))
+                }
+                Err(e) => Err(e),
+            },
         }
     }
 }

@@ -33,16 +33,21 @@ cp "$RUST_DIR/xsh" "$APP/Contents/MacOS/xsh"
 VERSION="$(awk -F'"' '/^version/ { print $2; exit }' "$ROOT/Cargo.toml")"
 awk -v v="$VERSION" '{ gsub(/__VERSION__/, v); print }' "$ROOT/app/Info.plist" > "$APP/Contents/Info.plist"
 
-# The icon is drawn from the SVG at build time, so no binary file is in the repository.
+# Build the macOS .icns from assets/xsh-icon.png (fallback: render assets/xsh.svg).
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 ICONSET="$WORK/xsh.iconset"
 mkdir -p "$ICONSET"
-qlmanage -t -s 1024 -o "$WORK" "$ROOT/assets/xsh.svg" > /dev/null 2>&1
+if [ -f "$ROOT/assets/xsh-icon.png" ]; then
+    ICON_SRC="$ROOT/assets/xsh-icon.png"
+else
+    qlmanage -t -s 1024 -o "$WORK" "$ROOT/assets/xsh.svg" > /dev/null 2>&1
+    ICON_SRC="$WORK/xsh.svg.png"
+fi
 for s in 16 32 128 256 512; do
-    sips -z "$s" "$s" "$WORK/xsh.svg.png" --out "$ICONSET/icon_${s}x${s}.png" > /dev/null
+    sips -z "$s" "$s" "$ICON_SRC" --out "$ICONSET/icon_${s}x${s}.png" > /dev/null
     d=$((s * 2))
-    sips -z "$d" "$d" "$WORK/xsh.svg.png" --out "$ICONSET/icon_${s}x${s}@2x.png" > /dev/null
+    sips -z "$d" "$d" "$ICON_SRC" --out "$ICONSET/icon_${s}x${s}@2x.png" > /dev/null
 done
 iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/xsh.icns"
 

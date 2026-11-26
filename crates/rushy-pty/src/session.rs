@@ -1,6 +1,7 @@
 //! Sessions, windows, and the manager that owns every pane.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
@@ -172,16 +173,15 @@ impl SessionManager {
     }
 
     fn spawn_pane(&mut self, rect: Rect) -> Result<PaneId> {
+        let cmd = self.command.clone();
+        self.spawn_pane_with(rect, &cmd)
+    }
+
+    fn spawn_pane_with(&mut self, rect: Rect, cmd: &PaneCommand) -> Result<PaneId> {
         self.next_pane += 1;
         let id = PaneId(self.next_pane);
         let inner = rect.inner();
-        let pane = Pane::spawn(
-            id,
-            &self.command,
-            inner.width,
-            inner.height,
-            self.events.clone(),
-        )?;
+        let pane = Pane::spawn(id, cmd, inner.width, inner.height, self.events.clone())?;
         self.panes.insert(id, pane);
         Ok(id)
     }
@@ -192,10 +192,24 @@ impl SessionManager {
     ///
     /// Fails if the name is taken or the pane cannot start.
     pub fn create_session(&mut self, name: &str) -> Result<SessionId> {
+        self.create_session_in(name, None)
+    }
+
+    /// Creates a session with one window and one pane, optionally overriding
+    /// the working directory without mutating the manager's default command.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the name is taken or the pane cannot start.
+    pub fn create_session_in(&mut self, name: &str, cwd: Option<PathBuf>) -> Result<SessionId> {
         if self.find(name).is_some() {
             return Err(Error::SessionExists(name.to_owned()));
         }
-        let pane = self.spawn_pane(self.area())?;
+        let mut cmd = self.command.clone();
+        if let Some(dir) = cwd {
+            cmd.cwd = Some(dir);
+        }
+        let pane = self.spawn_pane_with(self.area(), &cmd)?;
         self.next_session += 1;
         let id = SessionId(self.next_session);
         let name = if name.is_empty() {
@@ -512,6 +526,15 @@ impl SessionManager {
             }
         }
         let _ = self.relayout();
+    }
+
+    /// Whether `pane` is in the active window of the attached session.
+    #[must_use]
+    pub fn is_visible(&self, pane: PaneId) -> bool {
+        self.attached
+            .and_then(|id| self.sessions.get(&id))
+            .and_then(Session::window)
+            .is_some_and(|w| w.layout.contains(pane))
     }
 
     /// Panes of the active window in the attached session.

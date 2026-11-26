@@ -49,7 +49,10 @@ pub const DEFAULT_ALLOWED_HOSTS: &[&str] = &[
 /// Name of the per-project config file looked up in the working directory.
 pub const PROJECT_FILE: &str = ".xsh.toml";
 
-const ENV_SECTIONS: &[&str] = &["shell", "ui", "mux", "bundles", "history"];
+const ENV_SECTIONS: &[&str] = &[
+    "shell", "ui", "mux", "bundles", "history", "window", "font", "colors", "terminal", "keys",
+    "updates",
+];
 
 /// Fully merged configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -79,6 +82,47 @@ pub struct Config {
     pub updates: UpdatesConfig,
     /// macOS app: extra session profiles.
     pub profiles: Vec<Profile>,
+}
+
+impl Config {
+    /// Checks semantic and range constraints on configuration values.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Extract`] if any setting is outside its allowed range.
+    pub fn validate(&self) -> Result<()> {
+        if !(10..=100).contains(&self.window.opacity) {
+            return Err(Error::Extract(format!(
+                "window.opacity must be in 10..=100, got {}",
+                self.window.opacity
+            )));
+        }
+        if !(1..=21).contains(&self.font.min_contrast) {
+            return Err(Error::Extract(format!(
+                "font.min_contrast must be in 1..=21, got {}",
+                self.font.min_contrast
+            )));
+        }
+        if !(20..=500).contains(&self.window.columns) {
+            return Err(Error::Extract(format!(
+                "window.columns must be in 20..=500, got {}",
+                self.window.columns
+            )));
+        }
+        if !(5..=200).contains(&self.window.rows) {
+            return Err(Error::Extract(format!(
+                "window.rows must be in 5..=200, got {}",
+                self.window.rows
+            )));
+        }
+        if !(6..=96).contains(&self.font.size) {
+            return Err(Error::Extract(format!(
+                "font.size must be in 6..=96, got {}",
+                self.font.size
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// `[updates]` section of the macOS app.
@@ -420,6 +464,8 @@ pub struct ShellConfig {
     pub notify_after_secs: u64,
     /// Set the terminal title to the command and directory, and send OSC 7 and OSC 133 marks.
     pub terminal_integration: bool,
+    /// Preserve theme colors, prompt integration, and live syntax highlighting over interactive SSH.
+    pub ssh_integration: bool,
     /// Suggest close command names when a command is not found.
     pub suggest_typos: bool,
     /// Script run at start-up, relative to the config directory.
@@ -439,6 +485,7 @@ impl Default for ShellConfig {
             confirm_exit_with_jobs: true,
             notify_after_secs: 10,
             terminal_integration: true,
+            ssh_integration: true,
             suggest_typos: true,
             rc_file: "init.xsh".to_owned(),
             import_rc: "auto".to_owned(),
@@ -557,16 +604,38 @@ impl Default for HistoryConfig {
     }
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+#[allow(dead_code, clippy::struct_excessive_bools)]
+struct ProjectShellConfig {
+    capture_stderr: Option<bool>,
+    edit_mode: Option<String>,
+    autosuggest: Option<bool>,
+    auto_cd: Option<bool>,
+    confirm_exit_with_jobs: Option<bool>,
+    notify_after_secs: Option<u64>,
+    terminal_integration: Option<bool>,
+    ssh_integration: Option<bool>,
+    suggest_typos: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+#[allow(dead_code)]
+struct ProjectMuxConfig {
+    prefix: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[allow(dead_code)]
 struct ProjectConfig {
     #[serde(default)]
-    shell: Option<ShellConfig>,
+    shell: Option<ProjectShellConfig>,
     #[serde(default)]
     ui: Option<UiConfig>,
     #[serde(default)]
-    mux: Option<MuxConfig>,
+    mux: Option<ProjectMuxConfig>,
 }
 
 /// Values from command-line flags, the highest-priority layer.
@@ -650,20 +719,46 @@ impl Loader {
     /// Returns [`Error::Invalid`] with a line and column for a bad file, and
     /// [`Error::Extract`] when the merged result is invalid.
     pub fn load(&self) -> Result<Config> {
-        let mut fig = Figment::from(Serialized::defaults(Config::default()));
         let user = self.paths.config_file();
-        if let Some(text) = read_optional(&user)? {
-            parse_toml::<Config>(&user, &text)?;
-            fig = fig.merge(Toml::string(&text));
-        }
-        if let Some(cwd) = &self.cwd {
-            let project = cwd.join(PROJECT_FILE);
-            if let Some(text) = read_optional(&project)? {
-                parse_toml::<ProjectConfig>(&project, &text)?;
-                fig = fig.merge(Toml::string(&text));
+        let user_text = read_optional(&user)?;
+        let project = self.cwd.as_ref().map(|cwd| cwd.join(PROJECT_FILE));
+        let project_text = match &project {
+            Some(p) => read_optional(p)?,
+            None => None,
+        };
+        let env_hit = self.use_env && has_env_override();
+        // Skip Figment's default-serialization roundtrip when no project file
+        // or `XSH_*` env override needs merging.
+        if project_text.is_none() && !env_hit {
+            let mut cfg = match &user_text {
+                Some(text) => parse_toml::<Config>(&user, text)?,
+                None => Config::default(),
+            };
+            if let Some(t) = &self.overrides.theme {
+                cfg.ui.theme.clone_from(t);
             }
+            if let Some(sr) = self.overrides.screen_reader {
+                cfg.ui.screen_reader = sr;
+            }
+            if let Some(nc) = self.overrides.no_color {
+                cfg.ui.no_color = nc;
+            }
+            cfg.validate()?;
+            if std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) {
+                cfg.ui.no_color = true;
+            }
+            return Ok(cfg);
         }
-        if self.use_env {
+        let mut fig = Figment::from(Serialized::defaults(Config::default()));
+        if let Some(text) = &user_text {
+            parse_toml::<Config>(&user, text)?;
+            fig = fig.merge(Toml::string(text));
+        }
+        if let (Some(project), Some(text)) = (&project, &project_text) {
+            parse_toml::<ProjectConfig>(project, text)?;
+            fig = fig.merge(Toml::string(text));
+        }
+        if env_hit {
             fig = fig.merge(
                 Env::prefixed("XSH_")
                     .filter(|k| {
@@ -684,11 +779,25 @@ impl Loader {
             },
         }));
         let mut cfg: Config = fig.extract().map_err(|e| Error::Extract(e.to_string()))?;
+        cfg.validate()?;
         if std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) {
             cfg.ui.no_color = true;
         }
         Ok(cfg)
     }
+}
+
+fn has_env_override() -> bool {
+    std::env::vars_os().any(|(k, _)| {
+        k.to_str().is_some_and(|s| {
+            let lower = s.to_ascii_lowercase();
+            lower.strip_prefix("xsh_").is_some_and(|rest| {
+                ENV_SECTIONS
+                    .iter()
+                    .any(|sec| rest.strip_prefix(sec).is_some_and(|r| r.starts_with("__")))
+            })
+        })
+    })
 }
 
 fn read_optional(path: &Path) -> Result<Option<String>> {
@@ -729,6 +838,49 @@ pub fn parse_toml<T: DeserializeOwned>(path: &Path, text: &str) -> Result<T> {
     })
 }
 
+fn write_atomic(path: &Path, content: &str) -> Result<()> {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let pid = std::process::id();
+    let base = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("config.toml");
+
+    let (tmp_path, mut file) = loop {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let candidate = dir.join(format!(".{base}.tmp.{pid}.{n}"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(f) => break (candidate, f),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
+        }
+    };
+
+    let write_res = file
+        .write_all(content.as_bytes())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(e) = write_res {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
 /// Sets `ui.theme` in the user's `config.toml`, keeping all other content and
 /// comments, and creating the file if needed.
 ///
@@ -744,9 +896,7 @@ pub fn set_theme(paths: &Paths, name: &str) -> Result<()> {
         .map_err(|e| Error::Extract(e.to_string()))?;
     ensure_section(&mut doc, "ui");
     doc["ui"]["theme"] = toml_edit::value(name);
-    std::fs::create_dir_all(paths.config_dir())?;
-    std::fs::write(&file, doc.to_string())?;
-    Ok(())
+    write_atomic(&file, &doc.to_string())
 }
 
 /// Replaces the `[[profiles]]` of the user's `config.toml`, keeping all other
@@ -774,10 +924,8 @@ pub fn set_profiles(paths: &Paths, profiles: &[Profile]) -> Result<()> {
         }
     }
     let new = doc.to_string();
-    parse_toml::<Config>(&file, &new)?;
-    std::fs::create_dir_all(paths.config_dir())?;
-    std::fs::write(&file, new)?;
-    Ok(())
+    parse_toml::<Config>(&file, &new)?.validate()?;
+    write_atomic(&file, &new)
 }
 
 /// Every `section.key` name that [`get_value`] and [`set_value`] accept.
@@ -850,20 +998,21 @@ pub fn set_value(paths: &Paths, key: &str, raw: &str) -> Result<()> {
     ensure_section(&mut doc, section);
     doc[section][name] = toml_edit::Item::Value(value);
     let mut new = doc.to_string();
-    if let Err(e) = parse_toml::<Config>(&file, &new) {
+    if let Err(e) = parse_toml::<Config>(&file, &new).and_then(|c| c.validate()) {
         // `1984` or `true` for a text setting: keep the text as typed.
         if is_str {
             return Err(e);
         }
         doc[section][name] = toml_edit::value(raw);
         new = doc.to_string();
-        if parse_toml::<Config>(&file, &new).is_err() {
+        if parse_toml::<Config>(&file, &new)
+            .and_then(|c| c.validate())
+            .is_err()
+        {
             return Err(e);
         }
     }
-    std::fs::create_dir_all(paths.config_dir())?;
-    std::fs::write(&file, new)?;
-    Ok(())
+    write_atomic(&file, &new)
 }
 
 /// Removes `section.key` from the user's `config.toml`, so the default applies.
@@ -886,8 +1035,7 @@ pub fn unset_value(paths: &Paths, key: &str) -> Result<()> {
     {
         t.remove(name);
     }
-    std::fs::write(&file, doc.to_string())?;
-    Ok(())
+    write_atomic(&file, &doc.to_string())
 }
 
 /// Reads and parses a TOML file with [`parse_toml`].
@@ -1149,6 +1297,72 @@ mod tests {
         )?;
         let res = Loader::new(paths).env(false).project(dir.path()).load();
         assert!(matches!(res, Err(Error::Invalid { line: 1, .. })));
+        Ok(())
+    }
+
+    #[test]
+    fn project_cannot_set_rce_fields() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let (dir, paths) = setup()?;
+        for forbidden in [
+            "[mux]\nshell = \"/tmp/evil\"\n",
+            "[shell]\nrc_file = \"/tmp/evil.xsh\"\n",
+            "[shell]\nimport_rc = \"bash\"\n",
+            "[shell]\ncdpath = [\"/tmp\"]\n",
+        ] {
+            std::fs::write(dir.path().join(PROJECT_FILE), forbidden)?;
+            let res = Loader::new(paths.clone())
+                .env(false)
+                .project(dir.path())
+                .load();
+            assert!(
+                matches!(res, Err(Error::Invalid { .. })),
+                "{forbidden:?} must be rejected"
+            );
+        }
+        // Safe fields in [mux] and [shell] are still allowed.
+        std::fs::write(
+            dir.path().join(PROJECT_FILE),
+            "[mux]\nprefix = \"C-a\"\n[shell]\nedit_mode = \"vi\"\n",
+        )?;
+        let cfg = Loader::new(paths).env(false).project(dir.path()).load()?;
+        assert_eq!(cfg.mux.prefix, "C-a");
+        assert_eq!(cfg.shell.edit_mode, "vi");
+        Ok(())
+    }
+
+    #[test]
+    fn range_validation_rejects_out_of_bounds()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let (_dir, paths) = setup()?;
+        for (key, bad) in [
+            ("window.opacity", "9"),
+            ("window.opacity", "101"),
+            ("font.min_contrast", "0"),
+            ("font.min_contrast", "22"),
+            ("window.columns", "19"),
+            ("window.columns", "501"),
+            ("window.rows", "4"),
+            ("window.rows", "201"),
+            ("font.size", "5"),
+            ("font.size", "97"),
+        ] {
+            assert!(
+                set_value(&paths, key, bad).is_err(),
+                "{key}={bad} should be rejected"
+            );
+        }
+        // Boundary values succeed.
+        set_value(&paths, "window.opacity", "10")?;
+        set_value(&paths, "font.min_contrast", "21")?;
+        set_value(&paths, "window.columns", "20")?;
+        set_value(&paths, "window.rows", "5")?;
+        set_value(&paths, "font.size", "96")?;
+        let cfg = Loader::new(paths).env(false).load()?;
+        assert_eq!(cfg.window.opacity, 10);
+        assert_eq!(cfg.font.min_contrast, 21);
+        assert_eq!(cfg.window.columns, 20);
+        assert_eq!(cfg.window.rows, 5);
+        assert_eq!(cfg.font.size, 96);
         Ok(())
     }
 }

@@ -4,7 +4,7 @@ use std::io::{self, Stdout};
 use std::os::unix::process::CommandExt as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
 use ratatui::Terminal;
@@ -15,11 +15,14 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, size,
 };
+use ratatui::layout::Rect as UiRect;
+use ratatui::widgets::Paragraph;
 use rushy_pty::proto::{ClientMsg, ServerMsg, read_frame, write_frame};
 use rushy_pty::server::{self, Connection};
 use rushy_pty::{PaneCommand, View};
 use rushy_tui::mux::{self, Options, Screens};
 use rushy_tui::{AiState, StatusInfo, clock_now};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 
 use crate::app::App;
@@ -145,7 +148,7 @@ enum Input {
     Resize(u16, u16),
 }
 
-fn spawn_input(tx: mpsc::UnboundedSender<Input>, stop: Arc<AtomicBool>) {
+fn spawn_input(tx: mpsc::Sender<Input>, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         while !stop.load(Ordering::Relaxed) {
             match event::poll(Duration::from_millis(100)) {
@@ -159,11 +162,19 @@ fn spawn_input(tx: mpsc::UnboundedSender<Input>, stop: Arc<AtomicBool>) {
                 Ok(_) => continue,
                 Err(_) => break,
             };
-            if tx.send(msg).is_err() {
+            if tx.blocking_send(msg).is_err() {
                 break;
             }
         }
-    });
+    })
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 fn status_info(app: &App, view: &View, ai: &AiState) -> StatusInfo {
@@ -212,14 +223,14 @@ pub async fn attach(app: &mut App, session: &str, create: bool) -> Result<i32> {
     let (cols, rows) = size().context("a terminal is required to attach")?;
     let (pc, pr) = mux::pane_area((cols, rows), opts.status_bar);
 
-    let (srv_tx, mut srv_rx) = mpsc::unbounded_channel::<ServerMsg>();
-    tokio::spawn(async move {
+    let (srv_tx, mut srv_rx) = mpsc::channel::<ServerMsg>(256);
+    let _srv_reader = AbortOnDrop(tokio::spawn(async move {
         while let Ok(Some(msg)) = read_frame::<_, ServerMsg>(&mut rx).await {
-            if srv_tx.send(msg).is_err() {
+            if srv_tx.send(msg).await.is_err() {
                 return;
             }
         }
-    });
+    }));
     write_frame(
         &mut tx,
         &ClientMsg::Attach {
@@ -234,8 +245,10 @@ pub async fn attach(app: &mut App, session: &str, create: bool) -> Result<i32> {
 
     let (guard, mut term) = TermGuard::enter()?;
     let stop = Arc::new(AtomicBool::new(false));
-    let (in_tx, mut in_rx) = mpsc::unbounded_channel();
-    spawn_input(in_tx, Arc::clone(&stop));
+    let (in_tx, mut in_rx) = mpsc::channel(256);
+    let input_thread = spawn_input(in_tx, Arc::clone(&stop));
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sighup = signal(SignalKind::hangup())?;
 
     let mut keymap = Keymap::new(prefix);
     let mut screens = Screens::new();
@@ -243,8 +256,11 @@ pub async fn attach(app: &mut App, session: &str, create: bool) -> Result<i32> {
     let mut tick = tokio::time::interval(Duration::from_millis(33));
     let mut clock = clock_now();
     let (mut dirty, mut failure) = (true, None::<String>);
+    let mut notice: Option<(String, Instant)> = None;
     let outcome = loop {
         tokio::select! {
+            _ = sigterm.recv() => break "terminated",
+            _ = sighup.recv() => break "hangup",
             Some(msg) = srv_rx.recv() => match msg {
                 ServerMsg::View(v) => { screens.sync(&v); view = Some(v); dirty = true; }
                 ServerMsg::Snapshot(id, b) => { screens.snapshot(id, &b); dirty = true; }
@@ -252,7 +268,12 @@ pub async fn attach(app: &mut App, session: &str, create: bool) -> Result<i32> {
                 ServerMsg::Detached => break "detached",
                 ServerMsg::Exited => break "exited",
                 ServerMsg::Error(e) => {
-                    if view.is_none() { failure = Some(e); break "failed"; }
+                    if view.is_none() {
+                        failure = Some(e);
+                        break "failed";
+                    }
+                    notice = Some((e, Instant::now() + Duration::from_secs(4)));
+                    dirty = true;
                 }
                 ServerMsg::Ok | ServerMsg::Sessions(_) => {}
             },
@@ -277,10 +298,31 @@ pub async fn attach(app: &mut App, session: &str, create: bool) -> Result<i32> {
             _ = tick.tick() => {
                 let now = clock_now();
                 if now != clock { clock = now; dirty = true; }
+                if notice.as_ref().is_some_and(|(_, exp)| Instant::now() >= *exp) {
+                    notice = None;
+                    dirty = true;
+                }
                 if dirty {
                     if let Some(v) = &view {
                         let info = status_info(app, v, &ai);
-                        term.draw(|f| mux::draw(f, v, &screens, &app.theme, Some(&info), opts))?;
+                        term.draw(|f| {
+                            mux::draw(f, v, &screens, &app.theme, Some(&info), opts);
+                            if let Some((msg, _)) = &notice {
+                                let area = f.area();
+                                let bar = UiRect::new(
+                                    area.x,
+                                    area.y + area.height.saturating_sub(1),
+                                    area.width,
+                                    1,
+                                );
+                                let clean: String = msg.chars().filter(|c| !c.is_control()).collect();
+                                f.render_widget(
+                                    Paragraph::new(format!(" xsh: {clean}"))
+                                        .style(app.theme.style(app.theme.error)),
+                                    bar,
+                                );
+                            }
+                        })?;
                     }
                     dirty = false;
                 }
@@ -289,12 +331,15 @@ pub async fn attach(app: &mut App, session: &str, create: bool) -> Result<i32> {
         }
     };
     stop.store(true, Ordering::Relaxed);
+    drop(in_rx);
+    let _ = input_thread.join();
     drop(guard);
     drop(term);
     match outcome {
         "detached" => println!("[detached from session {session}]"),
         "exited" => println!("[session {session} ended]"),
         "lost" => println!("[lost connection to the multiplexer server]"),
+        "terminated" | "hangup" => println!("[detached from session {session} ({outcome})]"),
         _ => {
             if let Some(e) = failure {
                 bail!("{e}");

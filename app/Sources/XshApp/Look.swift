@@ -50,6 +50,7 @@ struct Palette {
     var cursor: NSColor
     var selection: NSColor
     var ansi: [Color]?
+    var ansiHex: [String] = []
 
     /// The theme for the current light or dark mode, with `[colors]` on top.
     static func current(profile: Profile?) -> Palette {
@@ -73,7 +74,8 @@ struct Palette {
             foreground: fg,
             cursor: pick("cursor") ?? fg,
             selection: pick("selection") ?? .selectedTextBackgroundColor,
-            ansi: ansi?.count == 16 ? ansi : nil)
+            ansi: ansi?.count == 16 ? ansi : nil,
+            ansiHex: list.count == 16 ? list : [])
     }
 }
 
@@ -92,11 +94,11 @@ enum Fonts {
             ?? .monospacedSystemFont(ofSize: size, weight: .regular)
     }
 
-    static var fixedPitchFamilies: [String] {
+    static let fixedPitchFamilies: [String] = {
         let names = NSFontManager.shared.availableFontNames(with: .fixedPitchFontMask) ?? []
         let families = names.compactMap { NSFont(name: $0, size: 12)?.familyName }
         return Array(Set(families)).filter { !$0.hasPrefix(".") }.sorted()
-    }
+    }()
 
     /// Size of one cell, used to size a new window.
     static func cell(_ font: NSFont, lineSpacing: CGFloat) -> NSSize {

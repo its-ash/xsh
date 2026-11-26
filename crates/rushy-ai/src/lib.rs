@@ -28,7 +28,7 @@ pub use assistant::{Assistant, Failure, Settings, Suggestion, run_command_tool};
 pub use config::{
     AiConfig, KeySpec, ProviderConfig, Secret, delete_api_key, known_models, store_api_key,
 };
-pub use context::Context;
+pub use context::{Context, redact_secrets};
 pub use error::{Error, Result};
 pub use provider::{
     AiProvider, AiRequest, AiResponse, ChatMessage, Role, StopReason, ToolCall, ToolSpec, tail,

@@ -270,7 +270,11 @@ fn merge_literals(parts: &mut Vec<WordPart>) {
 /// # Ok::<(), rushy_core::Error>(())
 /// ```
 pub fn parse_program(input: &str, aliases: &BTreeMap<String, String>) -> Result<List> {
-    let mut p = Parser::new(input, aliases);
+    parse_program_at(input, aliases, 0)
+}
+
+fn parse_program_at(input: &str, aliases: &BTreeMap<String, String>, depth: usize) -> Result<List> {
+    let mut p = Parser::with_depth(input, aliases, depth);
     let list = p.list()?;
     p.blank();
     match p.peek() {
@@ -361,7 +365,7 @@ struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    fn new(input: &str, aliases: &'a BTreeMap<String, String>) -> Self {
+    fn with_depth(input: &str, aliases: &'a BTreeMap<String, String>, depth: usize) -> Self {
         Self {
             s: input.chars().collect(),
             pos: 0,
@@ -369,7 +373,7 @@ impl<'a> Parser<'a> {
             active: Vec::new(),
             expansions: 0,
             alias_next: false,
-            depth: 0,
+            depth,
         }
     }
 
@@ -823,9 +827,9 @@ impl<'a> Parser<'a> {
             let [init, cond, step] = parts.as_slice() else {
                 return Err(Error::Parse("expected `for ((init; cond; step))`".into()));
             };
-            let init = expansion_text(init, self.aliases)?;
-            let cond = expansion_text(cond, self.aliases)?;
-            let step = expansion_text(step, self.aliases)?;
+            let init = expansion_text(init, self.aliases, self.depth)?;
+            let cond = expansion_text(cond, self.aliases, self.depth)?;
+            let step = expansion_text(step, self.aliases, self.depth)?;
             self.eat_op(Op::Semi);
             self.newlines();
             self.expect_reserved("do")?;
@@ -975,7 +979,7 @@ impl<'a> Parser<'a> {
     /// Reads up to the `))` that closes `((`, then parses it.
     fn arith_body(&mut self) -> Result<crate::ast::Word> {
         let text = self.arith_raw()?;
-        expansion_text(&text, self.aliases)
+        expansion_text(&text, self.aliases, self.depth)
     }
 
     fn arith_raw(&mut self) -> Result<String> {
@@ -1155,6 +1159,12 @@ impl<'a> Parser<'a> {
                 '\\' if !sq => i += 1,
                 '\'' if !dq => sq = !sq,
                 '"' if !sq => dq = !dq,
+                '#' if !sq && !dq && (i == 0 || self.s.get(i - 1).is_some_and(|&p| is_meta(p))) => {
+                    while self.s.get(i).is_some_and(|&ch| ch != '\n') {
+                        i += 1;
+                    }
+                    break;
+                }
                 '\n' if !sq && !dq => break,
                 _ => {}
             }
@@ -1197,7 +1207,7 @@ impl<'a> Parser<'a> {
         if quoted {
             return Ok(crate::ast::Word::lit(&body, true));
         }
-        heredoc_text(&body, self.aliases)
+        heredoc_text(&body, self.aliases, self.depth)
     }
 
     /// Reads one word up to an unquoted metacharacter.
@@ -1306,7 +1316,7 @@ impl<'a> Parser<'a> {
                 Some(c) => raw.push(c),
             }
         }
-        let body = parse_program(&raw, self.aliases)?;
+        let body = parse_program_at(&raw, self.aliases, self.depth)?;
         segs.push(Seg::Command { body, quoted });
         Ok(())
     }
@@ -1410,8 +1420,15 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    #[allow(clippy::too_many_lines, reason = "one arm per ${} operator")]
     fn brace_param(&mut self, quoted: bool) -> Result<Param> {
+        self.enter()?;
+        let res = self.brace_param_inner(quoted);
+        self.leave();
+        res
+    }
+
+    #[allow(clippy::too_many_lines, reason = "one arm per ${} operator")]
+    fn brace_param_inner(&mut self, quoted: bool) -> Result<Param> {
         let bad = |p: &Self| {
             if p.peek().is_none() {
                 Error::Incomplete
@@ -1606,20 +1623,30 @@ fn assignment(w: &crate::ast::Word) -> Option<Assign> {
 
 /// Parses text where only `$`, backquotes, and `\` are special, as inside
 /// double quotes. Used for arithmetic.
-fn expansion_text(text: &str, aliases: &BTreeMap<String, String>) -> Result<crate::ast::Word> {
-    scan_text(text, aliases, false)
+fn expansion_text(
+    text: &str,
+    aliases: &BTreeMap<String, String>,
+    depth: usize,
+) -> Result<crate::ast::Word> {
+    scan_text(text, aliases, false, depth)
 }
 
-fn heredoc_text(text: &str, aliases: &BTreeMap<String, String>) -> Result<crate::ast::Word> {
-    scan_text(text, aliases, true)
+fn heredoc_text(
+    text: &str,
+    aliases: &BTreeMap<String, String>,
+    depth: usize,
+) -> Result<crate::ast::Word> {
+    scan_text(text, aliases, true, depth)
 }
 
 fn scan_text(
     text: &str,
     aliases: &BTreeMap<String, String>,
     heredoc: bool,
+    depth: usize,
 ) -> Result<crate::ast::Word> {
-    let mut p = Parser::new(text, aliases);
+    let mut p = Parser::with_depth(text, aliases, depth);
+    p.enter()?;
     let mut segs = Vec::new();
     while let Some(c) = p.bump() {
         match c {
@@ -1637,6 +1664,7 @@ fn scan_text(
             _ => push_lit(&mut segs, c, true),
         }
     }
+    p.leave();
     if segs.is_empty() {
         segs.push(Seg::Lit {
             text: String::new(),
@@ -1948,6 +1976,16 @@ mod tests {
             s.redirects.first().map(|r| r.op.clone()),
             Some(RedirOp::HereDoc(crate::ast::Word::lit("$a\n", true)))
         );
+        let list = program("cat <<EOF # don't break\nhi\nEOF")?;
+        let Some(Command::Simple(s)) = first_cmd(&list) else {
+            return Err("not simple".into());
+        };
+        assert_eq!(
+            s.redirects.first().map(|r| r.op.clone()),
+            Some(RedirOp::HereDoc(crate::ast::Word::lit("hi\n", true)))
+        );
+        let deep_brace = format!("{}{}{}", "${a:-".repeat(250), "x", "}".repeat(250));
+        assert!(program(&deep_brace).is_err());
         Ok(())
     }
 

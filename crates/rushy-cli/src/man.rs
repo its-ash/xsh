@@ -5,15 +5,18 @@
 //! of that command (or of its subcommand page, such as `git-commit`) are
 //! offered with a short description.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read as _;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const TIMEOUT: Duration = Duration::from_secs(2);
+const READER_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+const MAX_MAN_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_OPTIONS: usize = 400;
 const MAX_HELP: usize = 70;
+const MAX_CACHE_ENTRIES: usize = 128;
 
 /// One option found in a man page.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,7 +37,7 @@ pub fn valid_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'))
 }
 
-/// Removes terminal overstrikes (`x\bx`, `_\bx`) and ANSI escapes.
+/// Removes terminal overstrikes (`x\bx`, `_\bx`) and ANSI/OSC escapes.
 pub fn clean(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut chars = raw.chars().peekable();
@@ -43,16 +46,29 @@ pub fn clean(raw: &str) -> String {
             '\u{8}' => {
                 out.pop();
             }
-            '\u{1b}' => {
-                if chars.peek() == Some(&'[') {
+            '\u{1b}' => match chars.peek().copied() {
+                Some('[') => {
                     chars.next();
                     for n in chars.by_ref() {
-                        if n.is_ascii_alphabetic() {
+                        if ('@'..='~').contains(&n) {
                             break;
                         }
                     }
                 }
-            }
+                Some(']') => {
+                    chars.next();
+                    while let Some(n) = chars.next() {
+                        if n == '\u{7}' {
+                            break;
+                        }
+                        if n == '\u{1b}' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            },
             '\r' => {}
             _ => out.push(c),
         }
@@ -190,11 +206,12 @@ fn fetch(page: &str) -> Option<String> {
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
+    let stdout = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut bytes = Vec::new();
-        let _ = stdout.read_to_end(&mut bytes);
-        bytes
+        let _ = stdout.take(MAX_MAN_BYTES).read_to_end(&mut bytes);
+        let _ = tx.send(bytes);
     });
     let started = Instant::now();
     let status = loop {
@@ -210,10 +227,11 @@ fn fetch(page: &str) -> Option<String> {
             }
         }
     };
-    let bytes = reader.join().ok()?;
-    status
-        .filter(std::process::ExitStatus::success)
-        .map(|_| String::from_utf8_lossy(&bytes).into_owned())
+    if !status.is_some_and(|s| s.success()) {
+        return None;
+    }
+    let bytes = rx.recv_timeout(READER_DRAIN_TIMEOUT).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// The programs named in a command line: the first word of every pipeline
@@ -235,22 +253,69 @@ pub fn programs(line: &str) -> Vec<(String, Option<String>)> {
     out
 }
 
+#[derive(Debug, Default)]
+struct CacheInner {
+    map: HashMap<String, Arc<Vec<Opt>>>,
+    order: VecDeque<String>,
+    in_flight: HashSet<String>,
+}
+
+struct FlightGuard {
+    cache: ManCache,
+    page: String,
+}
+
+impl FlightGuard {
+    fn new(cache: ManCache, page: String) -> Self {
+        Self { cache, page }
+    }
+}
+
+impl Drop for FlightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut inner) = self.cache.0.lock() {
+            inner.in_flight.remove(&self.page);
+        }
+    }
+}
+
 /// Parsed options per man page, shared between the prompt and background
 /// lookups.
 #[derive(Debug, Clone, Default)]
-pub struct ManCache(Arc<Mutex<HashMap<String, Arc<Vec<Opt>>>>>);
+pub struct ManCache(Arc<Mutex<CacheInner>>);
 
 impl ManCache {
     /// The cached options of `page`, if it was looked up already.
     pub fn get(&self, page: &str) -> Option<Arc<Vec<Opt>>> {
-        self.0.lock().ok()?.get(page).cloned()
+        self.0.lock().ok()?.map.get(page).cloned()
     }
 
-    /// Stores options for `page`.
+    /// Cached options for `cmd` (or its subcommand page `cmd-sub`) without
+    /// spawning `man`.
+    pub fn get_cached(&self, cmd: &str, sub: Option<&str>) -> Option<Arc<Vec<Opt>>> {
+        if let Some(sub) = sub.filter(|s| valid_name(s))
+            && let Some(opts) = self.get(&format!("{cmd}-{sub}"))
+            && !opts.is_empty()
+        {
+            return Some(opts);
+        }
+        self.get(cmd)
+    }
+
+    /// Stores options for `page`, evicting the oldest entry if the cache is full.
     pub fn insert(&self, page: &str, opts: Vec<Opt>) -> Arc<Vec<Opt>> {
         let opts = Arc::new(opts);
-        if let Ok(mut m) = self.0.lock() {
-            m.insert(page.to_owned(), Arc::clone(&opts));
+        if let Ok(mut inner) = self.0.lock() {
+            if !inner.map.contains_key(page) {
+                while inner.map.len() >= MAX_CACHE_ENTRIES {
+                    let Some(oldest) = inner.order.pop_front() else {
+                        break;
+                    };
+                    inner.map.remove(&oldest);
+                }
+                inner.order.push_back(page.to_owned());
+            }
+            inner.map.insert(page.to_owned(), Arc::clone(&opts));
         }
         opts
     }
@@ -276,12 +341,50 @@ impl ManCache {
         self.page(cmd)
     }
 
+    fn claim(&self, page: &str) -> bool {
+        let Ok(mut inner) = self.0.lock() else {
+            return false;
+        };
+        if inner.map.contains_key(page) || inner.in_flight.contains(page) {
+            return false;
+        }
+        inner.in_flight.insert(page.to_owned());
+        true
+    }
+
     /// Looks up the programs of `line` in the background.
     pub fn prefetch(&self, line: &str) {
         for (cmd, sub) in programs(line) {
+            let sub_page = sub
+                .as_deref()
+                .filter(|s| valid_name(s))
+                .map(|s| format!("{cmd}-{s}"));
+            if let Some(p) = &sub_page
+                && self.get(p).is_some_and(|opts| !opts.is_empty())
+            {
+                continue;
+            }
+            let need_sub = sub_page.as_deref().is_some_and(|p| self.claim(p));
+            let need_cmd = self.claim(&cmd);
+            if !need_sub && !need_cmd {
+                continue;
+            }
             let cache = self.clone();
             tokio::task::spawn_blocking(move || {
-                cache.load(&cmd, sub.as_deref());
+                let _g_sub = sub_page
+                    .as_deref()
+                    .filter(|_| need_sub)
+                    .map(|p| FlightGuard::new(cache.clone(), p.to_owned()));
+                let _g_cmd = need_cmd.then(|| FlightGuard::new(cache.clone(), cmd.clone()));
+                if need_sub
+                    && let Some(p) = sub_page.as_deref()
+                    && !cache.page(p).is_empty()
+                {
+                    return;
+                }
+                if need_cmd {
+                    let _ = cache.page(&cmd);
+                }
             });
         }
     }
@@ -394,6 +497,10 @@ OPTIONS
             clean("N\u{8}NA\u{8}AM\u{8}ME\u{8}E \u{1b}[1mbold\u{1b}[0m\r\n"),
             "NAME bold\n"
         );
+        assert_eq!(
+            clean("\u{1b}]0;title\u{7}ok\u{1b}]8;;https://x\u{1b}\\end"),
+            "okend"
+        );
     }
 
     #[test]
@@ -472,5 +579,15 @@ OPTIONS
         // An unknown subcommand page is cached as empty; the main page is used.
         c.insert("git-nosuch", Vec::new());
         assert_eq!(c.load("git", Some("nosuch"))[0].flag, "--version");
+    }
+
+    #[test]
+    fn cache_evicts_past_limit() {
+        let c = ManCache::default();
+        for i in 0..=MAX_CACHE_ENTRIES + 5 {
+            c.insert(&format!("p{i}"), Vec::new());
+        }
+        assert!(c.get("p0").is_none());
+        assert!(c.get(&format!("p{}", MAX_CACHE_ENTRIES + 5)).is_some());
     }
 }

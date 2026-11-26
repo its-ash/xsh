@@ -19,13 +19,14 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, bail};
+use rand::RngCore as _;
 use rushy_ai::agent::{AgentHost as _, Approval, CommandOutput, StepEvent};
 use rushy_ai::{Assistant, Settings, Verdict};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::io::{AsyncWriteExt as _, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::{mpsc, oneshot};
 
@@ -50,8 +51,20 @@ End with a short summary of what you did and what is left.";
 
 /// Bytes of command output sent back to Claude Code.
 const OUTPUT_LIMIT: usize = 30_000;
+/// Maximum tool actions allowed in `--auto` / autopilot mode.
+const AUTOPILOT_MAX_STEPS: usize = 50;
+/// Timeout for the initial bearer-token handshake on the MCP socket.
+const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+/// Maximum length of the auth handshake line.
+const AUTH_LINE_LIMIT: usize = 4096;
 
 type Call = (Value, oneshot::Sender<Value>);
+
+fn random_token() -> String {
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
 
 /// Deletes the private socket directory at the end.
 struct TempDir(PathBuf);
@@ -144,33 +157,51 @@ fn claude_args(config: &Value, model: Option<&str>) -> Vec<String> {
     args
 }
 
-/// Accepts the connection of `xsh mcp` and passes its calls to `tx`.
-async fn accept(listener: UnixListener, tx: mpsc::Sender<Call>) {
-    while let Ok((stream, _)) = listener.accept().await {
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            let (read, mut write) = stream.into_split();
-            let mut lines = BufReader::new(read).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let Ok(req) = serde_json::from_str::<Value>(&line) else {
-                    break;
-                };
-                let (reply_tx, reply_rx) = oneshot::channel();
-                if tx.send((req, reply_tx)).await.is_err() {
-                    break;
-                }
-                let Ok(reply) = reply_rx.await else {
-                    break;
-                };
-                if write
-                    .write_all(format!("{reply}\n").as_bytes())
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
+/// Accepts a single authenticated connection from `xsh mcp` and passes its
+/// calls to `tx`.
+async fn accept(listener: UnixListener, tx: mpsc::Sender<Call>, token: String) {
+    let (mut reader, mut write) = loop {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let (read, write) = stream.into_split();
+        let mut reader = BufReader::new(read);
+        let Ok(Ok(Some(auth_line))) = tokio::time::timeout(
+            AUTH_TIMEOUT,
+            mcp::read_line_capped(&mut reader, AUTH_LINE_LIMIT),
+        )
+        .await
+        else {
+            continue;
+        };
+        let ok = serde_json::from_str::<Value>(&auth_line)
+            .ok()
+            .and_then(|v| v["auth"].as_str().map(str::to_owned))
+            .is_some_and(|got| mcp::constant_time_eq(&got, &token));
+        if ok {
+            break (reader, write);
+        }
+    };
+    // Cap to 1 authenticated connection: stop accepting any further peers.
+    drop(listener);
+    while let Ok(Some(line)) = mcp::read_line_capped(&mut reader, mcp::MAX_LINE_BYTES).await {
+        let Ok(req) = serde_json::from_str::<Value>(&line) else {
+            break;
+        };
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if tx.send((req, reply_tx)).await.is_err() {
+            break;
+        }
+        let Ok(reply) = reply_rx.await else {
+            break;
+        };
+        if write
+            .write_all(format!("{reply}\n").as_bytes())
+            .await
+            .is_err()
+        {
+            break;
+        }
     }
 }
 
@@ -205,10 +236,13 @@ struct Run<'a, 'h> {
     host: CliHost<'h>,
     root: PathBuf,
     step: usize,
+    max_steps: Option<usize>,
     session: Session,
     review: Option<(&'a Assistant<'a>, &'a rushy_ai::Context)>,
     /// The user stopped the run at an approval.
     aborted: bool,
+    /// Autopilot hit `max_steps`.
+    limit_reached: bool,
 }
 
 impl Run<'_, '_> {
@@ -216,42 +250,59 @@ impl Run<'_, '_> {
     /// the user stops it. Returns the final answer and whether the user stopped.
     async fn drive(
         &mut self,
-        events: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+        events: &mut mpsc::Receiver<String>,
         rx: &mut mpsc::Receiver<Call>,
         fg: &rushy_core::ForegroundHandle,
     ) -> (String, bool) {
         let tty = std::io::stdin().is_terminal();
+        let busy = Arc::clone(&self.host.busy);
+        let interrupted = Arc::clone(&self.host.interrupted);
         let mut answer = String::new();
         self.host.event(StepEvent::Thinking);
         loop {
             tokio::select! {
-                line = events.next_line() => match line {
-                    Ok(Some(l)) => {
+                line = events.recv() => match line {
+                    Some(l) => {
                         if let Ok(ev) = serde_json::from_str::<Value>(&l) {
                             show_event(&mut self.host, &ev, &mut answer);
                         }
                     }
-                    _ => return (answer, false),
+                    None => return (answer, false),
                 },
                 Some((req, reply)) = rx.recv() => {
                     let tool = req["tool"].as_str().unwrap_or_default().to_owned();
-                    let res = self.call(&tool, &req["args"]).await;
+                    let res = {
+                        let work = self.call(&tool, &req["args"]);
+                        tokio::pin!(work);
+                        loop {
+                            tokio::select! {
+                                res = &mut work => break res,
+                                Ok(()) = tokio::signal::ctrl_c() => {
+                                    // A command in this pane ends first; the run stops after it.
+                                    if busy.load(Ordering::SeqCst) {
+                                        interrupted.store(true, Ordering::SeqCst);
+                                        if !tty {
+                                            let _ = fg.signal("INT");
+                                        }
+                                    } else {
+                                        let _ = reply.send(mcp::tool_text(
+                                            "the user stopped the run",
+                                            true,
+                                        ));
+                                        return (answer, true);
+                                    }
+                                }
+                            }
+                        }
+                    };
                     let _ = reply.send(res);
                     if self.aborted {
-                        return (answer, true);
+                        return (answer, !self.limit_reached);
                     }
                     self.host.event(StepEvent::Thinking);
                 }
                 Ok(()) = tokio::signal::ctrl_c() => {
-                    // A command in this pane ends first; the run stops after it.
-                    if self.host.busy.load(Ordering::SeqCst) {
-                        self.host.interrupted.store(true, Ordering::SeqCst);
-                        if !tty {
-                            let _ = fg.signal("INT");
-                        }
-                    } else {
-                        return (answer, true);
-                    }
+                    return (answer, true);
                 }
             }
         }
@@ -264,6 +315,51 @@ impl Run<'_, '_> {
         }
     }
 
+    fn check_step_limit(&mut self) -> Option<String> {
+        let max = self.max_steps?;
+        if self.step >= max {
+            self.limit_reached = true;
+            self.aborted = true;
+            return Some(format!("not run: autopilot step limit ({max}) reached"));
+        }
+        None
+    }
+
+    async fn secret_read(&mut self, tool: &str, path: &Path, args: &Value) -> Result<String> {
+        let rel = path.strip_prefix(&self.root).unwrap_or(path).display();
+        if !self.host.ask_each {
+            bail!("refused: reading secret file `{rel}` requires interactive approval");
+        }
+        self.step += 1;
+        let what = format!("{tool} {rel} (sensitive file)");
+        match self
+            .host
+            .approve(self.step, &what, "accessing a sensitive file")
+            .await
+        {
+            Approval::Run => {
+                let res = if tool == "read_file" {
+                    mcp::read_file(&self.root, args)
+                } else {
+                    mcp::search_text(&self.root, args)
+                };
+                let (failed, note) = match &res {
+                    Ok(_) => (false, "done".to_owned()),
+                    Err(e) => (true, format!("failed: {e}")),
+                };
+                eprint!("{}", self.host.pal.card_note(failed, &note));
+                res
+            }
+            Approval::Skip => {
+                Ok("not read: the user declined reading this sensitive file".to_owned())
+            }
+            Approval::Abort => {
+                self.aborted = true;
+                Ok("not read: the user stopped the run".to_owned())
+            }
+        }
+    }
+
     /// Runs one tool call. Returns the MCP result.
     async fn call(&mut self, tool: &str, args: &Value) -> Value {
         if self.aborted {
@@ -273,19 +369,49 @@ impl Run<'_, '_> {
         let res = match short {
             "run_command" => self.run_command(args).await,
             "write_file" | "edit_file" => self.change_file(short, args).await,
-            "read_file" | "list_dir" | "find_files" | "search_text" => {
+            "read_file" => {
+                let what = args["path"].as_str().unwrap_or(".");
+                match mcp::resolve(&self.root, what) {
+                    Ok(full) if mcp::is_secret_path(&self.root, &full) => {
+                        self.secret_read("read_file", &full, args).await
+                    }
+                    Ok(_) => {
+                        self.host.clear_thinking();
+                        eprintln!("{}", self.host.pal.dim(&format!("  · read_file {what}")));
+                        mcp::read_file(&self.root, args)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            "search_text" => {
+                let path_arg = args["path"].as_str().unwrap_or(".");
+                let what = args["path"]
+                    .as_str()
+                    .or_else(|| args["query"].as_str())
+                    .unwrap_or(".");
+                match mcp::resolve(&self.root, path_arg) {
+                    Ok(full) if full.is_file() && mcp::is_secret_path(&self.root, &full) => {
+                        self.secret_read("search_text", &full, args).await
+                    }
+                    Ok(_) => {
+                        self.host.clear_thinking();
+                        eprintln!("{}", self.host.pal.dim(&format!("  · search_text {what}")));
+                        mcp::search_text(&self.root, args)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            "list_dir" | "find_files" => {
                 let what = args["path"]
                     .as_str()
                     .or_else(|| args["pattern"].as_str())
-                    .or_else(|| args["query"].as_str())
                     .unwrap_or(".");
                 self.host.clear_thinking();
                 eprintln!("{}", self.host.pal.dim(&format!("  · {short} {what}")));
-                match short {
-                    "read_file" => mcp::read_file(&self.root, args),
-                    "list_dir" => mcp::list_dir(&self.root, args),
-                    "find_files" => mcp::find_files(&self.root, args),
-                    _ => mcp::search_text(&self.root, args),
+                if short == "list_dir" {
+                    mcp::list_dir(&self.root, args)
+                } else {
+                    mcp::find_files(&self.root, args)
                 }
             }
             "shell_info" => Ok(self.shell_info()),
@@ -309,6 +435,9 @@ impl Run<'_, '_> {
         let reason = args["reason"].as_str().unwrap_or_default();
         if command.is_empty() {
             bail!("`command` is empty");
+        }
+        if let Some(msg) = self.check_step_limit() {
+            return Ok(msg);
         }
         self.step += 1;
         let step = self.step;
@@ -344,6 +473,9 @@ impl Run<'_, '_> {
     }
 
     async fn change_file(&mut self, tool: &str, args: &Value) -> Result<String> {
+        if let Some(msg) = self.check_step_limit() {
+            return Ok(msg);
+        }
         let (full, what) = mcp::describe_write(&self.root, tool, args)?;
         let reason = args["reason"].as_str().unwrap_or_default();
         self.step += 1;
@@ -459,9 +591,10 @@ struct Started {
     /// Removed when the run ends.
     _dir: TempDir,
     child: tokio::process::Child,
-    events: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    events: mpsc::Receiver<String>,
     rx: mpsc::Receiver<Call>,
     acceptor: tokio::task::JoinHandle<()>,
+    event_reader: tokio::task::JoinHandle<()>,
 }
 
 /// Opens the tool socket and starts Claude Code in `root` with `goal`.
@@ -476,9 +609,11 @@ async fn start(
     let socket = dir.0.join("s");
     let listener = UnixListener::bind(&socket).context("cannot open the tool socket")?;
     let exe = std::env::current_exe().context("cannot find the xsh program")?;
+    let token = random_token();
     let config = mcp_config(&exe, &socket);
     let mut cmd = tokio::process::Command::new(claude);
     cmd.args(claude_args(&config, model))
+        .env(mcp::TOKEN_VAR, &token)
         .current_dir(root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -495,14 +630,46 @@ async fn start(
         drop(stdin);
     }
     let stdout = child.stdout.take().context("no output from Claude Code")?;
+    let (ev_tx, events) = mpsc::channel::<String>(64);
+    let event_reader = tokio::spawn(async move {
+        let mut reader = BufReader::new(stdout);
+        while let Ok(Some(line)) = mcp::read_line_capped(&mut reader, mcp::MAX_LINE_BYTES).await {
+            if ev_tx.send(line).await.is_err() {
+                break;
+            }
+        }
+    });
     let (tx, rx) = mpsc::channel::<Call>(1);
     Ok(Started {
         _dir: dir,
         child,
-        events: BufReader::new(stdout).lines(),
+        events,
         rx,
-        acceptor: tokio::spawn(accept(listener, tx)),
+        acceptor: tokio::spawn(accept(listener, tx, token)),
+        event_reader,
     })
+}
+
+fn final_answer(
+    answer: String,
+    stopped: bool,
+    limit_reached: bool,
+    steps: usize,
+    status: Option<i32>,
+) -> String {
+    if limit_reached {
+        format!("*Stopped after {AUTOPILOT_MAX_STEPS} steps (the limit).*")
+    } else if stopped {
+        format!("*Stopped by you after {steps} step(s).*")
+    } else if answer.trim().is_empty() {
+        match status {
+            Some(0) => "*Claude Code gave no summary.*".to_owned(),
+            Some(c) => format!("*Claude Code ended with status {c}; see the messages above.*"),
+            None => "*Claude Code was stopped.*".to_owned(),
+        }
+    } else {
+        answer
+    }
 }
 
 /// `ai claude [--auto] [--model M] <goal>`.
@@ -541,6 +708,7 @@ pub async fn run(app: &mut App, goal: &str, auto: bool, model: Option<&str>) -> 
         mut events,
         mut rx,
         acceptor,
+        event_reader,
     } = start(&claude, &root, path.as_deref(), goal, model).await?;
 
     let pal = Pal::for_app(app);
@@ -577,32 +745,32 @@ pub async fn run(app: &mut App, goal: &str, auto: bool, model: Option<&str>) -> 
         host,
         root,
         step: 0,
+        max_steps: auto.then_some(AUTOPILOT_MAX_STEPS),
         session,
         review: assistant.as_ref().zip(ctx.as_ref()),
         aborted: false,
+        limit_reached: false,
     };
     let (answer, stopped) = run.drive(&mut events, &mut rx, &fg).await;
     run.host.clear_thinking();
-    if stopped {
+    let limit_reached = run.limit_reached;
+    if stopped || limit_reached {
         let _ = child.start_kill();
     }
     let status = child.wait().await.ok().and_then(|s| s.code());
     acceptor.abort();
+    event_reader.abort();
     let steps = std::mem::take(&mut run.host.steps);
     drop(run);
-    let answer = if stopped {
-        format!("*Stopped by you after {} step(s).*", steps.len())
-    } else if answer.trim().is_empty() {
-        match status {
-            Some(0) => "*Claude Code gave no summary.*".to_owned(),
-            Some(c) => format!("*Claude Code ended with status {c}; see the messages above.*"),
-            None => "*Claude Code was stopped.*".to_owned(),
-        }
-    } else {
-        answer
-    };
+    let answer = final_answer(answer, stopped, limit_reached, steps.len(), status);
     print!("\n{}", pal.agent_report(goal, &answer, &steps));
-    Ok(if stopped { 130 } else { status.unwrap_or(1) })
+    Ok(if stopped {
+        130
+    } else if limit_reached {
+        0
+    } else {
+        status.unwrap_or(1)
+    })
 }
 
 #[cfg(test)]

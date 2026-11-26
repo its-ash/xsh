@@ -3,7 +3,8 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+use std::time::Duration;
 
 use ratatui::style::Color;
 use ratatui::text::{Line, Span};
@@ -285,17 +286,37 @@ pub fn to_line(theme: &Theme, pieces: &[Piece]) -> Line<'static> {
     )
 }
 
-fn run(program: &str, args: &[&str], cwd: &Path) -> Option<String> {
-    let out = Command::new(program)
-        .args(args)
+const GIT_STATUS_TIMEOUT: Duration = Duration::from_secs(1);
+const VERSION_TIMEOUT: Duration = Duration::from_secs(3);
+
+async fn run_with_timeout_async(
+    program: &str,
+    args: &[&str],
+    cwd: &Path,
+    limit: Duration,
+) -> Option<String> {
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stderr(Stdio::null())
-        .output()
-        .ok()?;
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(limit, cmd.output()).await.ok()?.ok()?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+}
+
+fn run_with_timeout(program: &str, args: &[&str], cwd: &Path, limit: Duration) -> Option<String> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.block_on(run_with_timeout_async(program, args, cwd, limit))
+    } else {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()?;
+        rt.block_on(run_with_timeout_async(program, args, cwd, limit))
+    }
 }
 
 fn git_branch(cwd: &Path) -> Option<String> {
@@ -329,18 +350,20 @@ pub fn segment_values(name: &str, cwd: &Path) -> Option<BTreeMap<String, String>
     match name {
         "git" => {
             v.insert("branch".to_owned(), git_branch(cwd)?);
-            let dirty = run("git", &["status", "--porcelain"], cwd).is_some_and(|s| !s.is_empty());
+            let dirty =
+                run_with_timeout("git", &["status", "--porcelain"], cwd, GIT_STATUS_TIMEOUT)
+                    .is_some_and(|s| !s.is_empty());
             v.insert(
                 "dirty".to_owned(),
                 if dirty { "*".into() } else { String::new() },
             );
         }
         "node" => {
-            let out = run("node", &["--version"], cwd)?;
+            let out = run_with_timeout("node", &["--version"], cwd, VERSION_TIMEOUT)?;
             v.insert("version".to_owned(), out.trim_start_matches('v').to_owned());
         }
         "python" => {
-            let out = run("python3", &["--version"], cwd)?;
+            let out = run_with_timeout("python3", &["--version"], cwd, VERSION_TIMEOUT)?;
             v.insert(
                 "version".to_owned(),
                 out.split_whitespace().last()?.to_owned(),

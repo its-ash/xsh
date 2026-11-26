@@ -4,7 +4,7 @@
 //! `xsh app state` and writes with `xsh config set` and the commands here, so
 //! the same validation applies to the app, the prompt, and a hand-edited file.
 
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 
 use anyhow::{Context as _, Result, bail};
 use ratatui::style::Color;
@@ -15,6 +15,7 @@ use rushy_bundles::Effects;
 use rushy_config::{Config, Loader, Profile};
 use rushy_tui::{BUILTIN, Theme};
 use serde_json::{Value, json};
+use zeroize::Zeroize as _;
 
 use crate::app::{App, user_themes};
 use crate::cli::AppCmd;
@@ -202,7 +203,7 @@ fn set_profiles(app: &App) -> Result<()> {
     Ok(())
 }
 
-/// Edits `ai.toml`, and writes the result only when it is valid.
+/// Edits `ai.toml`, and writes the result atomically only when it is valid.
 fn edit_ai(app: &App, edit: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<()>) -> Result<()> {
     let file = app.paths.ai_file();
     let text = match std::fs::read_to_string(&file) {
@@ -214,8 +215,12 @@ fn edit_ai(app: &App, edit: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<(
     edit(&mut doc)?;
     let new = doc.to_string();
     rushy_config::parse_toml::<AiConfig>(&file, &new)?;
-    std::fs::create_dir_all(app.paths.config_dir())?;
-    std::fs::write(&file, new)?;
+    let dir = app.paths.config_dir();
+    std::fs::create_dir_all(dir)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(new.as_bytes())?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(&file).map_err(|e| e.error)?;
     Ok(())
 }
 
@@ -251,10 +256,11 @@ fn check_provider(name: &str) -> Result<()> {
 fn ai_key(app: &App, provider: &str) -> Result<()> {
     check_provider(provider)?;
     let service = format!("xsh-{provider}");
-    let key = read_stdin()?;
-    let key = key.trim();
+    let mut raw = read_stdin()?;
+    let trimmed = raw.trim();
     let path = format!("providers.{provider}.api_key");
-    if key.is_empty() {
+    if trimmed.is_empty() {
+        raw.zeroize();
         rushy_ai::delete_api_key(&service)?;
         return edit_ai(app, |doc| {
             let (t, last) = ai_table(doc, &path)?;
@@ -262,7 +268,9 @@ fn ai_key(app: &App, provider: &str) -> Result<()> {
             Ok(())
         });
     }
-    rushy_ai::store_api_key(&service, &Secret::new(key))?;
+    let stored = rushy_ai::store_api_key(&service, &Secret::new(trimmed));
+    raw.zeroize();
+    stored?;
     edit_ai(app, |doc| {
         let (t, last) = ai_table(doc, &path)?;
         let mut spec = toml_edit::InlineTable::new();
@@ -272,12 +280,19 @@ fn ai_key(app: &App, provider: &str) -> Result<()> {
     })
 }
 
+fn same_origin(a: &str, b: &str) -> bool {
+    let (Ok(ua), Ok(ub)) = (url::Url::parse(a), url::Url::parse(b)) else {
+        return false;
+    };
+    ua.origin().is_tuple() && ua.origin() == ub.origin()
+}
+
 async fn ai_models(app: &App, endpoint: &str) -> Result<()> {
-    let key = AiConfig::load(&app.paths.ai_file())?
-        .provider("custom")
-        .api_key
-        .map(|k| k.resolve("custom"))
-        .transpose()?;
+    let custom = AiConfig::load(&app.paths.ai_file())?.provider("custom");
+    let key = match (&custom.base_url, custom.api_key) {
+        (Some(saved), Some(k)) if same_origin(endpoint, saved) => Some(k.resolve("custom")?),
+        _ => None,
+    };
     let models = rushy_ai::list_models(endpoint, key.as_ref()).await?;
     println!("{}", json!(models));
     Ok(())
@@ -355,4 +370,33 @@ pub async fn run(app: &mut App, cmd: AppCmd) -> Result<i32> {
         AppCmd::AgentRunner { socket } => return crate::agent_pane::serve(app, &socket).await,
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn origin_matching_checks_scheme_host_port() {
+        assert!(same_origin(
+            "http://127.0.0.1:9694/v1/models",
+            "http://127.0.0.1:9694/v1"
+        ));
+        assert!(same_origin(
+            "https://api.example.com:443/v1",
+            "https://api.example.com/v2"
+        ));
+        assert!(!same_origin(
+            "http://127.0.0.1:9694/v1",
+            "https://127.0.0.1:9694/v1"
+        ));
+        assert!(!same_origin(
+            "http://127.0.0.1:9694/v1",
+            "http://127.0.0.1:9695/v1"
+        ));
+        assert!(!same_origin(
+            "https://evil.example.com/v1",
+            "https://api.example.com/v1"
+        ));
+    }
 }

@@ -198,3 +198,42 @@ fn pause_export_import() -> TestResult {
     assert_eq!(cmds, ["one", "two"]);
     Ok(())
 }
+
+#[test]
+fn wal_user_version_permissions_and_argon2_meta() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let sub = dir.path().join("hist");
+    let path = sub.join("history.db");
+    let pass = KeySource::Passphrase(Zeroizing::new("secret-pass".to_owned()));
+    {
+        let mut store = HistoryStore::open(&path, &pass)?;
+        store.record(&entry("echo hi"))?;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir_mode = std::fs::metadata(&sub)?.permissions().mode() & 0o777;
+        let db_mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(db_mode, 0o600);
+    }
+
+    let conn = rusqlite::Connection::open(&path)?;
+    let journal: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
+    assert_eq!(journal.to_ascii_lowercase(), "wal");
+    let version: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    assert_eq!(version, 1);
+
+    for k in ["argon2_m_cost", "argon2_t_cost", "argon2_p_cost"] {
+        let v: Vec<u8> = conn.query_row("SELECT v FROM meta WHERE k = ?1", [k], |r| r.get(0))?;
+        assert!(!v.is_empty(), "missing {k}");
+    }
+    // Backward compatibility: deleting argon2_* meta still opens with default params.
+    conn.execute("DELETE FROM meta WHERE k LIKE 'argon2_%'", [])?;
+    drop(conn);
+
+    let store = HistoryStore::open(&path, &pass)?;
+    assert_eq!(store.all()?.len(), 1);
+    Ok(())
+}

@@ -17,14 +17,16 @@ use anyhow::{Context as _, Result};
 use rushy_ai::agent::CommandOutput;
 use rushy_core::Shell;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Lines};
+use tokio::io::{AsyncWriteExt as _, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::app::App;
+use crate::mcp::{MAX_LINE_BYTES, constant_time_eq, read_line_capped};
 
 const TOKEN_VAR: &str = "XSH_APP_TOKEN";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+const AUTH_LINE_LIMIT: usize = 4096;
 
 async fn send(writer: &mut OwnedWriteHalf, v: &Value) -> std::io::Result<()> {
     writer.write_all(format!("{v}\n").as_bytes()).await?;
@@ -49,7 +51,7 @@ pub async fn run_logged(shell: &mut Shell, command: &str) -> CommandOutput {
 
 /// The connection from the agent to its right pane.
 pub struct Link {
-    lines: Lines<BufReader<OwnedReadHalf>>,
+    reader: BufReader<OwnedReadHalf>,
     writer: OwnedWriteHalf,
     interrupted: bool,
 }
@@ -84,19 +86,40 @@ impl Link {
         let path = dir.join("s");
         let listener = UnixListener::bind(&path).ok()?;
         crate::term::agent_split(token, &path);
-        let (stream, _) = tokio::time::timeout(CONNECT_TIMEOUT, listener.accept())
+        let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
+        loop {
+            let (stream, _) = tokio::time::timeout_at(deadline, listener.accept())
+                .await
+                .ok()?
+                .ok()?;
+            let (read, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(read);
+            let auth_line = match tokio::time::timeout_at(
+                deadline,
+                read_line_capped(&mut reader, AUTH_LINE_LIMIT),
+            )
             .await
-            .ok()?
-            .ok()?;
-        let (read, mut writer) = stream.into_split();
-        send(&mut writer, &json!({ "cwd": cwd.to_string_lossy() }))
-            .await
-            .ok()?;
-        Some(Self {
-            lines: BufReader::new(read).lines(),
-            writer,
-            interrupted: false,
-        })
+            {
+                Ok(Ok(Some(line))) => line,
+                Ok(_) => continue,
+                Err(_) => return None,
+            };
+            let ok = serde_json::from_str::<Value>(&auth_line)
+                .ok()
+                .and_then(|v| v["auth"].as_str().map(str::to_owned))
+                .is_some_and(|got| constant_time_eq(&got, token));
+            if !ok {
+                continue;
+            }
+            send(&mut writer, &json!({ "cwd": cwd.to_string_lossy() }))
+                .await
+                .ok()?;
+            return Some(Self {
+                reader,
+                writer,
+                interrupted: false,
+            });
+        }
     }
 
     /// Whether the user pressed Ctrl-C in the right pane during a command.
@@ -109,7 +132,9 @@ impl Link {
         send(&mut self.writer, &json!({ "command": command }))
             .await
             .ok()?;
-        let line = self.lines.next_line().await.ok()??;
+        let line = read_line_capped(&mut self.reader, MAX_LINE_BYTES)
+            .await
+            .ok()??;
         let v: Value = serde_json::from_str(&line).ok()?;
         self.interrupted |= v["interrupted"].as_bool().unwrap_or(false);
         let text = |k: &str| v[k].as_str().unwrap_or_default().to_owned();
@@ -124,15 +149,18 @@ impl Link {
     }
 }
 
-async fn serve_link(shell: &mut Shell, stream: UnixStream) -> Result<()> {
+async fn serve_link(shell: &mut Shell, stream: UnixStream, token: &str) -> Result<()> {
     let (read, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(read).lines();
+    send(&mut writer, &json!({ "auth": token }))
+        .await
+        .context("agent connection")?;
+    let mut reader = BufReader::new(read);
     let fg = shell.state().foreground();
     loop {
         // Ctrl-C here, between commands, also stops the agent: it sees the
         // connection close at its next command.
         let next = tokio::select! {
-            line = lines.next_line() => line.context("agent connection")?,
+            line = read_line_capped(&mut reader, MAX_LINE_BYTES) => line.context("agent connection")?,
             Ok(()) = tokio::signal::ctrl_c() => None,
         };
         let Some(line) = next else {
@@ -144,7 +172,8 @@ async fn serve_link(shell: &mut Shell, stream: UnixStream) -> Result<()> {
                 shell.state_mut().set_cwd(cwd);
             }
         } else if let Some(command) = v["command"].as_str() {
-            println!("\x1b[2m$ {}\x1b[0m", command.replace('\x1b', ""));
+            let safe_cmd: String = command.chars().filter(|c| !c.is_control()).collect();
+            println!("\x1b[2m$ {safe_cmd}\x1b[0m");
             let work = run_logged(shell, command);
             tokio::pin!(work);
             let (mut interrupted, mut gone) = (false, false);
@@ -152,7 +181,7 @@ async fn serve_link(shell: &mut Shell, stream: UnixStream) -> Result<()> {
                 tokio::select! {
                     out = &mut work => break out,
                     Ok(()) = tokio::signal::ctrl_c(), if !interrupted => interrupted = true,
-                    line = lines.next_line(), if !gone => {
+                    line = read_line_capped(&mut reader, MAX_LINE_BYTES), if !gone => {
                         // The agent stopped, so its command stops too.
                         if matches!(line, Ok(None) | Err(_)) {
                             gone = true;
@@ -180,11 +209,15 @@ async fn serve_link(shell: &mut Shell, stream: UnixStream) -> Result<()> {
 /// `xsh app agent-runner`: runs the commands of the agent, and exits when the
 /// agent stops (the app then closes the pane).
 pub async fn serve(app: &mut App, socket: &Path) -> Result<i32> {
+    let token = std::env::var(TOKEN_VAR)
+        .ok()
+        .filter(|t| !t.is_empty())
+        .context("missing XSH_APP_TOKEN")?;
     crate::repl::forward_signals(&app.shell.state().foreground());
     crate::term::set_title("xsh agent");
     let stream = UnixStream::connect(socket)
         .await
         .with_context(|| format!("no agent at {}", socket.display()))?;
-    serve_link(&mut app.shell, stream).await?;
+    serve_link(&mut app.shell, stream, &token).await?;
     Ok(0)
 }

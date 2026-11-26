@@ -20,7 +20,13 @@ struct Shortcut {
     init?(_ text: String) {
         // `+` is both the separator and a possible key.
         var parts = text.lowercased().split(separator: "+", omittingEmptySubsequences: false).map(String.init)
-        if text.hasSuffix("+") { parts = parts.dropLast(2) + ["+"] }
+        if text == "+" {
+            parts = ["+"]
+        } else if text.hasSuffix("++") {
+            parts = parts.dropLast(2) + ["+"]
+        } else if text.hasSuffix("+") {
+            return nil
+        }
         guard let last = parts.popLast(), !last.isEmpty else { return nil }
         key = last
         modifiers = []

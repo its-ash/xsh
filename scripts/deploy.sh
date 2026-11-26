@@ -64,6 +64,11 @@ trap 'exit 130' INT TERM
 awk -v v="$version" '!done && /^version = / { print "version = \"" v "\""; done = 1; next } { print }' \
     "$work/Cargo.toml" > Cargo.toml
 
+echo "deploy: verify formatting, clippy, and tests"
+cargo fmt --check || die "cargo fmt --check failed"
+cargo clippy --workspace --all-targets -- -D warnings || die "cargo clippy failed"
+cargo test --workspace || die "cargo test failed"
+
 echo "deploy: make build ($tag)"
 make build
 

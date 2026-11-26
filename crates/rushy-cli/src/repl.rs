@@ -215,108 +215,90 @@ fn sub_matches(
     })
 }
 
-/// File names under `cwd`; `home` expands a leading `~`, as the parser does.
-/// A directory is given a trailing `/`, so that `Tab` again lists what is
-/// inside it.
-fn complete_files(
-    data: &CompData,
-    home: Option<&str>,
-    prefix: &str,
-    span: Span,
-    quoted: bool,
-) -> Vec<Suggestion> {
-    let cut = prefix.rfind(['/', '\\']).map_or(0, |i| i + 1);
-    let (dir, base) = prefix.split_at(cut);
-    let root = match dir.strip_prefix('~') {
-        Some(rest) => match home {
-            Some(h) => std::path::Path::new(h).join(rest.trim_start_matches(['/', '\\'])),
-            None => data.cwd.join(dir),
-        },
-        None if dir.is_empty() => data.cwd.clone(),
-        None => data.cwd.join(dir),
-    };
-    let Ok(entries) = std::fs::read_dir(&root) else {
-        return Vec::new();
-    };
-    let mut names: Vec<(String, bool)> = entries
-        .flatten()
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            // Hidden files show only when the typed name starts with a dot.
-            if !name.starts_with(base) || (name.starts_with('.') && !base.starts_with('.')) {
-                return None;
-            }
-            Some((name, e.path().is_dir()))
-        })
-        .collect();
-    names.sort();
-    names
-        .into_iter()
-        .take(MAX_SUGGESTIONS)
-        .map(|(name, is_dir)| {
-            let mut value = format!("{dir}{name}");
-            if is_dir {
-                value.push('/');
-            }
-            // Inside a quote an escape would be taken literally.
-            suggestion(if quoted { value } else { escape(&value) }, span)
-        })
-        .collect()
+/// A single `read_dir` snapshot used for exact, case-insensitive, and fuzzy
+/// file completion without rescanning the directory three times.
+struct DirEntries<'a> {
+    dir: &'a str,
+    base: &'a str,
+    all: Vec<(String, bool)>,
 }
 
-/// File names that match `prefix` when case is ignored, used when the exact
-/// match finds nothing (`doc<Tab>` finds `Documents/`). With `fuzzy`, the
-/// names that match it fuzzily instead (`dwn<Tab>` finds `Downloads/`).
-/// Only the last part of the path is matched loosely.
-fn complete_files_loose(
-    data: &CompData,
-    home: Option<&str>,
-    prefix: &str,
-    span: Span,
-    quoted: bool,
-    fuzzy: bool,
-) -> Vec<Suggestion> {
-    let cut = prefix.rfind(['/', '\\']).map_or(0, |i| i + 1);
-    let (dir, base) = prefix.split_at(cut);
-    let lower = base.to_lowercase();
-    let root = match (dir.strip_prefix('~'), home) {
-        (Some(rest), Some(h)) => std::path::Path::new(h).join(rest.trim_start_matches(['/', '\\'])),
-        _ if dir.is_empty() => data.cwd.clone(),
-        _ => data.cwd.join(dir),
-    };
-    let Ok(entries) = std::fs::read_dir(&root) else {
-        return Vec::new();
-    };
-    // Hidden files take part only when the typed name starts with a dot.
-    let mut all: Vec<(String, bool)> = entries
-        .flatten()
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            (!name.starts_with('.') || base.starts_with('.')).then(|| (name, e.path().is_dir()))
-        })
-        .collect();
-    all.sort();
-    let names: Vec<(String, bool)> = if !fuzzy {
-        all.into_iter()
-            .filter(|(name, _)| name.to_lowercase().starts_with(&lower))
+impl<'a> DirEntries<'a> {
+    fn read(data: &CompData, home: Option<&str>, prefix: &'a str) -> Option<Self> {
+        let cut = prefix.rfind(['/', '\\']).map_or(0, |i| i + 1);
+        let (dir, base) = prefix.split_at(cut);
+        let root = match (dir.strip_prefix('~'), home) {
+            (Some(rest), Some(h)) => {
+                std::path::Path::new(h).join(rest.trim_start_matches(['/', '\\']))
+            }
+            _ if dir.is_empty() => data.cwd.clone(),
+            _ => data.cwd.join(dir),
+        };
+        let entries = std::fs::read_dir(&root).ok()?;
+        let show_hidden = base.starts_with('.');
+        let mut all: Vec<(String, bool)> = entries
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                (!name.starts_with('.') || show_hidden).then(|| (name, e.path().is_dir()))
+            })
+            .collect();
+        all.sort();
+        Some(Self { dir, base, all })
+    }
+
+    fn format(
+        &self,
+        names: impl Iterator<Item = (String, bool)>,
+        span: Span,
+        quoted: bool,
+        dirs_only: bool,
+    ) -> Vec<Suggestion> {
+        names
+            .filter(|(_, is_dir)| !dirs_only || *is_dir)
+            .take(MAX_SUGGESTIONS)
+            .map(|(name, is_dir)| {
+                let value = format!("{}{name}{}", self.dir, if is_dir { "/" } else { "" });
+                suggestion(if quoted { value } else { escape(&value) }, span)
+            })
             .collect()
-    } else if base.is_empty() {
-        Vec::new()
-    } else {
-        let keys: Vec<&str> = all.iter().map(|(name, _)| name.as_str()).collect();
-        rushy_history::fuzzy::rank_literal(base, &keys)
+    }
+
+    fn exact(&self, span: Span, quoted: bool, dirs_only: bool) -> Vec<Suggestion> {
+        self.format(
+            self.all
+                .iter()
+                .filter(|(name, _)| name.starts_with(self.base))
+                .cloned(),
+            span,
+            quoted,
+            dirs_only,
+        )
+    }
+
+    fn case_insensitive(&self, span: Span, quoted: bool, dirs_only: bool) -> Vec<Suggestion> {
+        let lower = self.base.to_lowercase();
+        self.format(
+            self.all
+                .iter()
+                .filter(|(name, _)| name.to_lowercase().starts_with(&lower))
+                .cloned(),
+            span,
+            quoted,
+            dirs_only,
+        )
+    }
+
+    fn fuzzy(&self, span: Span, quoted: bool, dirs_only: bool) -> Vec<Suggestion> {
+        if self.base.is_empty() {
+            return Vec::new();
+        }
+        let keys: Vec<&str> = self.all.iter().map(|(name, _)| name.as_str()).collect();
+        let matched = rushy_history::fuzzy::rank_literal(self.base, &keys)
             .into_iter()
-            .filter_map(|i| all.get(i).cloned())
-            .collect()
-    };
-    names
-        .into_iter()
-        .take(MAX_SUGGESTIONS)
-        .map(|(name, is_dir)| {
-            let value = format!("{dir}{name}{}", if is_dir { "/" } else { "" });
-            suggestion(if quoted { value } else { escape(&value) }, span)
-        })
-        .collect()
+            .filter_map(|i| self.all.get(i).cloned());
+        self.format(matched, span, quoted, dirs_only)
+    }
 }
 
 /// Arguments that depend on the command: SSH hosts, `make` targets,
@@ -375,11 +357,9 @@ const CLAUDE_MODELS: &[(&str, &str)] = &[
     ("opus", "Claude Code alias: the latest Opus"),
     ("sonnet", "Claude Code alias: the latest Sonnet"),
     ("haiku", "Claude Code alias: the latest Haiku"),
-    ("fable", "Claude Code alias: the latest Fable"),
-    ("claude-opus-5-5", "Claude Opus 5.5"),
-    ("claude-sonnet-5-5", "Claude Sonnet 5.5"),
-    ("claude-haiku-5-5", "Claude Haiku 5.5"),
-    ("claude-fable-5-1", "Claude Fable 5.1"),
+    ("claude-sonnet-4-20250514", "Claude Sonnet 4"),
+    ("claude-opus-4-20250514", "Claude Opus 4"),
+    ("claude-haiku-4-5-20251001", "Claude Haiku 4.5"),
 ];
 
 /// Models pulled into the local Ollama store, as `name:tag`.
@@ -520,39 +500,57 @@ fn make_targets(cwd: &std::path::Path) -> Vec<String> {
     out
 }
 
-/// Keys of `scripts` in the `package.json` of `cwd`. A small scan, so no
-/// JSON parser is needed: it reads the `"scripts": { ... }` object.
+/// Keys of `scripts` in the `package.json` of `cwd`.
 fn npm_scripts(cwd: &std::path::Path) -> Vec<String> {
     let Ok(text) = std::fs::read_to_string(cwd.join("package.json")) else {
         return Vec::new();
     };
-    let Some(start) = text.find("\"scripts\"") else {
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) else {
         return Vec::new();
     };
-    let body = &text[start..];
-    let (Some(open), Some(close)) = (body.find('{'), body.find('}')) else {
-        return Vec::new();
-    };
-    if close < open {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    let mut depth_key = true;
-    for (i, part) in body[open + 1..close].split('"').enumerate() {
-        // Odd parts are inside quotes: key, value, key, value ...
-        if i % 2 == 1 {
-            if depth_key {
-                out.push(part.to_owned());
-            }
-            depth_key = !depth_key;
+    val.get("scripts")
+        .and_then(serde_json::Value::as_object)
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Resolves the common `.git` directory for `cwd`, handling both `.git`
+/// directories and `.git` files used by worktrees and submodules.
+fn resolve_git_dir(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
+    for dir in cwd.ancestors() {
+        let dot_git = dir.join(".git");
+        if dot_git.is_dir() {
+            return Some(dot_git);
+        }
+        if dot_git.is_file() {
+            let text = std::fs::read_to_string(&dot_git).ok()?;
+            let rel = text.lines().next()?.trim().strip_prefix("gitdir:")?.trim();
+            let git_dir = if std::path::Path::new(rel).is_absolute() {
+                std::path::PathBuf::from(rel)
+            } else {
+                dir.join(rel)
+            };
+            let common = std::fs::read_to_string(git_dir.join("commondir"))
+                .ok()
+                .map(|s| {
+                    let p = std::path::Path::new(s.trim());
+                    if p.is_absolute() {
+                        p.to_path_buf()
+                    } else {
+                        git_dir.join(p)
+                    }
+                })
+                .filter(|p| p.is_dir())
+                .unwrap_or(git_dir);
+            return common.is_dir().then_some(common);
         }
     }
-    out
+    None
 }
 
 /// Local branch names of the git repository that holds `cwd`.
 fn git_branches(cwd: &std::path::Path) -> Vec<String> {
-    let Some(git) = cwd.ancestors().map(|d| d.join(".git")).find(|g| g.is_dir()) else {
+    let Some(git) = resolve_git_dir(cwd) else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -600,15 +598,14 @@ impl XshHinter {
             .filter(|h| !h.is_empty())
     }
 
-    fn completion_hint(&mut self, line: &str) -> Option<String> {
+    fn completion_hint(&self, line: &str) -> Option<String> {
         let (prefix, span, _) = word_at(line, line.len());
         if prefix.is_empty() {
             return None;
         }
         let typed = line.get(span.start..)?;
         self.completer
-            .complete(line, line.len())
-            .suggestions()
+            .complete_cached(line, line.len())
             .iter()
             .find_map(|s| s.value.strip_prefix(typed).map(str::to_owned))
             .filter(|h| !h.is_empty())
@@ -671,9 +668,17 @@ impl ShellCompleter {
         prefix: &str,
         span: Span,
         fuzzy: bool,
+        cached_only: bool,
     ) -> Vec<Suggestion> {
+        let options = if cached_only {
+            let Some(o) = self.man.get_cached(cmd, sub) else {
+                return Vec::new();
+            };
+            o
+        } else {
+            self.man.load(cmd, sub)
+        };
         let mut seen = HashSet::new();
-        let options = self.man.load(cmd, sub);
         let unique: Vec<_> = options
             .iter()
             .filter(|o| seen.insert(o.flag.clone()))
@@ -686,6 +691,68 @@ impl ShellCompleter {
                 ..suggestion(o.flag.clone(), span)
             })
             .collect()
+    }
+
+    /// Fast, non-blocking completion for keystroke hints: uses only in-memory
+    /// cached data (commands, subcommands, variables, cached man flags) plus a
+    /// single-pass exact file prefix lookup. Never spawns `man` or performs
+    /// triple/fuzzy disk scans.
+    fn complete_cached(&self, line: &str, pos: usize) -> Vec<Suggestion> {
+        let (prefix, span, quoted) = word_at(line, pos);
+        let Ok(data) = self.data.read() else {
+            return Vec::new();
+        };
+        let typed = words(line.get(..span.start).unwrap_or_default());
+        let stage = typed
+            .iter()
+            .rposition(|w| is_operator(w))
+            .map_or(0, |i| i + 1);
+        let args: Vec<&String> = typed[stage..]
+            .iter()
+            .filter(|w| !is_assignment(w))
+            .collect();
+        let found = if let Some(name) = prefix
+            .strip_prefix("${")
+            .or_else(|| prefix.strip_prefix('$'))
+        {
+            let open = prefix.starts_with("${");
+            pick_words(&data.vars, String::as_str, name, false)
+                .into_iter()
+                .take(MAX_SUGGESTIONS)
+                .map(|v| {
+                    suggestion(
+                        if open {
+                            format!("${{{v}}}")
+                        } else {
+                            format!("${v}")
+                        },
+                        span,
+                    )
+                })
+                .collect()
+        } else if prefix.starts_with('-') {
+            let sub = args
+                .get(1)
+                .copied()
+                .map(String::as_str)
+                .filter(|s| !s.starts_with('-'));
+            args.first().map_or_else(Vec::new, |cmd| {
+                self.man_flags(cmd, sub, &prefix, span, false, true)
+            })
+        } else if args.is_empty() {
+            command_matches(&data, &prefix, span, false)
+        } else if args.len() == 1 {
+            sub_matches(&data, args[0], &prefix, span, false)
+        } else {
+            Vec::new()
+        };
+        if !found.is_empty() || prefix.starts_with('-') {
+            return found;
+        }
+        let cmd = args.first().map(|s| s.as_str()).unwrap_or_default();
+        let dirs_only = matches!(cmd, "cd" | "pushd" | "rmdir");
+        DirEntries::read(&data, self.home.as_deref(), &prefix)
+            .map_or_else(Vec::new, |e| e.exact(span, quoted, dirs_only))
     }
 }
 
@@ -711,29 +778,29 @@ impl Completer for ShellCompleter {
         // same again matched fuzzily.
         let dirs_only = matches!(cmd, "cd" | "pushd" | "rmdir");
         let home = self.home.as_deref();
-        let files = |found: Vec<Suggestion>| {
-            let mut found = found;
-            if dirs_only {
-                found.retain(|s| s.value.ends_with('/'));
-            }
-            found
-        };
         let mut found = self.words_for(&data, &args, &prefix, span, false);
-        if found.is_empty() {
-            found = files(complete_files(&data, home, &prefix, span, quoted));
+        let dir_entries = if found.is_empty() {
+            DirEntries::read(&data, home, &prefix)
+        } else {
+            None
+        };
+        if found.is_empty()
+            && let Some(entries) = &dir_entries
+        {
+            found = entries.exact(span, quoted, dirs_only);
         }
-        if found.is_empty() {
-            found = files(complete_files_loose(
-                &data, home, &prefix, span, quoted, false,
-            ));
+        if found.is_empty()
+            && let Some(entries) = &dir_entries
+        {
+            found = entries.case_insensitive(span, quoted, dirs_only);
         }
         if found.is_empty() {
             found = self.words_for(&data, &args, &prefix, span, true);
         }
-        if found.is_empty() {
-            found = files(complete_files_loose(
-                &data, home, &prefix, span, quoted, true,
-            ));
+        if found.is_empty()
+            && let Some(entries) = &dir_entries
+        {
+            found = entries.fuzzy(span, quoted, dirs_only);
         }
         CompletionResult::fresh(found)
     }
@@ -791,7 +858,7 @@ impl ShellCompleter {
                 .map(String::as_str)
                 .filter(|s| !s.starts_with('-'));
             args.first().map_or_else(Vec::new, |cmd| {
-                self.man_flags(cmd, sub, prefix, span, fuzzy)
+                self.man_flags(cmd, sub, prefix, span, fuzzy, false)
             })
         } else if args.is_empty() {
             let mut res = command_matches(data, prefix, span, fuzzy);
@@ -1920,11 +1987,11 @@ mod tests {
         // The configured model comes first, then the provider's known models.
         let listed = values(&c.complete("ai --model ", 11));
         assert_eq!(listed.first().map(String::as_str), Some("my-claude"));
-        assert!(listed.iter().any(|m| m == "claude-opus-5-5"));
+        assert!(listed.iter().any(|m| m == "claude-opus-4-20250514"));
         assert!(!listed.iter().any(|m| m == "gpt-4o"));
         assert_eq!(
             values(&c.complete("ai explain --model claude-son", 29)),
-            ["claude-sonnet-5-5", "claude-sonnet-4-5"]
+            ["claude-sonnet-4-20250514"]
         );
         // After the model, the modes again; `ai claude` takes Claude Code names.
         assert_eq!(values(&c.complete("ai --model x a", 14)), ["agent"]);
@@ -1934,6 +2001,30 @@ mod tests {
             ["--model", "--auto", "--help"]
         );
         assert_eq!(values(&c.complete("ai --", 5)), ["--model", "--help"]);
+        Ok(())
+    }
+
+    #[test]
+    fn npm_scripts_and_git_worktree_file() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"app","scripts":{"build":"echo \"}\" && tsc","test":"vitest"}}"#,
+        )?;
+        let mut scripts = npm_scripts(dir.path());
+        scripts.sort();
+        assert_eq!(scripts, ["build", "test"]);
+
+        let common = dir.path().join("common.git");
+        let wt_git = common.join("worktrees/wt1");
+        std::fs::create_dir_all(common.join("refs/heads"))?;
+        std::fs::create_dir_all(&wt_git)?;
+        std::fs::write(common.join("refs/heads/main"), "")?;
+        std::fs::write(wt_git.join("commondir"), "../..\n")?;
+        let wt = dir.path().join("wt1");
+        std::fs::create_dir_all(&wt)?;
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", wt_git.display()))?;
+        assert_eq!(git_branches(&wt), ["main"]);
         Ok(())
     }
 }

@@ -437,11 +437,12 @@ fn only_config_files_count_as_config_changes() {
         "themes/mine.toml",
         "bundles/git/init.rushy",
         "bundles/git/README.md",
-        "bundles/git",
     ] {
         assert!(rushy_tui::is_config_path(Path::new(yes)), "{yes}");
     }
     for no in [
+        "bundles/git",
+        "LOCK",
         "history.db",
         "history.db-wal",
         "mux/default.sock",

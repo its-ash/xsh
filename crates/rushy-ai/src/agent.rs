@@ -3,8 +3,8 @@
 use async_trait::async_trait;
 
 use crate::assistant::{Assistant, run_command_tool};
-use crate::context::Context;
-use crate::provider::{ChatMessage, tail};
+use crate::context::{Context, redact_secrets};
+use crate::provider::{ChatMessage, Role, tail};
 use crate::safety::Verdict;
 use crate::{Result, prompts};
 
@@ -105,13 +105,57 @@ pub struct Outcome {
     pub steps: usize,
 }
 
+const TRUNCATED_OUTPUT: &str = "[older tool output truncated to fit context window]";
+
 fn render(out: &CommandOutput) -> String {
+    let stdout = redact_secrets(&out.stdout);
+    let stderr = redact_secrets(&out.stderr);
     format!(
         "exit status: {}\nstdout:\n{}\nstderr:\n{}",
         out.status,
-        tail(&out.stdout, OUTPUT_LIMIT),
-        tail(&out.stderr, OUTPUT_LIMIT / 2)
+        tail(&stdout, OUTPUT_LIMIT),
+        tail(&stderr, OUTPUT_LIMIT / 2)
     )
+}
+
+fn message_bytes(m: &ChatMessage) -> usize {
+    let calls: usize = m
+        .tool_calls
+        .iter()
+        .map(|c| c.id.len() + c.name.len() + c.arguments.to_string().len())
+        .sum();
+    m.content.len() + calls
+}
+
+fn prune_messages(messages: &mut [ChatMessage], max_context_tokens: u32) {
+    let budget = usize::try_from(max_context_tokens)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(4);
+    let mut total: usize = messages.iter().map(message_bytes).sum();
+    if total <= budget {
+        return;
+    }
+    let last_tool = messages.iter().rposition(|m| m.role == Role::Tool);
+    for (idx, m) in messages.iter_mut().enumerate() {
+        if total <= budget {
+            break;
+        }
+        if m.role == Role::Tool && Some(idx) != last_tool && m.content != TRUNCATED_OUTPUT {
+            let old = m.content.len();
+            TRUNCATED_OUTPUT.clone_into(&mut m.content);
+            total = total.saturating_sub(old).saturating_add(m.content.len());
+        }
+    }
+    if total > budget
+        && let Some(idx) = last_tool
+        && let Some(m) = messages.get_mut(idx)
+    {
+        let excess = total - budget;
+        let keep = m.content.len().saturating_sub(excess).max(256);
+        if keep < m.content.len() {
+            m.content = format!("[truncated]\n{}", tail(&m.content, keep));
+        }
+    }
 }
 
 /// Runs the agent loop for `goal`, up to [`MAX_STEPS`] tool calls.
@@ -148,6 +192,7 @@ pub async fn run_limited(
     let mut steps = 0;
     loop {
         host.event(StepEvent::Thinking);
+        prune_messages(&mut req.messages, assistant.settings().max_context_tokens);
         let res = assistant.provider().complete(req.clone()).await?;
         req.messages.push(ChatMessage::assistant(
             res.content.clone(),
@@ -230,5 +275,25 @@ pub async fn run_limited(
                 steps,
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prune_messages_truncates_older_tool_outputs() {
+        let mut msgs = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("goal"),
+            ChatMessage::tool("1", "a".repeat(2_000)),
+            ChatMessage::tool("2", "b".repeat(2_000)),
+            ChatMessage::tool("3", "recent"),
+        ];
+        prune_messages(&mut msgs, 200);
+        assert_eq!(msgs[2].content, TRUNCATED_OUTPUT);
+        assert_eq!(msgs[3].content, TRUNCATED_OUTPUT);
+        assert_eq!(msgs[4].content, "recent");
     }
 }

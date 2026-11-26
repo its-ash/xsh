@@ -1,6 +1,7 @@
 //! Mutable shell state: working directory, variables, aliases, and history.
 
-use std::collections::BTreeMap;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -227,11 +228,11 @@ impl Options {
 #[derive(Debug, Clone)]
 pub struct ShellState {
     cwd: PathBuf,
-    vars: BTreeMap<String, String>,
-    exported: std::collections::BTreeSet<String>,
-    aliases: BTreeMap<String, String>,
+    vars: Arc<BTreeMap<String, String>>,
+    exported: Arc<BTreeSet<String>>,
+    aliases: Arc<BTreeMap<String, String>>,
     last_status: i32,
-    history: Vec<String>,
+    history: Arc<Vec<String>>,
     capture_stderr: bool,
     last_command: String,
     last_stderr: Vec<u8>,
@@ -239,21 +240,45 @@ pub struct ShellState {
     out_log: Vec<u8>,
     err_log: Vec<u8>,
     foreground: ForegroundHandle,
-    functions: BTreeMap<String, Arc<Command>>,
+    functions: Arc<BTreeMap<String, Arc<Command>>>,
     options: Options,
     arg0: String,
     positional: Vec<String>,
     locals: Vec<Vec<(String, Option<String>)>>,
-    dirs: Vec<PathBuf>,
-    traps: BTreeMap<String, String>,
+    dirs: Arc<Vec<PathBuf>>,
+    traps: Arc<BTreeMap<String, String>>,
     cdpath: Option<Vec<String>>,
     umask: Option<u32>,
     last_bg: Option<u32>,
-    readonly: std::collections::BTreeSet<String>,
+    readonly: Arc<BTreeSet<String>>,
     interactive: bool,
     /// `getopts` progress: the `OPTIND` it last set and the character
     /// offset inside that argument (for grouped options such as `-ab`).
     getopts: (usize, usize),
+}
+
+/// Formats `value` as ASCII decimal directly into `buf`, reusing its storage.
+pub(crate) fn format_i64_into(buf: &mut String, value: i64) {
+    buf.clear();
+    if value == 0 {
+        buf.push('0');
+        return;
+    }
+    let mut tmp = [0u8; 20];
+    let mut i = tmp.len();
+    let mut n = value.unsigned_abs();
+    while n > 0 {
+        i -= 1;
+        tmp[i] = b'0' + u8::try_from(n % 10).unwrap_or(0);
+        n /= 10;
+    }
+    if value < 0 {
+        i -= 1;
+        tmp[i] = b'-';
+    }
+    if let Ok(s) = std::str::from_utf8(&tmp[i..]) {
+        buf.push_str(s);
+    }
 }
 
 /// Whether `a` and `b` are the same directory (same device and inode).
@@ -271,13 +296,14 @@ impl ShellState {
     #[must_use]
     pub fn new(cwd: PathBuf, vars: impl IntoIterator<Item = (String, String)>) -> Self {
         let vars: BTreeMap<String, String> = vars.into_iter().collect();
+        let exported: BTreeSet<String> = vars.keys().cloned().collect();
         Self {
             cwd,
-            exported: vars.keys().cloned().collect(),
-            vars,
-            aliases: BTreeMap::new(),
+            exported: Arc::new(exported),
+            vars: Arc::new(vars),
+            aliases: Arc::new(BTreeMap::new()),
             last_status: 0,
-            history: Vec::new(),
+            history: Arc::new(Vec::new()),
             capture_stderr: false,
             last_command: String::new(),
             last_stderr: Vec::new(),
@@ -285,17 +311,17 @@ impl ShellState {
             out_log: Vec::new(),
             err_log: Vec::new(),
             foreground: ForegroundHandle::default(),
-            functions: BTreeMap::new(),
+            functions: Arc::new(BTreeMap::new()),
             options: Options::default(),
             arg0: "xsh".to_owned(),
             positional: Vec::new(),
             locals: Vec::new(),
-            dirs: Vec::new(),
-            traps: BTreeMap::new(),
+            dirs: Arc::new(Vec::new()),
+            traps: Arc::new(BTreeMap::new()),
             cdpath: None,
             umask: None,
             last_bg: None,
-            readonly: std::collections::BTreeSet::new(),
+            readonly: Arc::new(BTreeSet::new()),
             interactive: true,
             getopts: (0, 0),
         }
@@ -355,11 +381,11 @@ impl ShellState {
     }
 
     pub(crate) fn set_function(&mut self, name: String, body: Arc<Command>) {
-        self.functions.insert(name, body);
+        Arc::make_mut(&mut self.functions).insert(name, body);
     }
 
     pub(crate) fn remove_function(&mut self, name: &str) -> bool {
-        self.functions.remove(name).is_some()
+        Arc::make_mut(&mut self.functions).remove(name).is_some()
     }
 
     /// Sets `$0` and the positional parameters `$1`..`$N`.
@@ -407,7 +433,7 @@ impl ShellState {
     }
 
     pub(crate) fn dirs_mut(&mut self) -> &mut Vec<PathBuf> {
-        &mut self.dirs
+        Arc::make_mut(&mut self.dirs)
     }
 
     /// The `pushd` directory stack, most recent first (without the
@@ -430,7 +456,7 @@ impl ShellState {
     }
 
     pub(crate) fn traps_mut(&mut self) -> &mut BTreeMap<String, String> {
-        &mut self.traps
+        Arc::make_mut(&mut self.traps)
     }
 
     pub(crate) fn umask(&self) -> Option<u32> {
@@ -465,7 +491,7 @@ impl ShellState {
     }
 
     pub(crate) fn set_readonly(&mut self, name: &str) {
-        self.readonly.insert(name.to_owned());
+        Arc::make_mut(&mut self.readonly).insert(name.to_owned());
     }
 
     pub(crate) fn readonly_names(&self) -> impl Iterator<Item = &String> {
@@ -478,6 +504,18 @@ impl ShellState {
 
     pub(crate) fn set_getopts_pos(&mut self, optind: usize, offset: usize) {
         self.getopts = (optind, offset);
+    }
+
+    /// Creates a copy of this state for a subshell without copying log buffers.
+    pub(crate) fn subshell_clone(&mut self) -> Self {
+        let out_log = std::mem::take(&mut self.out_log);
+        let err_log = std::mem::take(&mut self.err_log);
+        let last_stderr = std::mem::take(&mut self.last_stderr);
+        let mut child = self.clone();
+        child.out_log = out_log;
+        child.err_log = err_log;
+        child.last_stderr = last_stderr;
+        child
     }
 
     /// Takes the output logs and recorded stderr of a subshell copy, which
@@ -577,6 +615,10 @@ impl ShellState {
         self.foreground.clone()
     }
 
+    pub(crate) fn reset_foreground(&mut self) {
+        self.foreground = ForegroundHandle::default();
+    }
+
     /// Creates state from the process working directory and environment.
     ///
     /// Variables whose name or value is not valid UTF-8 are skipped.
@@ -595,7 +637,7 @@ impl ShellState {
             .iter()
             .find(|(k, _)| k == "PWD")
             .map(|(_, v)| PathBuf::from(v))
-            .filter(|p| p.is_absolute() && same_dir(p, &cwd));
+            .filter(|p| p.is_absolute() && (*p == cwd || same_dir(p, &cwd)));
         Ok(Self::new(logical.unwrap_or(cwd), vars))
     }
 
@@ -631,22 +673,93 @@ impl ShellState {
     /// Sets variable `name`. An exported variable stays exported; a new one
     /// is not exported.
     pub fn set_var(&mut self, name: impl Into<String>, value: impl Into<String>) {
-        self.vars.insert(name.into(), value.into());
+        Arc::make_mut(&mut self.vars).insert(name.into(), value.into());
+    }
+
+    /// Updates `name` in place when it already exists, reusing both key and
+    /// value allocations.
+    pub(crate) fn set_var_str(&mut self, name: &str, value: &str) {
+        let vars = Arc::make_mut(&mut self.vars);
+        if let Some(slot) = vars.get_mut(name) {
+            slot.clear();
+            slot.push_str(value);
+        } else {
+            vars.insert(name.to_owned(), value.to_owned());
+        }
+    }
+
+    /// Updates `name` with an integer in place, reusing its existing buffer.
+    pub(crate) fn set_var_i64(&mut self, name: &str, value: i64) {
+        let vars = Arc::make_mut(&mut self.vars);
+        if let Some(slot) = vars.get_mut(name) {
+            format_i64_into(slot, value);
+        } else {
+            let mut buf = String::with_capacity(20);
+            format_i64_into(&mut buf, value);
+            vars.insert(name.to_owned(), buf);
+        }
+    }
+
+    /// Reads and updates an integer variable with a single map lookup when the
+    /// existing value is a fast decimal integer. Returns `None` if the slot
+    /// holds a non-decimal expression that needs full arithmetic evaluation.
+    pub(crate) fn try_modify_var_i64(
+        &mut self,
+        name: &str,
+        parse: impl FnOnce(&str) -> Option<i64>,
+        compute: impl FnOnce(i64) -> std::result::Result<(i64, i64), String>,
+    ) -> Option<std::result::Result<i64, String>> {
+        let vars = Arc::make_mut(&mut self.vars);
+        if let Some(slot) = vars.get_mut(name) {
+            let trimmed = slot.trim();
+            let cur = if trimmed.is_empty() {
+                0
+            } else {
+                parse(trimmed)?
+            };
+            match compute(cur) {
+                Ok((new_val, ret_val)) => {
+                    format_i64_into(slot, new_val);
+                    Some(Ok(ret_val))
+                }
+                Err(e) => Some(Err(e)),
+            }
+        } else {
+            match compute(0) {
+                Ok((new_val, ret_val)) => {
+                    let mut buf = String::with_capacity(20);
+                    format_i64_into(&mut buf, new_val);
+                    vars.insert(name.to_owned(), buf);
+                    Some(Ok(ret_val))
+                }
+                Err(e) => Some(Err(e)),
+            }
+        }
+    }
+
+    /// Appends `suffix` to variable `name` in place.
+    pub(crate) fn append_var_str(&mut self, name: &str, suffix: &str) {
+        let vars = Arc::make_mut(&mut self.vars);
+        if let Some(slot) = vars.get_mut(name) {
+            slot.push_str(suffix);
+        } else {
+            vars.insert(name.to_owned(), suffix.to_owned());
+        }
     }
 
     /// Sets variable `name` and exports it to child processes.
     pub fn set_env(&mut self, name: impl Into<String>, value: impl Into<String>) {
         let name = name.into();
-        self.exported.insert(name.clone());
-        self.vars.insert(name, value.into());
+        Arc::make_mut(&mut self.exported).insert(name.clone());
+        Arc::make_mut(&mut self.vars).insert(name, value.into());
     }
 
     /// Marks `name` as exported (`on`) or not exported.
     pub fn set_exported(&mut self, name: &str, on: bool) {
         if on {
-            self.exported.insert(name.to_owned());
+            Arc::make_mut(&mut self.exported).insert(name.to_owned());
         } else {
-            self.exported.remove(name);
+            Arc::make_mut(&mut self.exported).remove(name);
         }
     }
 
@@ -666,35 +779,46 @@ impl ShellState {
     /// Removes the value of `name` but keeps its export mark, so a value
     /// restored later (when a function returns) is exported again.
     pub(crate) fn clear_var(&mut self, name: &str) {
-        self.vars.remove(name);
+        Arc::make_mut(&mut self.vars).remove(name);
     }
 
     /// Removes variable `name` and its export mark.
     pub fn unset_var(&mut self, name: &str) {
-        self.vars.remove(name);
-        self.exported.remove(name);
+        Arc::make_mut(&mut self.vars).remove(name);
+        Arc::make_mut(&mut self.exported).remove(name);
+    }
+
+    /// Resolves a parameter without allocating when the value is stored in state.
+    pub(crate) fn lookup_cow(&self, name: &str) -> Option<Cow<'_, str>> {
+        let first = *name.as_bytes().first()?;
+        if first.is_ascii_alphabetic() || first == b'_' {
+            if let Some(v) = self.vars.get(name) {
+                return Some(Cow::Borrowed(v.as_str()));
+            }
+            return (name == "RANDOM").then(|| Cow::Owned(random().to_string()));
+        }
+        match name {
+            "?" => Some(Cow::Owned(self.last_status.to_string())),
+            "$" => Some(Cow::Owned(std::process::id().to_string())),
+            "#" => Some(Cow::Owned(self.positional.len().to_string())),
+            "@" | "*" => Some(Cow::Owned(self.positional.join(" "))),
+            "!" => self.last_bg.map(|p| Cow::Owned(p.to_string())),
+            "-" => Some(Cow::Owned(self.options.flags())),
+            "0" => Some(Cow::Borrowed(self.arg0.as_str())),
+            _ if first.is_ascii_digit() && name.bytes().all(|b| b.is_ascii_digit()) => name
+                .parse::<usize>()
+                .ok()
+                .and_then(|i| self.positional.get(i.checked_sub(1)?))
+                .map(|s| Cow::Borrowed(s.as_str())),
+            _ => self.vars.get(name).map(|s| Cow::Borrowed(s.as_str())),
+        }
     }
 
     /// Resolves a parameter, including the specials `?`, `$`, `#`, `@`,
     /// `*`, `!`, `-`, `0`, the positional parameters, and `RANDOM`.
     #[must_use]
     pub fn lookup(&self, name: &str) -> Option<String> {
-        match name {
-            "?" => Some(self.last_status.to_string()),
-            "$" => Some(std::process::id().to_string()),
-            "#" => Some(self.positional.len().to_string()),
-            "@" | "*" => Some(self.positional.join(" ")),
-            "!" => self.last_bg.map(|p| p.to_string()),
-            "-" => Some(self.options.flags()),
-            "0" => Some(self.arg0.clone()),
-            "RANDOM" if !self.vars.contains_key("RANDOM") => Some(random().to_string()),
-            _ if name.bytes().all(|b| b.is_ascii_digit()) && !name.is_empty() => name
-                .parse::<usize>()
-                .ok()
-                .and_then(|i| self.positional.get(i.checked_sub(1)?))
-                .cloned(),
-            _ => self.vars.get(name).cloned(),
-        }
+        self.lookup_cow(name).map(Cow::into_owned)
     }
 
     /// Home directory from `HOME`.
@@ -711,17 +835,17 @@ impl ShellState {
 
     /// Defines or replaces an alias.
     pub fn set_alias(&mut self, name: impl Into<String>, value: impl Into<String>) {
-        self.aliases.insert(name.into(), value.into());
+        Arc::make_mut(&mut self.aliases).insert(name.into(), value.into());
     }
 
     /// Removes an alias, returning whether it existed.
     pub fn remove_alias(&mut self, name: &str) -> bool {
-        self.aliases.remove(name).is_some()
+        Arc::make_mut(&mut self.aliases).remove(name).is_some()
     }
 
     /// Removes all aliases.
     pub fn clear_aliases(&mut self) {
-        self.aliases.clear();
+        Arc::make_mut(&mut self.aliases).clear();
     }
 
     /// Exit status of the last command (`$?`).
@@ -746,15 +870,16 @@ impl ShellState {
         if line.is_empty() || self.history.last().is_some_and(|l| l == line) {
             return;
         }
-        if self.history.len() >= HISTORY_LIMIT {
-            self.history.remove(0);
+        let history = Arc::make_mut(&mut self.history);
+        if history.len() >= HISTORY_LIMIT {
+            history.remove(0);
         }
-        self.history.push(line.to_owned());
+        history.push(line.to_owned());
     }
 
     /// Removes all history entries.
     pub fn clear_history(&mut self) {
-        self.history.clear();
+        Arc::make_mut(&mut self.history).clear();
     }
 }
 

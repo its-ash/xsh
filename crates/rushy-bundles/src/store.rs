@@ -1,6 +1,9 @@
 //! Installed bundles under `<config>/bundles/<name>/`.
 
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
+
+const MAX_FILE_SIZE: usize = 1024 * 1024;
 
 use crate::init::{InitFile, parse_init};
 use crate::manifest::{Manifest, valid_name};
@@ -125,12 +128,14 @@ impl BundleStore {
         let name = &download.manifest.package.name;
         let dest = self.path(name)?;
         std::fs::create_dir_all(&self.dir)?;
-        let tmp = self.dir.join(format!(".{name}.tmp"));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp)?;
+        let _ = std::fs::remove_dir_all(self.dir.join(format!(".{name}.tmp")));
+        let tmp_dir = tempfile::Builder::new()
+            .prefix(&format!(".{name}."))
+            .suffix(".tmp")
+            .tempdir_in(&self.dir)?;
+        let tmp = tmp_dir.path();
         for (file, bytes) in &download.files {
             if file != "bundle.toml" && !EXTRA_FILES.contains(&file.as_str()) {
-                let _ = std::fs::remove_dir_all(&tmp);
                 return Err(Error::Invalid {
                     bundle: name.clone(),
                     reason: format!("unexpected file `{file}`"),
@@ -138,22 +143,22 @@ impl BundleStore {
             }
             std::fs::write(tmp.join(file), bytes)?;
         }
-        match Self::load_dir(&tmp) {
+        match Self::load_dir(tmp) {
             Ok(b) if b.name() == name => {}
             Ok(b) => {
-                let _ = std::fs::remove_dir_all(&tmp);
                 return Err(Error::Invalid {
                     bundle: name.clone(),
                     reason: format!("bundle.toml is named `{}`", b.name()),
                 });
             }
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(&tmp);
-                return Err(e);
-            }
+            Err(e) => return Err(e),
         }
+        let tmp_path = tmp_dir.keep();
         let _ = std::fs::remove_dir_all(&dest);
-        std::fs::rename(&tmp, &dest)?;
+        if let Err(e) = std::fs::rename(&tmp_path, &dest) {
+            let _ = std::fs::remove_dir_all(&tmp_path);
+            return Err(e.into());
+        }
         Self::load_dir(&dest)
     }
 
@@ -161,15 +166,31 @@ impl BundleStore {
     ///
     /// # Errors
     ///
-    /// Fails if the source is not a valid bundle.
+    /// Fails if the source is not a valid bundle or contains symlinks.
     pub fn install_dir(&self, src: &Path) -> Result<Installed> {
-        let manifest = Manifest::load(&src.join("bundle.toml"))?;
-        let mut files = vec![(
-            "bundle.toml".to_owned(),
-            std::fs::read(src.join("bundle.toml"))?,
-        )];
+        let label = src.display().to_string();
+        if std::fs::symlink_metadata(src)?.file_type().is_symlink() {
+            return Err(Error::Invalid {
+                bundle: label,
+                reason: "bundle source must not be a symlink".into(),
+            });
+        }
+        let manifest_path = src.join("bundle.toml");
+        let manifest_bytes = read_regular_file(&manifest_path, &label)?.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("missing {}", manifest_path.display()),
+            )
+        })?;
+        let manifest_text =
+            String::from_utf8(manifest_bytes.clone()).map_err(|_| Error::Invalid {
+                bundle: label.clone(),
+                reason: "bundle.toml is not valid UTF-8".into(),
+            })?;
+        let manifest = Manifest::parse(&manifest_path, &manifest_text)?;
+        let mut files = vec![("bundle.toml".to_owned(), manifest_bytes)];
         for f in EXTRA_FILES {
-            if let Ok(bytes) = std::fs::read(src.join(f)) {
+            if let Some(bytes) = read_regular_file(&src.join(f), &manifest.package.name)? {
                 files.push(((*f).to_owned(), bytes));
             }
         }
@@ -188,5 +209,43 @@ impl BundleStore {
         }
         std::fs::remove_dir_all(dir)?;
         Ok(())
+    }
+}
+
+fn read_regular_file(path: &Path, bundle: &str) -> Result<Option<Vec<u8>>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(Error::Invalid {
+                    bundle: bundle.to_owned(),
+                    reason: format!("refusing symlink `{}`", path.display()),
+                });
+            }
+            if !meta.file_type().is_file() {
+                return Err(Error::Invalid {
+                    bundle: bundle.to_owned(),
+                    reason: format!("expected regular file `{}`", path.display()),
+                });
+            }
+            if meta.len() > MAX_FILE_SIZE as u64 {
+                return Err(Error::Invalid {
+                    bundle: bundle.to_owned(),
+                    reason: format!("file `{}` exceeds {MAX_FILE_SIZE} bytes", path.display()),
+                });
+            }
+            let file = std::fs::File::open(path)?;
+            let mut bytes = Vec::new();
+            file.take((MAX_FILE_SIZE as u64) + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > MAX_FILE_SIZE {
+                return Err(Error::Invalid {
+                    bundle: bundle.to_owned(),
+                    reason: format!("file `{}` exceeds {MAX_FILE_SIZE} bytes", path.display()),
+                });
+            }
+            Ok(Some(bytes))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
     }
 }

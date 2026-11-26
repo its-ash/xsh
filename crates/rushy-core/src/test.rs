@@ -1,25 +1,29 @@
 //! Expressions of `test`, `[ ]`, and `[[ ]]`.
 
+use std::borrow::Cow;
 use std::io::IsTerminal as _;
 use std::path::Path;
 
 use crate::glob;
+use crate::state::Options;
+
+const MAX_DEPTH: usize = 64;
 
 /// One argument of a test expression.
 #[derive(Debug, Clone)]
-pub(crate) struct Tok {
+pub(crate) struct Tok<'a> {
     /// Expanded text.
-    pub(crate) text: String,
+    pub(crate) text: Cow<'a, str>,
     /// Whether the token may act as an operator.
     pub(crate) op: bool,
     /// For `[[`: the text as a pattern (quoted parts escaped).
-    pub(crate) pattern: Option<String>,
+    pub(crate) pattern: Option<Cow<'a, str>>,
 }
 
-impl Tok {
-    pub(crate) fn plain(text: &str) -> Self {
+impl<'a> Tok<'a> {
+    pub(crate) fn plain(text: &'a str) -> Self {
         Self {
-            text: text.to_owned(),
+            text: Cow::Borrowed(text),
             op: true,
             pattern: None,
         }
@@ -35,19 +39,23 @@ const BINARY: &[&str] = &[
     "=", "==", "!=", "<", ">", "-eq", "-ne", "-lt", "-le", "-gt", "-ge", "-nt", "-ot", "-ef", "=~",
 ];
 
-struct Eval<'a> {
-    toks: &'a [Tok],
+struct Eval<'a, 't> {
+    toks: &'a [Tok<'t>],
     pos: usize,
     dbl: bool,
     cwd: &'a Path,
+    options: &'a Options,
     is_set: &'a dyn Fn(&str) -> bool,
+    depth: usize,
+    skip: u32,
 }
 
 /// Evaluates a test expression. `dbl` selects `[[ ]]` rules.
 pub(crate) fn eval(
-    toks: &[Tok],
+    toks: &[Tok<'_>],
     dbl: bool,
     cwd: &Path,
+    options: &Options,
     is_set: &dyn Fn(&str) -> bool,
 ) -> Result<bool, String> {
     if toks.is_empty() {
@@ -58,7 +66,10 @@ pub(crate) fn eval(
         pos: 0,
         dbl,
         cwd,
+        options,
         is_set,
+        depth: 0,
+        skip: 0,
     };
     let v = e.or()?;
     match e.toks.get(e.pos) {
@@ -67,7 +78,19 @@ pub(crate) fn eval(
     }
 }
 
-impl Eval<'_> {
+impl Eval<'_, '_> {
+    fn enter(&mut self) -> Result<(), String> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            return Err("expression nesting is too deep".into());
+        }
+        Ok(())
+    }
+
+    fn leave(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
+    }
+
     fn is_op(&self, i: usize, text: &str) -> bool {
         self.toks.get(i).is_some_and(|t| t.op && t.text == text)
     }
@@ -77,8 +100,15 @@ impl Eval<'_> {
         let mut v = self.and()?;
         while self.is_op(self.pos, op) && self.pos + 1 < self.toks.len() {
             self.pos += 1;
-            let r = self.and()?;
-            v = v || r;
+            if self.dbl && v {
+                self.skip += 1;
+                let r = self.and();
+                self.skip -= 1;
+                r?;
+            } else {
+                let r = self.and()?;
+                v = v || r;
+            }
         }
         Ok(v)
     }
@@ -88,8 +118,15 @@ impl Eval<'_> {
         let mut v = self.not()?;
         while self.is_op(self.pos, op) && self.pos + 1 < self.toks.len() {
             self.pos += 1;
-            let r = self.not()?;
-            v = v && r;
+            if self.dbl && !v {
+                self.skip += 1;
+                let r = self.not();
+                self.skip -= 1;
+                r?;
+            } else {
+                let r = self.not()?;
+                v = v && r;
+            }
         }
         Ok(v)
     }
@@ -97,7 +134,10 @@ impl Eval<'_> {
     fn not(&mut self) -> Result<bool, String> {
         if self.is_op(self.pos, "!") && self.pos + 1 < self.toks.len() {
             self.pos += 1;
-            return Ok(!self.not()?);
+            self.enter()?;
+            let res = self.not();
+            self.leave();
+            return Ok(!res?);
         }
         self.primary()
     }
@@ -109,7 +149,10 @@ impl Eval<'_> {
         if tok.op && tok.text == "(" && self.pos + 1 < self.toks.len() {
             let save = self.pos;
             self.pos += 1;
-            let v = self.or()?;
+            self.enter()?;
+            let v = self.or();
+            self.leave();
+            let v = v?;
             if self.is_op(self.pos, ")") {
                 self.pos += 1;
                 return Ok(v);
@@ -120,34 +163,38 @@ impl Eval<'_> {
             self.pos = save;
         }
         if let (Some(op), Some(rhs)) = (self.toks.get(self.pos + 1), self.toks.get(self.pos + 2)) {
-            if op.op && BINARY.contains(&op.text.as_str()) && (self.dbl || op.text != "=~") {
-                let (lhs, op, rhs) = (tok.clone(), op.text.clone(), rhs.clone());
+            if op.op && BINARY.contains(&op.text.as_ref()) && (self.dbl || op.text != "=~") {
                 self.pos += 3;
-                return self.binary(&lhs, &op, &rhs);
+                if self.skip > 0 {
+                    return Ok(false);
+                }
+                return self.binary(tok, op.text.as_ref(), rhs);
             }
         }
-        if tok.op && UNARY.contains(&tok.text.as_str()) {
+        if tok.op && UNARY.contains(&tok.text.as_ref()) {
             if let Some(arg) = self.toks.get(self.pos + 1) {
-                let (op, arg) = (tok.text.clone(), arg.text.clone());
                 self.pos += 2;
-                return self.unary(&op, &arg);
+                if self.skip > 0 {
+                    return Ok(false);
+                }
+                return self.unary(tok.text.as_ref(), arg.text.as_ref());
             }
         }
         self.pos += 1;
-        Ok(!tok.text.is_empty())
+        Ok(self.skip == 0 && !tok.text.is_empty())
     }
 
     #[allow(
         clippy::many_single_char_names,
         reason = "a and b are the two operands"
     )]
-    fn binary(&self, lhs: &Tok, op: &str, rhs: &Tok) -> Result<bool, String> {
+    fn binary(&self, lhs: &Tok<'_>, op: &str, rhs: &Tok<'_>) -> Result<bool, String> {
         let int = |s: &str| {
             s.trim()
                 .parse::<i64>()
                 .map_err(|_| format!("{s}: integer expression expected"))
         };
-        let (a, b) = (lhs.text.as_str(), rhs.text.as_str());
+        let (a, b) = (lhs.text.as_ref(), rhs.text.as_ref());
         Ok(match op {
             "=" | "==" if self.dbl => glob::matches(rhs.pattern.as_deref().unwrap_or(b), a),
             "!=" if self.dbl => !glob::matches(rhs.pattern.as_deref().unwrap_or(b), a),
@@ -195,27 +242,27 @@ impl Eval<'_> {
             "-L" | "-h" => {
                 std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink())
             }
-            "-r" | "-w" | "-x" => meta().is_some_and(|m| access(&m, op)),
+            "-r" | "-w" | "-x" => access(&path, op),
             "-t" => match arg.trim() {
                 "0" => std::io::stdin().is_terminal(),
                 "1" => std::io::stdout().is_terminal(),
                 "2" => std::io::stderr().is_terminal(),
                 _ => false,
             },
-            "-o" => crate::state::Options::default().get(arg).is_some(),
+            "-o" => self.options.get(arg).unwrap_or(false),
             _ => meta().is_some_and(|m| special(&m, op)),
         })
     }
 }
 
-fn access(m: &std::fs::Metadata, op: &str) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = m.permissions().mode();
-    match op {
-        "-r" => mode & 0o444 != 0,
-        "-w" => mode & 0o222 != 0 && !m.permissions().readonly(),
-        _ => mode & 0o111 != 0,
-    }
+fn access(path: &Path, op: &str) -> bool {
+    use rustix::fs::Access;
+    let mode = match op {
+        "-r" => Access::READ_OK,
+        "-w" => Access::WRITE_OK,
+        _ => Access::EXEC_OK,
+    };
+    rustix::fs::access(path, mode).is_ok()
 }
 
 fn special(m: &std::fs::Metadata, op: &str) -> bool {
@@ -247,8 +294,10 @@ mod tests {
     use super::*;
 
     fn run(args: &[&str]) -> Result<bool, String> {
-        let toks: Vec<Tok> = args.iter().map(|a| Tok::plain(a)).collect();
-        eval(&toks, false, Path::new("/"), &|n| n == "SET")
+        let toks: Vec<Tok<'_>> = args.iter().map(|a| Tok::plain(a)).collect();
+        eval(&toks, false, Path::new("/"), &Options::default(), &|n| {
+            n == "SET"
+        })
     }
 
     #[test]
@@ -284,30 +333,94 @@ mod tests {
             Tok::plain("main.rs"),
             Tok::plain("=="),
             Tok {
-                text: "*.rs".into(),
+                text: Cow::Borrowed("*.rs"),
                 op: false,
-                pattern: Some("*.rs".into()),
+                pattern: Some(Cow::Borrowed("*.rs")),
             },
             Tok::plain("&&"),
             Tok::plain("abc"),
             Tok::plain("=~"),
             Tok {
-                text: "^a.c$".into(),
+                text: Cow::Borrowed("^a.c$"),
                 op: false,
                 pattern: None,
             },
         ];
-        assert!(eval(&toks, true, Path::new("/"), &|_| false)?);
+        assert!(eval(
+            &toks,
+            true,
+            Path::new("/"),
+            &Options::default(),
+            &|_| false
+        )?);
         let quoted = vec![
             Tok::plain("main.rs"),
             Tok::plain("=="),
             Tok {
-                text: "*.rs".into(),
+                text: Cow::Borrowed("*.rs"),
                 op: false,
-                pattern: Some("\\*.rs".into()),
+                pattern: Some(Cow::Borrowed("\\*.rs")),
             },
         ];
-        assert!(!eval(&quoted, true, Path::new("/"), &|_| false)?);
+        assert!(!eval(
+            &quoted,
+            true,
+            Path::new("/"),
+            &Options::default(),
+            &|_| false
+        )?);
+        let sc_or = vec![
+            Tok::plain("x"),
+            Tok::plain("||"),
+            Tok::plain("a"),
+            Tok::plain("=~"),
+            Tok::plain("("),
+        ];
+        assert!(eval(
+            &sc_or,
+            true,
+            Path::new("/"),
+            &Options::default(),
+            &|_| false
+        )?);
+        let sc_and = vec![
+            Tok::plain(""),
+            Tok::plain("&&"),
+            Tok::plain("a"),
+            Tok::plain("-eq"),
+            Tok::plain("1"),
+        ];
+        assert!(!eval(
+            &sc_and,
+            true,
+            Path::new("/"),
+            &Options::default(),
+            &|_| false
+        )?);
+        let mut opts = Options::default();
+        assert!(!eval(
+            &[Tok::plain("-o"), Tok::plain("errexit")],
+            false,
+            Path::new("/"),
+            &opts,
+            &|_| false
+        )?);
+        opts.errexit = true;
+        assert!(eval(
+            &[Tok::plain("-o"), Tok::plain("errexit")],
+            false,
+            Path::new("/"),
+            &opts,
+            &|_| false
+        )?);
+        let mut deep: Vec<Tok<'_>> = (0..100).map(|_| Tok::plain("!")).collect();
+        deep.push(Tok::plain("x"));
+        assert!(
+            eval(&deep, false, Path::new("/"), &Options::default(), &|_| {
+                false
+            })
+            .is_err()
+        );
         Ok(())
     }
 }

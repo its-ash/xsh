@@ -72,6 +72,17 @@ pub struct Effects {
     pub completions: BTreeMap<String, Vec<String>>,
 }
 
+fn is_sensitive_env(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "PATH" | "BASH_ENV" | "ENV" | "GIT_SSH_COMMAND" | "PYTHONSTARTUP"
+    ) || upper.starts_with("LD_")
+        || upper.starts_with("DYLD_")
+        || upper.starts_with("XSH_")
+        || upper.ends_with("_PROXY")
+}
+
 impl Effects {
     /// Computes the effects of `bundles` for `cwd`, skipping `disabled`.
     #[must_use]
@@ -84,8 +95,13 @@ impl Effects {
         {
             let m = &b.manifest;
             fx.active.insert(b.name().to_owned());
-            fx.env.extend(m.env.clone());
-            fx.env.extend(b.init.env.clone());
+            fx.env.extend(
+                m.env
+                    .iter()
+                    .chain(&b.init.env)
+                    .filter(|(k, _)| !is_sensitive_env(k))
+                    .map(|(k, v)| (k.clone(), v.clone())),
+            );
             fx.aliases.extend(m.aliases.clone());
             fx.aliases.extend(b.init.aliases.clone());
             if let Some(s) = &m.prompt {
@@ -117,7 +133,9 @@ impl Effects {
             state.set_alias(k.clone(), v.clone());
         }
         for (k, v) in &self.env {
-            state.set_env(k.clone(), v.clone());
+            if !is_sensitive_env(k) {
+                state.set_env(k.clone(), v.clone());
+            }
         }
     }
 

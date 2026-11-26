@@ -167,6 +167,16 @@ final class Pane: NSView, LocalProcessTerminalViewDelegate {
     /// `surface.isUsingMetalRenderer`.
     private var pendingGPU: Bool?
     private var scrollback: Int?
+    private var palette = Palette(
+        background: .textBackgroundColor,
+        foreground: .textColor,
+        cursor: .textColor,
+        selection: .selectedTextBackgroundColor,
+        ansi: nil)
+    private var opacity: CGFloat = 1
+    private var padding: CGFloat = 0
+    private var appliedAnsi: [String] = []
+    private var appliedCursor = ""
     private(set) var title = ""
     private(set) var exited = false
     weak var owner: TerminalWindow?
@@ -266,7 +276,8 @@ final class Pane: NSView, LocalProcessTerminalViewDelegate {
     func apply() {
         let s = Store.shared
         let p = Palette.current(profile: profile)
-        let opacity = CGFloat(min(max(s.int("window.opacity"), 10), 100)) / 100
+        let newOpacity = CGFloat(min(max(s.int("window.opacity"), 10), 100)) / 100
+        let newPadding = CGFloat(s.int("window.padding"))
         let t = surface
 
         let newFont = Fonts.make(profile: profile)
@@ -281,17 +292,30 @@ final class Pane: NSView, LocalProcessTerminalViewDelegate {
         t.customBlockGlyphs = s.bool("font.custom_block_glyphs")
         t.minimumContrastRatio = CGFloat(max(s.int("font.min_contrast"), 1))
 
+        palette = p
+        opacity = newOpacity
+        let padChanged = newPadding != padding
+        padding = newPadding
+
         t.nativeForegroundColor = p.foreground
-        t.nativeBackgroundColor = p.background.withAlphaComponent(opacity)
+        t.nativeBackgroundColor = p.background.withAlphaComponent(newOpacity)
         t.caretColor = p.cursor
         t.selectedTextBackgroundColor = p.selection
-        if let a = p.ansi { t.installColors(a) }
+        if let a = p.ansi, p.ansiHex != appliedAnsi {
+            t.installColors(a)
+            appliedAnsi = p.ansiHex
+        }
 
         let blink = s.bool("terminal.cursor_blink")
-        switch s.string("terminal.cursor_style") {
-        case "underline": t.setCursorStyle(blink ? .blinkUnderline : .steadyUnderline)
-        case "bar": t.setCursorStyle(blink ? .blinkBar : .steadyBar)
-        default: t.setCursorStyle(blink ? .blinkBlock : .steadyBlock)
+        let style = s.string("terminal.cursor_style")
+        let cursorKey = "\(style):\(blink)"
+        if cursorKey != appliedCursor {
+            switch style {
+            case "underline": t.setCursorStyle(blink ? .blinkUnderline : .steadyUnderline)
+            case "bar": t.setCursorStyle(blink ? .blinkBar : .steadyBar)
+            default: t.setCursorStyle(blink ? .blinkBlock : .steadyBlock)
+            }
+            appliedCursor = cursorKey
         }
         t.optionAsMetaKey = s.bool("terminal.option_as_meta")
         t.allowMouseReporting = s.bool("terminal.mouse_reporting")
@@ -311,12 +335,15 @@ final class Pane: NSView, LocalProcessTerminalViewDelegate {
             if scrollback != nil { t.changeScrollback(lines > 0 ? lines : nil) }
             scrollback = lines
         }
-        pendingGPU = s.bool("terminal.gpu")
-        applyGPU()
+        let gpu = s.bool("terminal.gpu")
+        if window == nil || gpu != surface.isUsingMetalRenderer || pendingGPU != nil {
+            pendingGPU = gpu
+            applyGPU()
+        }
         layer?.backgroundColor = NSColor.clear.cgColor
         updateDim()
         updateHeader()
-        needsLayout = true
+        if padChanged { needsLayout = true }
         needsDisplay = true
     }
 
@@ -328,9 +355,9 @@ final class Pane: NSView, LocalProcessTerminalViewDelegate {
     /// pane's pixels per keystroke, a cost that only shows at large sizes.
     private func applyGPU() {
         guard window != nil, let gpu = pendingGPU else { return }
-        pendingGPU = nil
         do {
             try surface.setUseMetal(gpu)
+            pendingGPU = nil
         } catch let error {
             let detail = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
             NSLog("%@", "xsh: GPU rendering unavailable: \(detail)")
@@ -351,16 +378,17 @@ final class Pane: NSView, LocalProcessTerminalViewDelegate {
 
     private func updateHeader() {
         guard showsHeader else { return }
-        let folder = cwd.map { ($0 as NSString).abbreviatingWithTildeInPath }
-        header.label.stringValue = title.isEmpty ? folder ?? "xsh" : title
-        let color = Palette.current(profile: profile).foreground.withAlphaComponent(focused ? 1 : 0.55)
+        header.label.stringValue = title.isEmpty
+            ? (cwd.map { ($0 as NSString).abbreviatingWithTildeInPath } ?? "xsh")
+            : title
+        let color = palette.foreground.withAlphaComponent(focused ? 1 : 0.55)
         header.label.textColor = color
         header.closeButton.contentTintColor = color
     }
 
     override func layout() {
         super.layout()
-        let pad = CGFloat(Store.shared.int("window.padding"))
+        let pad = padding
         let top = showsHeader ? max(PaneHeader.height, pad) : pad
         surface.frame = NSRect(
             x: pad,
@@ -374,8 +402,7 @@ final class Pane: NSView, LocalProcessTerminalViewDelegate {
     /// Paints only the padding: the terminal paints its own background, and
     /// two layers of a translucent color would look darker.
     override func draw(_ dirtyRect: NSRect) {
-        let opacity = CGFloat(min(max(Store.shared.int("window.opacity"), 10), 100)) / 100
-        Palette.current(profile: profile).background.withAlphaComponent(opacity).setFill()
+        palette.background.withAlphaComponent(opacity).setFill()
         let ring = NSBezierPath(rect: bounds)
         ring.append(NSBezierPath(rect: surface.frame))
         ring.windingRule = .evenOdd
@@ -386,8 +413,15 @@ final class Pane: NSView, LocalProcessTerminalViewDelegate {
         oscObservation = nil
         if !exited { surface.terminate() }
         surface.processDelegate = nil
-        surface.updateUiClosed()
+        Self.closeUi(surface, tries: 100)
         removeFromSuperview()
+    }
+
+    /// `updateUiClosed()` fails while GPU work is in flight and must then be
+    /// retried, or the Metal renderer and its render loop stay alive.
+    private static func closeUi(_ surface: Surface, tries: Int) {
+        guard !surface.updateUiClosed(), tries > 0 else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { closeUi(surface, tries: tries - 1) }
     }
 
     // MARK: LocalProcessTerminalViewDelegate

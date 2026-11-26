@@ -164,10 +164,11 @@ pub async fn import(app: &mut App) {
             return;
         };
         let doc = json!({ "sha256": sum, "shell": shell, "env": env, "aliases": aliases });
-        let tmp = path.with_extension("tmp");
-        let saved = std::fs::create_dir_all(app.paths.data_dir())
-            .and_then(|()| std::fs::write(&tmp, doc.to_string()))
-            .and_then(|()| std::fs::rename(&tmp, &path));
+        let saved = std::fs::create_dir_all(app.paths.data_dir()).and_then(|()| {
+            let mut tmp = tempfile::NamedTempFile::new_in(app.paths.data_dir())?;
+            std::io::Write::write_all(&mut tmp, doc.to_string().as_bytes())?;
+            tmp.persist(&path).map(|_| ()).map_err(|e| e.error)
+        });
         if let Err(e) = saved {
             eprintln!("xsh: {}: {e}", path.display());
         }

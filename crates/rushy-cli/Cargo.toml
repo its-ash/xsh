@@ -24,16 +24,22 @@ rushy-history = { path = "../rushy-history" }
 rushy-pty = { path = "../rushy-pty" }
 rushy-tui = { path = "../rushy-tui" }
 chrono.workspace = true
+base64.workspace = true
 globset.workspace = true
+hex.workspace = true
+portable-pty.workspace = true
+rand.workspace = true
 reedline.workspace = true
 reqwest.workspace = true
+rustix.workspace = true
 semver.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 toml_edit.workspace = true
+url.workspace = true
+zeroize.workspace = true
 nu-ansi-term = "0.50"
 
 [dev-dependencies]
-hex.workspace = true
-tempfile.workspace = true

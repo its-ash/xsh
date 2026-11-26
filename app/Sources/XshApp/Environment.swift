@@ -11,10 +11,41 @@ enum Session {
         return "/bin/zsh"
     }()
 
-    /// `PATH` of a login shell. An app that starts from Finder only gets a
-    /// short system `PATH`, so Homebrew and similar tools would be missing.
-    static let loginPath: String = {
-        let fallback = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    private static let pathLock = NSLock()
+    private static let pathGroup = DispatchGroup()
+    private static var pathStarted = false
+    private static var cachedLoginPath: String?
+    private static var pathCacheKey: String { "xsh.loginPath.\(loginShell)" }
+
+    /// Starts resolving the login shell `PATH` in the background. Uses the cached
+    /// `PATH` from earlier launches immediately so the first window never stalls.
+    static func warmLoginPath() {
+        pathLock.lock()
+        if pathStarted {
+            pathLock.unlock()
+            return
+        }
+        pathStarted = true
+        if let saved = UserDefaults.standard.string(forKey: pathCacheKey), !saved.isEmpty {
+            cachedLoginPath = saved
+        }
+        let needsWait = cachedLoginPath == nil
+        if needsWait { pathGroup.enter() }
+        pathLock.unlock()
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let fresh = fetchLoginPath()
+            pathLock.lock()
+            if let fresh, !fresh.isEmpty {
+                cachedLoginPath = fresh
+                UserDefaults.standard.set(fresh, forKey: pathCacheKey)
+            }
+            pathLock.unlock()
+            if needsWait { pathGroup.leave() }
+        }
+    }
+
+    private static func fetchLoginPath() -> String? {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: loginShell)
         p.arguments = ["-lc", "printf %s \"$PATH\""]
@@ -22,14 +53,43 @@ enum Session {
         p.standardOutput = out
         p.standardError = FileHandle.nullDevice
         p.standardInput = FileHandle.nullDevice
-        guard (try? p.run()) != nil else { return fallback }
-        // A slow profile must not hold the first window for long.
-        DispatchQueue.global().asyncAfter(deadline: .now() + 2) { if p.isRunning { p.terminate() } }
-        let data = out.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
+        guard (try? p.run()) != nil else { return nil }
+        var data = Data()
+        let done = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            data = out.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+            done.signal()
+        }
+        if done.wait(timeout: .now() + 2) == .timedOut {
+            if p.isRunning { p.terminate() }
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.5) {
+                if p.isRunning { kill(p.processIdentifier, SIGKILL) }
+            }
+            return nil
+        }
         let text = String(decoding: data, as: UTF8.self)
-        return p.terminationStatus == 0 && !text.isEmpty ? text : fallback
-    }()
+        return p.terminationStatus == 0 && !text.isEmpty ? text : nil
+    }
+
+    /// `PATH` of a login shell. An app that starts from Finder only gets a
+    /// short system `PATH`, so Homebrew and similar tools would be missing.
+    static var loginPath: String {
+        warmLoginPath()
+        pathLock.lock()
+        if let path = cachedLoginPath {
+            pathLock.unlock()
+            return path
+        }
+        pathLock.unlock()
+        _ = pathGroup.wait(timeout: .now() + 2)
+        pathLock.lock()
+        let path = cachedLoginPath
+        pathLock.unlock()
+        return path
+            ?? ProcessInfo.processInfo.environment["PATH"]
+            ?? "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    }
 
     /// Only a program with this token can ask for an agent pane. Text that a
     /// program prints, such as a file or the output of `ssh`, does not have it.
@@ -45,7 +105,10 @@ enum Session {
         env["TERM_PROGRAM"] = "xsh"
         env["TERM_PROGRAM_VERSION"] = Store.shared.version
         env["SHELL"] = env["SHELL"] ?? loginShell
-        if env["LANG"] == nil { env["LANG"] = Locale.current.identifier + ".UTF-8" }
+        if env["LANG"] == nil {
+            let base = Locale.current.identifier.split(separator: "@", maxSplits: 1).first.map(String.init) ?? "en_US"
+            env["LANG"] = (base.isEmpty ? "en_US" : base) + ".UTF-8"
+        }
         // The `xsh` of this app comes first: an older copy can be on the `PATH`.
         env["PATH"] = XshCLI.binary.deletingLastPathComponent().path + ":" + loginPath
         for pair in Store.shared.strings("terminal.env") + extra {

@@ -25,11 +25,12 @@ use std::path::Path;
 
 use serde::Deserialize;
 use url::Url;
+use zeroize::Zeroize as _;
 
 use crate::{Error, Result};
 
 /// Default Anthropic model.
-pub const ANTHROPIC_MODEL: &str = "claude-opus-5-5";
+pub const ANTHROPIC_MODEL: &str = "claude-sonnet-4-20250514";
 /// Default OpenAI model.
 pub const OPENAI_MODEL: &str = "gpt-4o-mini";
 /// Default Ollama model.
@@ -41,13 +42,12 @@ pub const OLLAMA_MODEL: &str = "llama3.1:8b";
 pub fn known_models(provider: &str) -> &'static [&'static str] {
     match provider {
         "anthropic" => &[
-            "claude-opus-5-5",
-            "claude-sonnet-5-5",
-            "claude-haiku-5-5",
-            "claude-fable-5-1",
-            "claude-opus-4-1",
-            "claude-sonnet-4-5",
-            "claude-haiku-4-5",
+            "claude-sonnet-4-20250514",
+            "claude-opus-4-20250514",
+            "claude-haiku-4-5-20251001",
+            "claude-3-7-sonnet-20250219",
+            "claude-3-5-sonnet-20241022",
+            "claude-3-5-haiku-20241022",
         ],
         "openai" => &[
             "gpt-5",
@@ -64,9 +64,16 @@ pub fn known_models(provider: &str) -> &'static [&'static str] {
     }
 }
 
-/// A secret string that never appears in `Debug` or `Display` output.
+/// A secret string that never appears in `Debug` or `Display` output and is
+/// zeroized on drop.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Secret(String);
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
 
 impl Secret {
     /// Wraps a secret.

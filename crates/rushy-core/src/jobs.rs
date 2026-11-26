@@ -315,7 +315,13 @@ impl JobTable {
             let code = match (p.status, &mut p.kind) {
                 (Some(s), _) => Some(s),
                 (None, Kind::Child(c)) => tokio::select! {
-                    s = c.wait() => Some(exit_code(s?)),
+                    s = c.wait() => match s {
+                        Ok(st) => Some(exit_code(st)),
+                        Err(e) => {
+                            fg.set(Vec::new());
+                            return Err(e);
+                        }
+                    },
                     () = fg.stopped() => None,
                 },
                 (None, Kind::Task { handle, .. }) => Some(handle.await.unwrap_or(1)),

@@ -5,6 +5,8 @@
 //! `\d \w \s \D \W \S` and `\` before any other character.
 
 const MAX_STEPS: usize = 1_000_000;
+const MAX_PARSE_DEPTH: usize = 64;
+const MAX_MATCH_DEPTH: usize = 1024;
 
 #[derive(Debug, Clone)]
 enum Node {
@@ -37,6 +39,7 @@ enum Item {
 struct Parser {
     s: Vec<char>,
     pos: usize,
+    depth: usize,
 }
 
 impl Parser {
@@ -45,12 +48,20 @@ impl Parser {
     }
 
     fn alt(&mut self) -> Result<Vec<Vec<Node>>, String> {
-        let mut alts = vec![self.seq()?];
-        while self.peek() == Some('|') {
-            self.pos += 1;
-            alts.push(self.seq()?);
+        self.depth += 1;
+        if self.depth > MAX_PARSE_DEPTH {
+            return Err("regex: nesting is too deep".into());
         }
-        Ok(alts)
+        let res = (|| {
+            let mut alts = vec![self.seq()?];
+            while self.peek() == Some('|') {
+                self.pos += 1;
+                alts.push(self.seq()?);
+            }
+            Ok(alts)
+        })();
+        self.depth -= 1;
+        res
     }
 
     fn seq(&mut self) -> Result<Vec<Node>, String> {
@@ -98,7 +109,7 @@ impl Parser {
                 Some('*') => (0, None),
                 Some('+') => (1, None),
                 Some('?') => (0, Some(1)),
-                Some('{') => match self.braces() {
+                Some('{') => match self.braces()? {
                     Some(r) => r,
                     None => return Ok(node),
                 },
@@ -117,20 +128,31 @@ impl Parser {
     }
 
     /// Parses `{m}`, `{m,}`, or `{m,n}`; leaves the cursor on `}`.
-    fn braces(&mut self) -> Option<(usize, Option<usize>)> {
-        let rest: String = self.s.get(self.pos + 1..)?.iter().collect();
-        let end = rest.find('}')?;
-        let body = &rest[..end];
-        let (min, max) = match body.split_once(',') {
-            None => {
-                let n = body.parse().ok()?;
-                (n, Some(n))
-            }
-            Some((a, "")) => (a.parse().ok()?, None),
-            Some((a, b)) => (a.parse().ok()?, Some(b.parse().ok()?)),
+    fn braces(&mut self) -> Result<Option<(usize, Option<usize>)>, String> {
+        let Some(tail) = self.s.get(self.pos + 1..) else {
+            return Ok(None);
         };
+        let rest: String = tail.iter().collect();
+        let Some(end) = rest.find('}') else {
+            return Ok(None);
+        };
+        let body = &rest[..end];
+        let parsed = match body.split_once(',') {
+            None => body.parse().ok().map(|n| (n, Some(n))),
+            Some((a, "")) => a.parse().ok().map(|n| (n, None)),
+            Some((a, b)) => match (a.parse().ok(), b.parse().ok()) {
+                (Some(min), Some(max)) => Some((min, Some(max))),
+                _ => None,
+            },
+        };
+        let Some((min, max)) = parsed else {
+            return Ok(None);
+        };
+        if max.is_some_and(|mx| min > mx) {
+            return Err("regex: invalid repetition bounds".into());
+        }
         self.pos += 1 + body.chars().count();
-        Some((min, max))
+        Ok(Some((min, max)))
     }
 
     fn class(&mut self) -> Result<Node, String> {
@@ -220,6 +242,7 @@ fn item_matches(item: &Item, c: char) -> bool {
 struct Matcher<'a> {
     text: &'a [char],
     steps: usize,
+    depth: usize,
 }
 
 impl Matcher<'_> {
@@ -231,24 +254,27 @@ impl Matcher<'_> {
         k: &mut dyn FnMut(&mut Self, usize) -> bool,
     ) -> bool {
         self.steps += 1;
-        if self.steps > MAX_STEPS {
+        if self.steps > MAX_STEPS || self.depth >= MAX_MATCH_DEPTH {
             return false;
         }
-        let Some((first, rest)) = nodes.split_first() else {
-            return k(self, i);
-        };
-        match first {
-            Node::Start => i == 0 && self.seq(rest, i, k),
-            Node::End => i == self.text.len() && self.seq(rest, i, k),
-            Node::Group(alts) => alts
-                .iter()
-                .any(|alt| self.seq(alt, i, &mut |m: &mut Self, j| m.seq(rest, j, k))),
-            Node::Repeat { node, min, max } => self.repeat(node, *min, *max, 0, i, rest, k),
-            single => match self.text.get(i) {
-                Some(&c) if single_matches(single, c) => self.seq(rest, i + 1, k),
-                _ => false,
+        self.depth += 1;
+        let matched = match nodes.split_first() {
+            None => k(self, i),
+            Some((first, rest)) => match first {
+                Node::Start => i == 0 && self.seq(rest, i, k),
+                Node::End => i == self.text.len() && self.seq(rest, i, k),
+                Node::Group(alts) => alts
+                    .iter()
+                    .any(|alt| self.seq(alt, i, &mut |m: &mut Self, j| m.seq(rest, j, k))),
+                Node::Repeat { node, min, max } => self.repeat(node, *min, *max, 0, i, rest, k),
+                single => match self.text.get(i) {
+                    Some(&c) if single_matches(single, c) => self.seq(rest, i + 1, k),
+                    _ => false,
+                },
             },
-        }
+        };
+        self.depth -= 1;
+        matched
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -262,15 +288,27 @@ impl Matcher<'_> {
         rest: &[Node],
         k: &mut dyn FnMut(&mut Self, usize) -> bool,
     ) -> bool {
-        if max.is_none_or(|m| count < m) {
-            let more = self.seq(std::slice::from_ref(node), i, &mut |m: &mut Self, j| {
-                j != i && m.repeat(node, min, max, count + 1, j, rest, k)
-            });
-            if more {
-                return true;
-            }
+        if self.depth >= MAX_MATCH_DEPTH {
+            return false;
         }
-        count >= min && self.seq(rest, i, k)
+        self.depth += 1;
+        let matched = 'try_match: {
+            if max.is_none_or(|m| count < m) {
+                let more = self.seq(std::slice::from_ref(node), i, &mut |m: &mut Self, j| {
+                    if j == i {
+                        m.seq(rest, i, k)
+                    } else {
+                        m.repeat(node, min, max, count + 1, j, rest, k)
+                    }
+                });
+                if more {
+                    break 'try_match true;
+                }
+            }
+            count >= min && self.seq(rest, i, k)
+        };
+        self.depth -= 1;
+        matched
     }
 }
 
@@ -288,6 +326,7 @@ pub(crate) fn is_match(re: &str, text: &str) -> Result<bool, String> {
     let mut p = Parser {
         s: re.chars().collect(),
         pos: 0,
+        depth: 0,
     };
     let alts = p.alt()?;
     if p.pos < p.s.len() {
@@ -298,6 +337,7 @@ pub(crate) fn is_match(re: &str, text: &str) -> Result<bool, String> {
     let mut m = Matcher {
         text: &chars,
         steps: 0,
+        depth: 0,
     };
     Ok((0..=chars.len()).any(|start| m.seq(&prog, start, &mut |_, _| true)))
 }
@@ -331,6 +371,13 @@ mod tests {
         }
         assert!(is_match("(", "x").is_err());
         assert!(is_match("*a", "x").is_err());
+        assert!(is_match("a{5,2}", "aaa").is_err());
+        assert!(is_match("^(a?){2}$", "")?);
+        assert!(is_match("^(a?){2}$", "a")?);
+        assert!(is_match("^(a?){2}$", "aa")?);
+        assert!(!is_match("^(a?){2}$", "aaa")?);
+        let deep = format!("{}a{}", "(".repeat(100), ")".repeat(100));
+        assert!(is_match(&deep, "a").is_err());
         Ok(())
     }
 }

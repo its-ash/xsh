@@ -18,7 +18,6 @@ enum Updater {
         guard Store.shared.bool("updates.auto_check"), !isDevBuild,
               Date().timeIntervalSince(last) >= checkInterval
         else { return }
-        d.set(Date(), forKey: lastCheckKey)
         check(manual: false)
     }
 
@@ -31,6 +30,7 @@ enum Updater {
                     if manual { show("Cannot check for updates", r.err) }
                     return
                 }
+                UserDefaults.standard.set(Date(), forKey: lastCheckKey)
                 if v["update"] as? Bool == true, let version = v["latest"] as? String {
                     offer(version, notes: v["notes"] as? String ?? "")
                 } else if manual {
@@ -66,7 +66,7 @@ enum Updater {
         }
         NSApp.dockTile.badgeLabel = "↓"
         DispatchQueue.global().async {
-            let r = XshCLI.run(["app", "update-download", version])
+            let r = XshCLI.run(["app", "update-download", version], timeout: 15 * 60)
             let v = (try? JSONSerialization.jsonObject(with: r.out)) as? [String: Any]
             DispatchQueue.main.async {
                 NSApp.dockTile.badgeLabel = nil
@@ -83,7 +83,12 @@ enum Updater {
     /// the result. If the swap fails, the old app comes back.
     private static func replaceAndRestart(with newApp: String) {
         let script = """
-        while kill -0 "$1" 2>/dev/null; do sleep 0.2; done
+        i=0
+        while kill -0 "$1" 2>/dev/null; do
+            i=$((i + 1))
+            [ "$i" -ge 150 ] && exit 1
+            sleep 0.2
+        done
         old="$3.old.$$"
         if mv "$3" "$old"; then
             if mv "$2" "$3"; then rm -rf "$old"; else mv "$old" "$3"; fi

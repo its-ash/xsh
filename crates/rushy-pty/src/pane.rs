@@ -12,6 +12,7 @@ use crate::{Error, Result};
 
 const SCROLLBACK: usize = 2_000;
 const READ_CHUNK: usize = 8_192;
+const INPUT_QUEUE: usize = 512;
 /// Widest pane; larger requests are clamped to keep the emulator's screen small.
 pub(crate) const MAX_COLS: u16 = 2_000;
 /// Tallest pane; larger requests are clamped to keep the emulator's screen small.
@@ -89,7 +90,7 @@ pub struct Pane {
     pub id: PaneId,
     /// PTY master, used for resizing.
     pub pty: Box<dyn MasterPty + Send>,
-    input: mpsc::Sender<Vec<u8>>,
+    input: mpsc::SyncSender<Vec<u8>>,
     killer: Box<dyn ChildKiller + Send + Sync>,
     screen: Arc<Mutex<vt100::Parser>>,
     size: (u16, u16),
@@ -138,11 +139,25 @@ impl Pane {
         let mut child = pair.slave.spawn_command(builder).map_err(pty_err)?;
         drop(pair.slave);
         let killer = child.clone_killer();
-        let mut reader = pair.master.try_clone_reader().map_err(pty_err)?;
-        let mut writer = pair.master.take_writer().map_err(pty_err)?;
+        let mut reader = match pair.master.try_clone_reader() {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(pty_err(e));
+            }
+        };
+        let mut writer = match pair.master.take_writer() {
+            Ok(w) => w,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(pty_err(e));
+            }
+        };
         let screen = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK)));
 
-        let (input, input_rx) = mpsc::channel::<Vec<u8>>();
+        let (input, input_rx) = mpsc::sync_channel::<Vec<u8>>(INPUT_QUEUE);
         std::thread::spawn(move || {
             while let Ok(bytes) = input_rx.recv() {
                 if writer
@@ -193,7 +208,7 @@ impl Pane {
 
     /// Queues bytes for the child's input.
     pub fn write(&self, bytes: &[u8]) {
-        let _ = self.input.send(bytes.to_vec());
+        let _ = self.input.try_send(bytes.to_vec());
     }
 
     /// Resizes the PTY and the emulator; the child receives `SIGWINCH`.
@@ -206,16 +221,20 @@ impl Pane {
         if self.size == (cols, rows) {
             return Ok(());
         }
-        self.pty
-            .resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(pty_err)?;
+        let prev = self.size;
         if let Ok(mut p) = self.screen.lock() {
             p.set_size(rows, cols);
+        }
+        if let Err(e) = self.pty.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        }) {
+            if let Ok(mut p) = self.screen.lock() {
+                p.set_size(prev.1, prev.0);
+            }
+            return Err(pty_err(e));
         }
         self.size = (cols, rows);
         Ok(())

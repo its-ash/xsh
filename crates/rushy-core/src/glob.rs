@@ -27,9 +27,66 @@ enum ClassItem {
     Named(String),
 }
 
+/// A precompiled shell glob pattern for repeated matching.
+#[derive(Debug, Clone)]
+pub(crate) struct Compiled {
+    ops: Vec<P>,
+    literal: Option<String>,
+    ascii_simple: bool,
+}
+
+impl Compiled {
+    /// Compiles `pat` once for reuse across many candidate strings.
+    pub(crate) fn new(pat: &str) -> Self {
+        let ops = compile(pat);
+        let literal = ops.iter().all(|p| matches!(p, P::Ch(_))).then(|| {
+            ops.iter()
+                .filter_map(|p| match p {
+                    P::Ch(c) => Some(*c),
+                    _ => None,
+                })
+                .collect()
+        });
+        let ascii_simple = ops.iter().all(|p| match p {
+            P::Ch(c) => c.is_ascii(),
+            P::Any | P::Star => true,
+            P::Class { .. } => false,
+        });
+        Self {
+            ops,
+            literal,
+            ascii_simple,
+        }
+    }
+
+    /// Plain literal text if the pattern contains no active wildcards or classes.
+    pub(crate) fn as_literal(&self) -> Option<&str> {
+        self.literal.as_deref()
+    }
+
+    /// Matches against a slice of characters.
+    pub(crate) fn matches_chars(&self, text: &[char], nocase: bool) -> bool {
+        match_compiled(&self.ops, text, nocase)
+    }
+
+    /// Matches against `text`, avoiding `Vec<char>` allocation on ASCII inputs.
+    pub(crate) fn matches_str(&self, text: &str, nocase: bool) -> bool {
+        if !nocase {
+            if let Some(lit) = &self.literal {
+                return text == lit;
+            }
+            if self.ascii_simple && text.is_ascii() {
+                return match_compiled_ascii(&self.ops, text.as_bytes());
+            }
+        }
+        let chars: Vec<char> = text.chars().collect();
+        match_compiled(&self.ops, &chars, nocase)
+    }
+}
+
 fn compile(pat: &str) -> Vec<P> {
     let chars: Vec<char> = pat.chars().collect();
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(chars.len());
     let mut i = 0;
     while let Some(&c) = chars.get(i) {
         i += 1;
@@ -127,6 +184,90 @@ fn class_matches(neg: bool, items: &[ClassItem], c: char, nocase: bool) -> bool 
     hit != neg
 }
 
+fn match_compiled_ascii(pat: &[P], text: &[u8]) -> bool {
+    let (mut p, mut t) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while t < text.len() {
+        let c = text[t];
+        match pat.get(p) {
+            Some(P::Star) => {
+                star = Some((p, t));
+                p += 1;
+                continue;
+            }
+            Some(P::Any) => {
+                p += 1;
+                t += 1;
+                continue;
+            }
+            Some(P::Ch(x)) if *x as u32 == u32::from(c) => {
+                p += 1;
+                t += 1;
+                continue;
+            }
+            _ => {}
+        }
+        match star {
+            Some((sp, st)) => {
+                p = sp + 1;
+                t = st + 1;
+                star = Some((sp, st + 1));
+            }
+            None => return false,
+        }
+    }
+    pat.get(p..)
+        .unwrap_or_default()
+        .iter()
+        .all(|x| *x == P::Star)
+}
+
+fn match_simple_ascii(pat: &[u8], text: &[u8]) -> bool {
+    let (mut p, mut t) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while t < text.len() {
+        if let Some(&b) = pat.get(p) {
+            if b == b'*' {
+                while pat.get(p + 1) == Some(&b'*') {
+                    p += 1;
+                }
+                star = Some((p, t));
+                p += 1;
+                continue;
+            }
+            if b == b'?' {
+                p += 1;
+                t += 1;
+                continue;
+            }
+            if b == b'\\' {
+                let lit = pat.get(p + 1).copied().unwrap_or(b'\\');
+                if text[t] == lit {
+                    p += if p + 1 < pat.len() { 2 } else { 1 };
+                    t += 1;
+                    continue;
+                }
+            } else if b == text[t] {
+                p += 1;
+                t += 1;
+                continue;
+            }
+        }
+        match star {
+            Some((sp, st)) => {
+                p = sp + 1;
+                t = st + 1;
+                star = Some((sp, st + 1));
+            }
+            None => return false,
+        }
+    }
+    while pat.get(p) == Some(&b'*') {
+        p += 1;
+    }
+    p == pat.len()
+}
+
 fn match_compiled(pat: &[P], text: &[char], nocase: bool) -> bool {
     let (mut p, mut t) = (0, 0);
     let mut star: Option<(usize, usize)> = None;
@@ -176,20 +317,57 @@ pub(crate) fn matches(pat: &str, text: &str) -> bool {
 }
 
 pub(crate) fn matches_opt(pat: &str, text: &str, nocase: bool) -> bool {
+    if !nocase && pat.is_ascii() && text.is_ascii() && !pat.as_bytes().contains(&b'[') {
+        return match_simple_ascii(pat.as_bytes(), text.as_bytes());
+    }
     let text: Vec<char> = text.chars().collect();
     match_compiled(&compile(pat), &text, nocase)
 }
 
-/// Whether `pat` has an unescaped `*`, `?`, or `[`.
-pub(crate) fn has_meta(pat: &str) -> bool {
-    let mut esc = false;
-    for c in pat.chars() {
-        if esc {
-            esc = false;
-        } else if c == '\\' {
-            esc = true;
-        } else if matches!(c, '*' | '?' | '[') {
+/// Whether a `[` starting at `rest` (the bytes right after `[`) has a valid closing `]`.
+fn has_closed_class(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    if matches!(bytes.get(i), Some(b'!' | b'^')) {
+        i += 1;
+    }
+    let mut first = true;
+    while let Some(&b) = bytes.get(i) {
+        if b == b']' && !first {
             return true;
+        }
+        first = false;
+        if b == b'['
+            && bytes.get(i + 1) == Some(&b':')
+            && let Some(tail) = bytes.get(i + 2..)
+            && let Some(end) = tail.windows(2).position(|w| w == b":]")
+        {
+            i += 2 + end + 2;
+            continue;
+        }
+        if b == b'\\' {
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Whether `pat` has an active unescaped `*`, `?`, or closed `[...]` class.
+pub(crate) fn has_meta(pat: &str) -> bool {
+    let bytes = pat.as_bytes();
+    let mut i = 0;
+    while let Some(&b) = bytes.get(i) {
+        match b {
+            b'\\' => i += 2,
+            b'*' | b'?' => return true,
+            b'[' => {
+                if has_closed_class(bytes.get(i + 1..).unwrap_or_default()) {
+                    return true;
+                }
+                i += 1;
+            }
+            _ => i += 1,
         }
     }
     false
@@ -240,16 +418,13 @@ fn entries(dir: &Path) -> Vec<(String, bool)> {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
-    let mut out: Vec<(String, bool)> = rd
-        .filter_map(|e| {
-            let e = e.ok()?;
-            let name = e.file_name().into_string().ok()?;
-            let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
-            Some((name, is_dir))
-        })
-        .collect();
-    out.sort();
-    out
+    rd.filter_map(|e| {
+        let e = e.ok()?;
+        let name = e.file_name().into_string().ok()?;
+        let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
+        Some((name, is_dir))
+    })
+    .collect()
 }
 
 fn visible(name: &str, pat: &str, opts: GlobOpts) -> bool {
@@ -267,6 +442,8 @@ pub(crate) fn expand(pat: &str, cwd: &Path, opts: GlobOpts) -> Vec<String> {
     for (i, comp) in rest.iter().enumerate() {
         let last = i + 1 == rest.len();
         let mut next = Vec::new();
+        let compiled = (!(comp.is_empty() || comp == "**" && opts.globstar) && has_meta(comp))
+            .then(|| Compiled::new(comp));
         for prefix in &paths {
             let dir = if prefix.is_empty() {
                 cwd.to_path_buf()
@@ -283,19 +460,28 @@ pub(crate) fn expand(pat: &str, cwd: &Path, opts: GlobOpts) -> Vec<String> {
                 walk(prefix, &dir, opts, &mut next, last);
                 continue;
             }
-            if !has_meta(comp) {
+            let Some(compiled) = &compiled else {
                 let name = unescape(comp);
                 let p = join(prefix, &name);
                 if std::fs::symlink_metadata(cwd.join(&p)).is_ok() {
                     next.push(p);
                 }
                 continue;
-            }
-            for (name, is_dir) in entries(&dir) {
-                if (last || is_dir)
-                    && visible(&name, comp, opts)
-                    && matches_opt(comp, &name, opts.nocase)
-                {
+            };
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                let Ok(name) = e.file_name().into_string() else {
+                    continue;
+                };
+                if !visible(&name, comp, opts) {
+                    continue;
+                }
+                if !last && !e.file_type().is_ok_and(|t| t.is_dir()) {
+                    continue;
+                }
+                if compiled.matches_str(&name, opts.nocase) {
                     next.push(join(prefix, &name));
                 }
             }
@@ -360,6 +546,10 @@ mod tests {
         assert!(matches_opt("*.RS", "a.rs", true));
         assert!(has_meta("a*"));
         assert!(!has_meta("a\\*"));
+        assert!(!has_meta("["));
+        assert!(!has_meta("[abc"));
+        assert!(has_meta("[a]"));
+        assert!(has_meta("[]a]"));
         assert_eq!(unescape("a\\*b"), "a*b");
     }
 

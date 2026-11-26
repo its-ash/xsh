@@ -109,6 +109,7 @@ pub struct App {
     model_override: Option<String>,
     last_env: Option<(PathBuf, String)>,
     warned_history: bool,
+    interactive: bool,
 }
 
 /// The machine's host name.
@@ -177,8 +178,7 @@ fn plain_theme() -> Theme {
     }
 }
 
-fn load_config(paths: &Paths, overrides: &Overrides) -> Config {
-    let cwd = std::env::current_dir().unwrap_or_default();
+fn load_config(paths: &Paths, overrides: &Overrides, cwd: PathBuf) -> Config {
     match Loader::new(paths.clone())
         .project(cwd)
         .overrides(overrides.clone())
@@ -198,10 +198,15 @@ fn load_config(paths: &Paths, overrides: &Overrides) -> Config {
 
 impl App {
     /// Loads configuration, bundles, and (when `interactive`) history.
-    pub fn load(overrides: Overrides, interactive: bool) -> Result<Self> {
+    pub fn load(
+        overrides: Overrides,
+        interactive: bool,
+        need_theme: bool,
+        load_bundles: bool,
+    ) -> Result<Self> {
         let paths = Paths::discover()?;
-        let cfg = load_config(&paths, &overrides);
         let mut shell = Shell::from_env().context("failed to initialize shell state")?;
+        let cfg = load_config(&paths, &overrides, shell.state().cwd().to_path_buf());
         shell
             .state_mut()
             .set_capture_stderr(interactive && cfg.shell.capture_stderr);
@@ -210,11 +215,20 @@ impl App {
             color_defaults(shell.state_mut());
         }
         let store = BundleStore::new(paths.bundles_dir());
-        let (installed, broken) = store.list();
-        for e in broken {
-            eprintln!("xsh: skipping a broken bundle: {e}");
-        }
-        let theme = load_theme(&paths, &cfg);
+        let installed = if load_bundles {
+            let (installed, broken) = store.list();
+            for e in broken {
+                eprintln!("xsh: skipping a broken bundle: {e}");
+            }
+            installed
+        } else {
+            Vec::new()
+        };
+        let theme = if need_theme {
+            load_theme(&paths, &cfg)
+        } else {
+            plain_theme()
+        };
         let mut app = Self {
             paths,
             cfg,
@@ -226,13 +240,18 @@ impl App {
             effects: Effects::default(),
             history: None,
             session_id: format!("{}-{}", std::process::id(), now_ms()),
-            host: hostname(),
+            host: if interactive {
+                hostname()
+            } else {
+                String::new()
+            },
             comp: Arc::new(RwLock::new(CompData::default())),
             man: crate::man::ManCache::default(),
             ai: None,
             model_override: None,
             last_env: None,
             warned_history: false,
+            interactive,
         };
         if interactive
             && app.cfg.history.enabled
@@ -246,13 +265,16 @@ impl App {
 
     /// Reloads config, theme, and bundles (hot reload).
     pub fn reload(&mut self) {
-        self.cfg = load_config(&self.paths, &self.overrides);
+        self.cfg = load_config(
+            &self.paths,
+            &self.overrides,
+            self.shell.state().cwd().to_path_buf(),
+        );
         self.theme = load_theme(&self.paths, &self.cfg);
         self.reload_bundles();
-        let capture = self.shell.state().capture_stderr();
         self.shell
             .state_mut()
-            .set_capture_stderr(capture && self.cfg.shell.capture_stderr);
+            .set_capture_stderr(self.interactive && self.cfg.shell.capture_stderr);
         self.shell
             .state_mut()
             .set_cdpath(self.cfg.shell.cdpath.clone());
@@ -311,6 +333,12 @@ impl App {
                 .is_some_and(|c| c == line.trim())
         {
             return;
+        }
+        if self.history.is_none() {
+            return;
+        }
+        if self.host.is_empty() {
+            self.host = hostname();
         }
         let entry = NewEntry {
             command: line.trim().to_owned(),
@@ -381,6 +409,11 @@ impl App {
     }
 
     fn update_completion(&self, path: &str) {
+        // Only the interactive line editor reads completion data; scanning
+        // `PATH` dominates the start-up time of scripts and `-c`.
+        if !self.interactive {
+            return;
+        }
         let Ok(mut c) = self.comp.write() else {
             return;
         };

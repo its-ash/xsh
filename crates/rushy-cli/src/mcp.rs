@@ -15,11 +15,17 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader,
+};
 use tokio::net::UnixStream;
 
 /// The server name, so Claude Code calls the tools `mcp__xsh__<tool>`.
 pub const SERVER: &str = "xsh";
+/// Environment variable carrying the per-session socket bearer token.
+pub const TOKEN_VAR: &str = "XSH_MCP_TOKEN";
+/// Maximum bytes accepted for a single newline-delimited JSON line (10 MiB).
+pub const MAX_LINE_BYTES: usize = 10 * 1024 * 1024;
 /// MCP protocol version used when the client does not name one.
 const PROTOCOL: &str = "2025-06-18";
 /// Lines `read_file` returns when no `limit` is given.
@@ -207,16 +213,65 @@ where
     })
 }
 
+/// Constant-time string comparison for bearer tokens.
+pub fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Reads a single `\n`-terminated line up to `limit` bytes (excluding `\n`).
+/// Returns `Ok(None)` at EOF, or `InvalidData` if the line exceeds `limit`
+/// bytes or is not valid UTF-8.
+pub async fn read_line_capped<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    limit: usize,
+) -> std::io::Result<Option<String>> {
+    let mut buf = Vec::new();
+    let cap = u64::try_from(limit.saturating_add(1)).unwrap_or(u64::MAX);
+    let n = reader.take(cap).read_until(b'\n', &mut buf).await?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if buf.len() > limit && !buf.ends_with(b"\n") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "line exceeds maximum length",
+        ));
+    }
+    if buf.ends_with(b"\n") {
+        buf.pop();
+        if buf.ends_with(b"\r") {
+            buf.pop();
+        }
+    }
+    String::from_utf8(buf)
+        .map(Some)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
 /// `xsh mcp --socket PATH`: serves MCP on standard input and output.
 pub async fn serve(socket: &Path) -> Result<i32> {
+    let token = std::env::var(TOKEN_VAR)
+        .ok()
+        .filter(|t| !t.is_empty())
+        .context("missing session authentication token")?;
     let stream = UnixStream::connect(socket)
         .await
         .with_context(|| format!("no xsh session at {}", socket.display()))?;
     let (read, mut session) = stream.into_split();
-    let mut replies = BufReader::new(read).lines();
-    let mut input = BufReader::new(tokio::io::stdin()).lines();
+    let auth = json!({ "auth": token });
+    session
+        .write_all(format!("{auth}\n").as_bytes())
+        .await
+        .context("cannot authenticate with the xsh session")?;
+    session.flush().await?;
+    let mut replies = BufReader::new(read);
+    let mut input = BufReader::new(tokio::io::stdin());
     let mut out = tokio::io::stdout();
-    while let Some(line) = input.next_line().await? {
+    while let Some(line) = read_line_capped(&mut input, MAX_LINE_BYTES).await? {
         if line.trim().is_empty() {
             continue;
         }
@@ -232,7 +287,7 @@ pub async fn serve(socket: &Path) -> Result<i32> {
                     {
                         return tool_text("the xsh session has ended", true);
                     }
-                    match replies.next_line().await {
+                    match read_line_capped(replies, MAX_LINE_BYTES).await {
                         Ok(Some(l)) => serde_json::from_str(&l)
                             .unwrap_or_else(|_| tool_text("bad reply from the xsh session", true)),
                         _ => tool_text("the xsh session has ended", true),
@@ -381,16 +436,79 @@ pub fn describe_write(root: &Path, tool: &str, args: &Value) -> Result<(PathBuf,
     Ok((full, what))
 }
 
+/// Returns `true` for sensitive files (`.env`, `.env.*`, `*.pem`, `*.key`,
+/// `id_rsa`, `id_ed25519`, `.git/config`) that must not be auto-read.
+pub fn is_secret_path(root: &Path, path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if name == ".env"
+        || name.starts_with(".env.")
+        || path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("pem") || ext.eq_ignore_ascii_case("key"))
+        || name == "id_rsa"
+        || name == "id_ed25519"
+    {
+        return true;
+    }
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    let parts: Vec<String> = rel
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s.to_string_lossy().to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect();
+    parts.windows(2).any(|w| w[0] == ".git" && w[1] == "config")
+}
+
+/// Re-resolves `full` inside `root` right before I/O and rejects symlinks
+/// (including dangling ones) that could escape `root`.
+fn verify_write_target(root: &Path, full: &Path) -> Result<PathBuf> {
+    let resolved = resolve(root, &full.to_string_lossy())?;
+    if let Ok(meta) = std::fs::symlink_metadata(&resolved)
+        && meta.file_type().is_symlink()
+    {
+        let canon = resolved.canonicalize().with_context(|| {
+            format!(
+                "refusing to write through symlink {}",
+                shown(root, &resolved)
+            )
+        })?;
+        if !canon.starts_with(root) {
+            bail!(
+                "`{}` is outside the working directory {}",
+                shown(root, &resolved),
+                root.display()
+            );
+        }
+        return Ok(canon);
+    }
+    Ok(resolved)
+}
+
 /// `write_file`, after approval.
 pub fn write_file(root: &Path, full: &Path, args: &Value) -> Result<String> {
     let content = args["content"].as_str().context("`content` is required")?;
-    if let Some(dir) = full.parent() {
+    let target = verify_write_target(root, full)?;
+    if let Some(dir) = target.parent() {
         std::fs::create_dir_all(dir)?;
+        let canon_dir = dir.canonicalize()?;
+        if !canon_dir.starts_with(root) {
+            bail!(
+                "`{}` is outside the working directory {}",
+                shown(root, &target),
+                root.display()
+            );
+        }
     }
-    std::fs::write(full, content)?;
+    let target = verify_write_target(root, &target)?;
+    std::fs::write(&target, content)?;
     Ok(format!(
         "wrote {} ({} bytes)",
-        shown(root, full),
+        shown(root, &target),
         content.len()
     ))
 }
@@ -406,7 +524,8 @@ pub fn edit_file(root: &Path, full: &Path, args: &Value) -> Result<String> {
     if old.is_empty() {
         bail!("`old_text` is empty; use write_file to create a file");
     }
-    let text = read_text(full)?;
+    let target = verify_write_target(root, full)?;
+    let text = read_text(&target)?;
     let n = text.matches(old).count();
     let all = args["replace_all"].as_bool().unwrap_or(false);
     match (n, all) {
@@ -416,8 +535,12 @@ pub fn edit_file(root: &Path, full: &Path, args: &Value) -> Result<String> {
             bail!("`old_text` matches {n} times; add more lines around it, or set replace_all")
         }
     }
-    std::fs::write(full, text.replace(old, new))?;
-    Ok(format!("edited {} ({n} replacement(s))", shown(root, full)))
+    let target = verify_write_target(root, &target)?;
+    std::fs::write(&target, text.replace(old, new))?;
+    Ok(format!(
+        "edited {} ({n} replacement(s))",
+        shown(root, &target)
+    ))
 }
 
 /// `list_dir`.
@@ -525,6 +648,9 @@ pub fn search_text(root: &Path, args: &Value) -> Result<String> {
         vec![(dir.clone(), shown(root, &dir))]
     } else {
         walk(&dir)
+            .into_iter()
+            .filter(|(p, _)| !is_secret_path(root, p))
+            .collect()
     };
     let mut out = String::new();
     let mut hits = 0;
@@ -659,6 +785,46 @@ mod tests {
             .await
             .ok_or("no reply")?;
         assert_eq!(r["error"]["code"], -32601);
+        Ok(())
+    }
+
+    #[test]
+    fn detects_secret_paths() {
+        let root = Path::new("/proj");
+        for secret in [
+            "/proj/.env",
+            "/proj/.env.production",
+            "/proj/certs/server.pem",
+            "/proj/private.key",
+            "/proj/id_rsa",
+            "/proj/id_ed25519",
+            "/proj/.git/config",
+        ] {
+            assert!(is_secret_path(root, Path::new(secret)), "{secret}");
+        }
+        for ok in ["/proj/src/main.rs", "/proj/README.md", "/proj/config.toml"] {
+            assert!(!is_secret_path(root, Path::new(ok)), "{ok}");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_line_capped_enforces_limit() -> TestResult {
+        let mut ok_reader = BufReader::new(&b"hello\nworld\n"[..]);
+        assert_eq!(
+            read_line_capped(&mut ok_reader, 16).await?.as_deref(),
+            Some("hello")
+        );
+        assert_eq!(
+            read_line_capped(&mut ok_reader, 16).await?.as_deref(),
+            Some("world")
+        );
+        assert_eq!(read_line_capped(&mut ok_reader, 16).await?, None);
+
+        let mut big_reader = BufReader::new(&b"0123456789abcdef\n"[..]);
+        assert!(read_line_capped(&mut big_reader, 8).await.is_err());
+        assert!(constant_time_eq("abc", "abc"));
+        assert!(!constant_time_eq("abc", "abd"));
+        assert!(!constant_time_eq("abc", "ab"));
         Ok(())
     }
 }

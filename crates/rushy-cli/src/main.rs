@@ -22,6 +22,7 @@ mod mcp;
 mod pretty;
 mod rcimport;
 mod repl;
+mod ssh;
 mod subcmds;
 mod term;
 mod update;
@@ -90,7 +91,12 @@ async fn run_block(app: &mut App, text: &str, name: &str) -> i32 {
         if i == 0 && line.starts_with("#!") {
             continue;
         }
-        if !buf.is_empty() {
+        if buf.is_empty() {
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+        } else {
             buf.push('\n');
         }
         buf.push_str(line);
@@ -174,21 +180,70 @@ const SHELL_STACK: usize = 512 * 1024 * 1024;
 /// Stack size for runtime worker threads (background jobs run there).
 const WORKER_STACK: usize = 64 * 1024 * 1024;
 
+/// Fast path for `-c` shell invocations that skips building `clap`'s full
+/// subcommand tree; any other flag or subcommand falls back to `Cli::parse()`.
+fn try_parse_fast() -> Option<Cli> {
+    let mut it = std::env::args_os();
+    let _prog = it.next()?;
+    let (mut norc, mut xtrace, mut errexit, mut noexec) = (false, false, false, false);
+    while let Some(arg) = it.next() {
+        match arg.to_str()? {
+            "--norc" => norc = true,
+            "-x" => xtrace = true,
+            "-e" => errexit = true,
+            "-n" => noexec = true,
+            "-c" => {
+                let command = Some(it.next()?.into_string().ok()?);
+                let script = it.next().map(std::path::PathBuf::from);
+                let mut args = Vec::new();
+                if script.is_some() {
+                    for rest in it {
+                        args.push(rest.into_string().ok()?);
+                    }
+                }
+                return Some(Cli {
+                    command,
+                    xtrace,
+                    errexit,
+                    noexec,
+                    norc,
+                    script,
+                    args,
+                    theme: None,
+                    screen_reader: false,
+                    no_color: false,
+                    sub: None,
+                });
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 fn main() -> Result<ExitCode> {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_stack_size(WORKER_STACK)
-        .build()?;
+    let cli = try_parse_fast().unwrap_or_else(Cli::parse);
+    let single_shot = cli.sub.is_none()
+        && (cli.command.is_some() || cli.script.is_some() || !std::io::stdin().is_terminal());
+    let rt = if single_shot {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+    } else {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_stack_size(WORKER_STACK)
+            .build()?
+    };
     std::thread::Builder::new()
         .name("xsh".into())
         .stack_size(SHELL_STACK)
-        .spawn(move || rt.block_on(run()))?
+        .spawn(move || rt.block_on(run(cli)))?
         .join()
         .map_err(|_| anyhow::anyhow!("the shell thread panicked"))?
 }
 
-async fn run() -> Result<ExitCode> {
-    let cli = Cli::parse();
+async fn run(cli: Cli) -> Result<ExitCode> {
     // The MCP server speaks JSON on standard output: no config, no shell.
     if let Some(Sub::Mcp { socket }) = &cli.sub {
         let code = match mcp::serve(socket).await {
@@ -211,7 +266,9 @@ async fn run() -> Result<ExitCode> {
         && shell_sub
         && cli.script.is_none()
         && std::io::stdin().is_terminal();
-    let mut app = App::load(overrides, interactive)?;
+    let need_theme = interactive || cli.sub.is_some();
+    let load_bundles = !cli.norc || cli.sub.is_some();
+    let mut app = App::load(overrides, interactive, need_theme, load_bundles)?;
     app.shell.state_mut().set_interactive(interactive);
     for (on, name) in [
         (cli.xtrace, "xtrace"),
@@ -227,7 +284,9 @@ async fn run() -> Result<ExitCode> {
         run_rc(&mut app).await;
     }
     let status = if let Some(line) = cli.command {
-        let _ = app.refresh_effects();
+        if !cli.norc {
+            let _ = app.refresh_effects();
+        }
         // `xsh -c CMD NAME ARGS...` sets `$0` and `$1`…, as `sh -c` does.
         if let Some(name) = &cli.script {
             app.shell
@@ -236,7 +295,9 @@ async fn run() -> Result<ExitCode> {
         }
         run_once(&mut app, &line).await
     } else if let Some(path) = cli.script {
-        let _ = app.refresh_effects();
+        if !cli.norc {
+            let _ = app.refresh_effects();
+        }
         let name = path.display().to_string();
         match std::fs::read(&path) {
             Ok(bytes) => {
@@ -259,7 +320,9 @@ async fn run() -> Result<ExitCode> {
     } else if interactive {
         repl::run(&mut app).await?
     } else {
-        let _ = app.refresh_effects();
+        if !cli.norc {
+            let _ = app.refresh_effects();
+        }
         script(&mut app).await?
     };
     // `exit` already ran (and cleared) the EXIT trap; this covers the end of

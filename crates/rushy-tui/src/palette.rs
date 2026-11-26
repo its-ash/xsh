@@ -258,9 +258,16 @@ impl Palette {
             inner.width,
             inner.height.saturating_sub(1),
         );
+        // Build only the rows that fit; with a fresh `ListState` the list
+        // scrolls so the selection is the last visible row, same as here.
+        let height = usize::from(list_area.height).max(1);
+        let start = self.selected.saturating_sub(height - 1);
         let rows: Vec<ListItem<'_>> = self
-            .visible()
-            .into_iter()
+            .matches
+            .iter()
+            .skip(start)
+            .take(height)
+            .filter_map(|&i| self.items.get(i))
             .map(|i| {
                 let mut spans = vec![Span::styled(
                     format!("{:<8}", i.kind.tag()),
@@ -276,7 +283,7 @@ impl Palette {
                 ListItem::new(Line::from(spans))
             })
             .collect();
-        let mut state = ListState::default().with_selected(Some(self.selected));
+        let mut state = ListState::default().with_selected(Some(self.selected - start));
         f.render_stateful_widget(
             List::new(rows)
                 .highlight_style(theme.focus())

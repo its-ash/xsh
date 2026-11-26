@@ -15,6 +15,19 @@ final class Split: NSSplitView {
     @available(*, unavailable)
     required init?(coder: NSCoder) { nil }
 
+    func applyRatio(_ ratio: Double) {
+        let total = isVertical ? bounds.width : bounds.height
+        let clamped = min(max(ratio, 0.1), 0.9)
+        setPosition((total - dividerThickness) * clamped, ofDividerAt: 0)
+    }
+
+    var currentRatio: Double {
+        let total = isVertical ? bounds.width : bounds.height
+        guard total > dividerThickness, let first = subviews.first else { return 0.5 }
+        let part = isVertical ? first.frame.width : first.frame.height
+        return Double(min(max(part / (total - dividerThickness), 0.1), 0.9))
+    }
+
     func equalize() {
         let total = isVertical ? bounds.width : bounds.height
         setPosition((total - dividerThickness) / 2, ofDividerAt: 0)
@@ -27,14 +40,14 @@ enum FocusDirection { case left, right, up, down }
 /// A saved pane layout.
 indirect enum Layout {
     case pane(cwd: String?, profile: String?)
-    case split(vertical: Bool, Layout, Layout)
+    case split(vertical: Bool, ratio: Double, Layout, Layout)
 
     var plist: [String: Any] {
         switch self {
         case let .pane(cwd, profile):
             return ["cwd": cwd ?? "", "profile": profile ?? ""]
-        case let .split(v, a, b):
-            return ["vertical": v, "a": a.plist, "b": b.plist]
+        case let .split(v, r, a, b):
+            return ["vertical": v, "ratio": r, "a": a.plist, "b": b.plist]
         }
     }
 
@@ -42,7 +55,8 @@ indirect enum Layout {
         if let v = plist["vertical"] as? Bool,
            let a = (plist["a"] as? [String: Any]).flatMap(Layout.init(plist:)),
            let b = (plist["b"] as? [String: Any]).flatMap(Layout.init(plist:)) {
-            self = .split(vertical: v, a, b)
+            let r = (plist["ratio"] as? NSNumber)?.doubleValue ?? 0.5
+            self = .split(vertical: v, ratio: r, a, b)
         } else if plist["cwd"] != nil {
             let (c, p) = (plist["cwd"] as? String ?? "", plist["profile"] as? String ?? "")
             self = .pane(cwd: c.isEmpty ? nil : c, profile: p.isEmpty ? nil : p)
@@ -117,6 +131,7 @@ final class TerminalWindow: NSWindowController, NSWindowDelegate {
         window.tabbingIdentifier = "xsh"
         window.title = "xsh"
         window.isRestorable = false
+        window.isReleasedWhenClosed = false
 
         let root = NSView(frame: window.contentLayoutRect)
         root.autoresizingMask = [.width, .height]
@@ -147,7 +162,7 @@ final class TerminalWindow: NSWindowController, NSWindowDelegate {
         let first = build(layout, frame: hostFrame)
         first.autoresizingMask = [.width, .height]
         host.addSubview(first)
-        (first as? Split)?.equalize()
+        applyRatios(layout, to: first)
         if other == nil, let pane = first as? Pane { fit(pane) }
         focus(panes.first)
         syncHeaders()
@@ -192,12 +207,19 @@ final class TerminalWindow: NSWindowController, NSWindowDelegate {
         case let .pane(cwd, name):
             let p = name.flatMap { n in Store.shared.profiles.map(Profile.init).first { $0.name == n } }
             return makePane(profile: p, directory: cwd, frame: frame)
-        case let .split(vertical, a, b):
+        case let .split(vertical, _, a, b):
             let s = Split(vertical: vertical, frame: frame)
             s.addSubview(build(a, frame: frame))
             s.addSubview(build(b, frame: frame))
             return s
         }
+    }
+
+    private func applyRatios(_ layout: Layout, to view: NSView) {
+        guard case let .split(_, ratio, a, b) = layout, let s = view as? Split, s.subviews.count == 2 else { return }
+        s.applyRatio(ratio)
+        applyRatios(a, to: s.subviews[0])
+        applyRatios(b, to: s.subviews[1])
     }
 
     private func makePane(profile: Profile?, directory: String?, frame: NSRect, agentSocket: String? = nil) -> Pane {
@@ -210,7 +232,7 @@ final class TerminalWindow: NSWindowController, NSWindowDelegate {
         func snap(_ v: NSView) -> Layout? {
             if let p = v as? Pane { return .pane(cwd: p.cwd, profile: p.profile?.name) }
             if let s = v as? Split, s.subviews.count == 2, let a = snap(s.subviews[0]), let b = snap(s.subviews[1]) {
-                return .split(vertical: s.isVertical, a, b)
+                return .split(vertical: s.isVertical, ratio: s.currentRatio, a, b)
             }
             return v.subviews.lazy.compactMap(snap).first
         }
@@ -292,11 +314,18 @@ final class TerminalWindow: NSWindowController, NSWindowDelegate {
 
     func updateTitle() {
         guard let window, let pane = active else { return }
-        let folder = pane.cwd.map { ($0 as NSString).abbreviatingWithTildeInPath }
-        let title = pane.title.isEmpty ? folder ?? "xsh" : pane.title
-        window.title = title
-        window.tab.title = title
-        window.representedURL = pane.cwd.map { URL(fileURLWithPath: $0) }
+        let dir = pane.cwd
+        let title = pane.title.isEmpty
+            ? (dir.map { ($0 as NSString).abbreviatingWithTildeInPath } ?? "xsh")
+            : pane.title
+        if window.title != title {
+            window.title = title
+            window.tab.title = title
+        }
+        let url = dir.map { URL(fileURLWithPath: $0) }
+        if window.representedURL != url {
+            window.representedURL = url
+        }
     }
 
     @objc func focusNextPane(_ sender: Any?) { cycle(1) }
@@ -434,10 +463,12 @@ final class TerminalWindow: NSWindowController, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
-        if fillsScreen { NSApp.presentationOptions = [] }
         panes.forEach { $0.shutdown() }
         observer = nil
         Self.all.removeAll { $0 === self }
+        if fillsScreen, !Self.all.contains(where: \.fillsScreen) {
+            NSApp.presentationOptions = []
+        }
         if Store.shared.bool("window.quit_when_last_closed"), Self.all.isEmpty {
             NSApp.terminate(nil)
         }
@@ -581,14 +612,16 @@ enum Terminals {
     static func save() {
         var seen = Set<ObjectIdentifier>()
         var groups: [[[String: Any]]] = []
+        var frames: [String] = []
         for w in NSApp.orderedWindows {
             guard w.windowController is TerminalWindow else { continue }
             let list = w.tabbedWindows ?? [w]
-            guard !seen.contains(ObjectIdentifier(list[0])) else { continue }
-            seen.insert(ObjectIdentifier(list[0]))
+            guard let head = list.first, seen.insert(ObjectIdentifier(head)).inserted else { continue }
             groups.append(list.compactMap { ($0.windowController as? TerminalWindow)?.layoutSnapshot().plist })
+            frames.append(NSStringFromRect(w.frame))
         }
         UserDefaults.standard.set(groups, forKey: sessionKey)
+        UserDefaults.standard.set(frames, forKey: sessionKey + ".frames")
     }
 
     /// Opens the saved tabs. Returns false when nothing was saved.
@@ -597,16 +630,25 @@ enum Terminals {
               let groups = UserDefaults.standard.array(forKey: sessionKey) as? [[[String: Any]]],
               !groups.isEmpty
         else { return false }
+        let frames = UserDefaults.standard.stringArray(forKey: sessionKey + ".frames") ?? []
         var opened = false
-        for tabs in groups.reversed() {
+        for (idx, tabs) in groups.enumerated().reversed() {
             var firstWindow: TerminalWindow?
+            let savedFrame: NSRect? = idx < frames.count ? {
+                let r = NSRectFromString(frames[idx])
+                return r.width >= 200 && r.height >= 120 ? r : nil
+            }() : nil
             for layout in tabs.compactMap(Layout.init(plist:)) {
                 if let f = firstWindow {
                     let w = TerminalWindow(layout: layout, sizedFrom: f.window)
                     f.addTab(w)
                 } else {
                     let w = TerminalWindow(layout: layout)
-                    w.window?.center()
+                    if let savedFrame {
+                        w.window?.setFrame(savedFrame, display: false)
+                    } else {
+                        w.window?.center()
+                    }
                     w.showWindow(nil)
                     firstWindow = w
                     opened = true

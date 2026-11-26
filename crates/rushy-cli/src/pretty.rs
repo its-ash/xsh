@@ -519,15 +519,31 @@ fn strip_ansi(s: &str) -> String {
     let mut it = s.chars().peekable();
     while let Some(c) = it.next() {
         if c == '\x1b' {
-            if it.peek() == Some(&'[') {
-                it.next();
-                for c in it.by_ref() {
-                    if ('@'..='~').contains(&c) {
-                        break;
+            match it.peek().copied() {
+                Some('[') => {
+                    it.next();
+                    for c in it.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
                     }
                 }
-            } else {
-                it.next();
+                Some(']') => {
+                    it.next();
+                    while let Some(c) = it.next() {
+                        if c == '\x07' {
+                            break;
+                        }
+                        if c == '\x1b' && it.peek() == Some(&'\\') {
+                            it.next();
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {
+                    it.next();
+                }
+                None => {}
             }
         } else if c == '\t' {
             out.push_str("    ");
@@ -1009,6 +1025,10 @@ mod tests {
         let p = pal.card_preview("a\n\x1b[31mred\x1b[0m\nc\nd", 2);
         assert_eq!(p, "| … 2 more line(s)\n| c\n| d\n");
         assert_eq!(strip_ansi("\x1b[1mbold\x1b[0m\tx"), "bold    x");
+        assert_eq!(
+            strip_ansi("\x1b]0;evil title\x07ok\x1b]8;;https://x\x1b\\link"),
+            "oklink"
+        );
     }
 
     #[test]

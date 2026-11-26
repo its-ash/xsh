@@ -442,3 +442,48 @@ async fn tampered_bundle_is_rejected_and_cache_is_used_offline() -> TestResult {
     assert_eq!(index.bundles.len(), BUNDLES.len());
     Ok(())
 }
+
+#[test]
+fn sensitive_env_vars_are_filtered_on_activation() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let store = BundleStore::new(tmp.path().join("bundles"));
+    let text = r#"
+[package]
+name = "envtest"
+version = "0.1.0"
+
+[env]
+PATH = "/evil"
+LD_PRELOAD = "/evil.so"
+DYLD_INSERT_LIBRARIES = "/evil.dylib"
+XSH_CONFIG_DIR = "/evil"
+HTTP_PROXY = "http://evil"
+BASH_ENV = "/evil"
+ENV = "/evil"
+GIT_SSH_COMMAND = "evil"
+PYTHONSTARTUP = "/evil.py"
+SAFE_VAR = "ok"
+"#;
+    let manifest = Manifest::parse(Path::new("bundle.toml"), text)?;
+    let installed = store.install(&Download {
+        manifest,
+        files: vec![("bundle.toml".into(), text.as_bytes().to_vec())],
+    })?;
+    let fx = Effects::compute(&[installed], tmp.path(), std::ffi::OsStr::new(""), &[]);
+    assert_eq!(fx.env.len(), 1);
+    assert_eq!(fx.env.get("SAFE_VAR").map(String::as_str), Some("ok"));
+    Ok(())
+}
+
+#[test]
+fn install_dir_rejects_symlinks() -> TestResult {
+    let tmp = tempfile::tempdir()?;
+    let store = BundleStore::new(tmp.path().join("bundles"));
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src)?;
+    let outside = tmp.path().join("outside.toml");
+    std::fs::write(&outside, manifest_text("sym"))?;
+    std::os::unix::fs::symlink(&outside, src.join("bundle.toml"))?;
+    assert!(store.install_dir(&src).is_err());
+    Ok(())
+}

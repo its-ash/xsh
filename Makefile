@@ -1,4 +1,4 @@
-.PHONY: run build install uninstall deploy theme
+.PHONY: run build install uninstall deploy theme test
 
 LLM_URL ?= http://127.0.0.1:9694/v1
 LLM_MODEL ?= router/auto
@@ -28,6 +28,14 @@ theme:
 	cp scripts/theme-editor.html target/theme-editor/index.html
 	sh scripts/theme-presets.sh > target/theme-editor/themes.js
 	open target/theme-editor/index.html
+
+# Runs the unit tests, then benchmarks xsh against /bin/bash and /bin/zsh with
+# hyperfine. `make test BENCH=string` runs only matching workloads; RUNS and
+# WARMUP set the hyperfine counts. Results: target/bench/results.md.
+test:
+	cargo test --workspace -q
+	cargo build --release -q -p rushy-cli
+	RUNS="$(or $(RUNS),5)" WARMUP="$(or $(WARMUP),1)" bench/run.sh $(BENCH)
 
 # Bumps the version, runs `make build`, commits with a message from the local
 # model at LLM_URL, pushes to main, and creates a GitHub release with gh.

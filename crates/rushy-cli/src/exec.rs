@@ -1,6 +1,7 @@
 //! Running a command line: built-ins that live in the `rushy` binary
 //! (`bundle`, `ai`, `theme`, `history`, `help`) next to the shell core.
 
+use std::io::IsTerminal as _;
 use std::time::Instant;
 
 use clap::Parser as _;
@@ -115,6 +116,15 @@ pub fn intercept(segment: &str, app: &App) -> Option<Vec<String>> {
     }
     let words: Vec<String> = cmd.words.iter().map(|w| expand(w, app)).collect();
     let first = words.first()?;
+    if first == "ssh"
+        && app.cfg.shell.ssh_integration
+        && !segment.trim_start().starts_with('\\')
+        && std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+        && crate::ssh::should_wrap(&words[1..])
+    {
+        return Some(words);
+    }
     if !OWN.contains(&first.as_str()) {
         return None;
     }
@@ -141,6 +151,17 @@ async fn run_own(app: &mut App, words: Vec<String>, text: &str) -> i32 {
         app.shell.record_external(text, 0, "");
         return 0;
     }
+    if words.first().is_some_and(|w| w == "ssh") {
+        let status = match crate::ssh::run(app, &words[1..]).await {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("xsh: {e:#}");
+                1
+            }
+        };
+        app.shell.record_external(text, status, "");
+        return status;
+    }
     let args = std::iter::once("xsh".to_owned()).chain(words);
     let (status, stderr) = match Cli::try_parse_from(args) {
         Err(e) => {
@@ -162,6 +183,14 @@ async fn run_own(app: &mut App, words: Vec<String>, text: &str) -> i32 {
     status
 }
 
+fn may_intercept(line: &str, app: &App) -> bool {
+    if !app.shell.state().aliases().is_empty() || line.trim_start().starts_with('$') {
+        return true;
+    }
+    OWN.iter().any(|cmd| line.contains(cmd))
+        || (app.cfg.shell.ssh_integration && line.contains("ssh"))
+}
+
 /// Runs a command line: built-ins of the binary and everything else through
 /// the shell core. Records the line in the encrypted history.
 ///
@@ -170,7 +199,20 @@ async fn run_own(app: &mut App, words: Vec<String>, text: &str) -> i32 {
 /// Returns [`Error::Incomplete`] (before running anything) when the line
 /// needs more input, and the core's errors otherwise.
 pub async fn execute(app: &mut App, line: &str) -> Result<Flow> {
-    if let Err(Error::Incomplete) = parser::parse(line, app.shell.state().aliases()) {
+    if !may_intercept(line, app) {
+        let started = Instant::now();
+        let res = app.shell.run_line(line).await;
+        if matches!(res, Err(Error::Incomplete)) {
+            return res;
+        }
+        let status = match &res {
+            Ok(Flow::Exit(c)) => *c,
+            _ => app.shell.last_status(),
+        };
+        app.record_history(line, status, started.elapsed());
+        return res;
+    }
+    if let Err(Error::Incomplete) = parser::parse_program(line, app.shell.state().aliases()) {
         return Err(Error::Incomplete);
     }
     let started = Instant::now();
@@ -179,19 +221,25 @@ pub async fn execute(app: &mut App, line: &str) -> Result<Flow> {
     let mut result = Ok(());
     // A compound command is not split at `;`, so the core sees it whole. A
     // line without a built-in of the binary also goes to the core unchanged.
-    let segs = if crate::hist::is_compound(line) {
-        vec![line.to_owned()]
+    let segs: Vec<(String, Option<Vec<String>>)> = if crate::hist::is_compound(line) {
+        vec![(line.to_owned(), intercept(line, app))]
     } else {
-        let segs = split_top_level(line);
-        if segs.iter().any(|s| intercept(s, app).is_some()) {
-            segs
+        let parsed: Vec<(String, Option<Vec<String>>)> = split_top_level(line)
+            .into_iter()
+            .map(|s| {
+                let own = intercept(&s, app);
+                (s, own)
+            })
+            .collect();
+        if parsed.iter().any(|(_, own)| own.is_some()) {
+            parsed
         } else {
-            vec![line.to_owned()]
+            vec![(line.to_owned(), None)]
         }
     };
     'segments: {
-        for seg in segs {
-            if let Some(words) = intercept(&seg, app) {
+        for (seg, own) in segs {
+            if let Some(words) = own {
                 if !pending.is_empty() {
                     match app.shell.run_line(&pending.join("\n")).await {
                         Ok(Flow::Exit(c)) => {

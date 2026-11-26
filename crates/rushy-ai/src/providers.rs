@@ -3,6 +3,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -16,6 +17,10 @@ use crate::{Error, Result};
 const TIMEOUT: Duration = Duration::from_secs(120);
 const LIST_TIMEOUT: Duration = Duration::from_secs(30);
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+const MAX_ATTEMPTS: usize = 3;
+const INITIAL_BACKOFF: Duration = Duration::from_millis(250);
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
+const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 fn validate_url(raw: &str) -> Result<Url> {
     let url = Url::parse(raw).map_err(|_| Error::Url(raw.to_owned()))?;
@@ -55,18 +60,78 @@ fn tool_arguments(v: &Value) -> Value {
 fn client(https_only: bool) -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .https_only(https_only)
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(TIMEOUT)
         .user_agent(concat!("xsh/", env!("CARGO_PKG_VERSION")))
         .build()?)
 }
 
-async fn post(provider: &str, req: reqwest::RequestBuilder, body: &Value) -> Result<Value> {
-    read_json(provider, req.json(body).send().await?).await
+fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529)
 }
 
-async fn read_json(provider: &str, res: reqwest::Response) -> Result<Value> {
+fn is_retryable_error(err: &reqwest::Error) -> bool {
+    err.is_timeout() || err.is_connect() || err.is_request()
+}
+
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let secs = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    Some(Duration::from_secs(secs).min(MAX_RETRY_AFTER))
+}
+
+async fn send_with_retry<F>(provider: &str, mut build: F) -> Result<Value>
+where
+    F: FnMut() -> reqwest::RequestBuilder,
+{
+    for attempt in 0..MAX_ATTEMPTS {
+        let last = attempt + 1 >= MAX_ATTEMPTS;
+        match build().send().await {
+            Ok(res) => {
+                if is_retryable_status(res.status()) && !last {
+                    let delay = retry_after(res.headers())
+                        .unwrap_or_else(|| INITIAL_BACKOFF * (1u32 << attempt));
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                return read_json(provider, res).await;
+            }
+            Err(err) => {
+                if is_retryable_error(&err) && !last {
+                    tokio::time::sleep(INITIAL_BACKOFF * (1u32 << attempt)).await;
+                    continue;
+                }
+                return Err(err.into());
+            }
+        }
+    }
+    Err(Error::BadResponse("request exhausted retries".into()))
+}
+
+async fn read_json(provider: &str, mut res: reqwest::Response) -> Result<Value> {
     let status = res.status();
-    let text = res.text().await?;
+    if let Some(len) = res.content_length()
+        && usize::try_from(len).is_ok_and(|n| n > MAX_RESPONSE_BYTES)
+    {
+        return Err(Error::BadResponse(format!(
+            "response exceeded {MAX_RESPONSE_BYTES} bytes"
+        )));
+    }
+    let mut buf = Vec::new();
+    while let Some(chunk) = res.chunk().await? {
+        if buf.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+            return Err(Error::BadResponse(format!(
+                "response exceeded {MAX_RESPONSE_BYTES} bytes"
+            )));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    let text = String::from_utf8_lossy(&buf);
     if !status.is_success() {
         let message = serde_json::from_str::<Value>(&text)
             .ok()
@@ -122,13 +187,16 @@ pub async fn list_models(endpoint: &str, key: Option<&Secret>) -> Result<Vec<Str
     let url = base
         .join("models")
         .map_err(|_| Error::Url(endpoint.to_owned()))?;
-    let mut req = client(url.scheme() == "https")?
-        .get(url)
-        .timeout(LIST_TIMEOUT);
-    if let Some(k) = key {
-        req = req.bearer_auth(k.expose());
-    }
-    let names = model_names(&read_json("custom", req.send().await?).await?);
+    let http = client(url.scheme() == "https")?;
+    let v = send_with_retry("custom", || {
+        let mut req = http.get(url.clone()).timeout(LIST_TIMEOUT);
+        if let Some(k) = key {
+            req = req.bearer_auth(k.expose());
+        }
+        req
+    })
+    .await?;
+    let names = model_names(&v);
     if names.is_empty() {
         return Err(Error::BadResponse("the address lists no models".into()));
     }
@@ -237,17 +305,35 @@ impl OpenAiProvider {
                 role => json!({"role": role, "content": m.content}),
             })
             .collect();
-        let mut body = json!({
-            "model": self.model,
-            "messages": messages,
-            "temperature": req.temperature,
-            "max_tokens": req.max_tokens,
-        });
+        let mut body = if is_reasoning_model(&self.model) {
+            json!({
+                "model": self.model,
+                "messages": messages,
+                "max_completion_tokens": req.max_tokens,
+            })
+        } else {
+            json!({
+                "model": self.model,
+                "messages": messages,
+                "temperature": req.temperature,
+                "max_tokens": req.max_tokens,
+            })
+        };
         if !req.tools.is_empty() {
             body["tools"] = openai_tools(req);
         }
         body
     }
+}
+
+fn is_reasoning_model(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    ["o1", "o3", "o4", "gpt-5"].iter().any(|p| {
+        lower == *p
+            || lower
+                .strip_prefix(p)
+                .is_some_and(|rest| rest.starts_with('-') || rest.starts_with('.'))
+    })
 }
 
 #[async_trait]
@@ -257,11 +343,15 @@ impl AiProvider for OpenAiProvider {
             .base
             .join("chat/completions")
             .map_err(|_| Error::Url(self.base.to_string()))?;
-        let mut http = self.http.post(url);
-        if let Some(k) = &self.key {
-            http = http.bearer_auth(k.expose());
-        }
-        let v = post(self.name, http, &self.body(&req)).await?;
+        let body = self.body(&req);
+        let v = send_with_retry(self.name, || {
+            let mut http = self.http.post(url.clone()).json(&body);
+            if let Some(k) = &self.key {
+                http = http.bearer_auth(k.expose());
+            }
+            http
+        })
+        .await?;
         let choice = v
             .pointer("/choices/0")
             .ok_or_else(|| Error::BadResponse("no choices".into()))?;
@@ -371,7 +461,9 @@ impl AnthropicProvider {
                     blocks.extend(m.tool_calls.iter().map(|c| {
                         json!({"type": "tool_use", "id": c.id, "name": c.name, "input": c.arguments})
                     }));
-                    messages.push(json!({"role": "assistant", "content": blocks}));
+                    if !blocks.is_empty() {
+                        messages.push(json!({"role": "assistant", "content": blocks}));
+                    }
                 }
                 _ => messages.push(json!({"role": "user", "content": m.content})),
             }
@@ -404,14 +496,14 @@ impl AiProvider for AnthropicProvider {
             .base
             .join("messages")
             .map_err(|_| Error::Url(self.base.to_string()))?;
-        let v = post(
-            "anthropic",
+        let body = self.body(&req);
+        let v = send_with_retry("anthropic", || {
             self.http
-                .post(url)
+                .post(url.clone())
                 .header("x-api-key", self.key.expose())
-                .header("anthropic-version", ANTHROPIC_VERSION),
-            &self.body(&req),
-        )
+                .header("anthropic-version", ANTHROPIC_VERSION)
+                .json(&body)
+        })
         .await?;
         let blocks = v["content"]
             .as_array()
@@ -452,6 +544,7 @@ pub struct OllamaProvider {
     http: reqwest::Client,
     base: Url,
     model: String,
+    next_call_id: AtomicU64,
 }
 
 impl OllamaProvider {
@@ -466,6 +559,7 @@ impl OllamaProvider {
             http: client(base.scheme() == "https")?,
             base,
             model: model.into(),
+            next_call_id: AtomicU64::new(0),
         })
     }
 
@@ -507,21 +601,24 @@ impl AiProvider for OllamaProvider {
             .base
             .join("api/chat")
             .map_err(|_| Error::Url(self.base.to_string()))?;
-        let v = post("ollama", self.http.post(url), &self.body(&req)).await?;
+        let body = self.body(&req);
+        let v = send_with_retry("ollama", || self.http.post(url.clone()).json(&body)).await?;
         let msg = &v["message"];
         let tool_calls: Vec<ToolCall> = msg["tool_calls"]
             .as_array()
             .map(|calls| {
                 calls
                     .iter()
-                    .enumerate()
-                    .map(|(i, c)| ToolCall {
-                        id: format!("call_{i}"),
-                        name: c["function"]["name"]
-                            .as_str()
-                            .unwrap_or_default()
-                            .to_owned(),
-                        arguments: tool_arguments(&c["function"]["arguments"]),
+                    .map(|c| {
+                        let id = self.next_call_id.fetch_add(1, Ordering::Relaxed);
+                        ToolCall {
+                            id: format!("call_{id}"),
+                            name: c["function"]["name"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_owned(),
+                            arguments: tool_arguments(&c["function"]["arguments"]),
+                        }
                     })
                     .collect()
             })
@@ -720,6 +817,50 @@ mod tests {
         let a = AnthropicProvider::new(Secret::new("sk-ant-secret"), "m", None)?;
         let dbg = format!("{p:?} {a:?}");
         assert!(!dbg.contains("sk-very") && !dbg.contains("sk-ant"));
+        Ok(())
+    }
+
+    #[test]
+    fn openai_reasoning_models_use_max_completion_tokens() -> Result<()> {
+        let req = AiRequest {
+            messages: vec![ChatMessage::user("hi")],
+            tools: Vec::new(),
+            temperature: 0.2,
+            max_tokens: 512,
+        };
+        for model in ["o1", "o3-mini", "o4-mini", "gpt-5", "gpt-5-mini"] {
+            let p = OpenAiProvider::new(Secret::new("k"), model, None)?;
+            let body = p.body(&req);
+            assert_eq!(body["max_completion_tokens"], 512, "{model}");
+            assert!(body.get("max_tokens").is_none(), "{model}");
+            assert!(body.get("temperature").is_none(), "{model}");
+        }
+        let p = OpenAiProvider::new(Secret::new("k"), "gpt-4o-mini", None)?;
+        let body = p.body(&req);
+        assert_eq!(body["max_tokens"], 512);
+        assert!(body.get("temperature").is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn anthropic_omits_empty_assistant_messages() -> Result<()> {
+        let req = AiRequest {
+            messages: vec![
+                ChatMessage::user("hi"),
+                ChatMessage::assistant("", Vec::new()),
+                ChatMessage::user("next"),
+            ],
+            tools: Vec::new(),
+            temperature: 0.2,
+            max_tokens: 256,
+        };
+        let a = AnthropicProvider::new(Secret::new("k"), crate::config::ANTHROPIC_MODEL, None)?;
+        let body = a.body(&req);
+        let msgs = body["messages"]
+            .as_array()
+            .ok_or_else(|| Error::BadResponse("missing messages".into()))?;
+        assert_eq!(msgs.len(), 2);
+        assert!(msgs.iter().all(|m| m["role"] == "user"));
         Ok(())
     }
 }

@@ -1880,6 +1880,7 @@ dependencies = [
  "rushy-history",
  "rushy-pty",
  "rushy-tui",
+ "rustix 1.1.5",
  "semver",
  "serde_json",
  "sha2",

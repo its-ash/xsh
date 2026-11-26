@@ -1,8 +1,9 @@
 //! Execution of syntax trees: lists, pipelines, compound commands,
 //! functions, built-ins, external processes, and redirection.
 
+use std::borrow::Cow;
 use std::future::Future;
-use std::io::{self, ErrorKind, IsTerminal as _, Read as _, Write as _};
+use std::io::{self, ErrorKind, IsTerminal as _, Read as _, Seek as _, SeekFrom, Write as _};
 use std::os::fd::OwnedFd;
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::path::PathBuf;
@@ -15,14 +16,17 @@ use tokio::process::{Child, ChildStdout, Command as Proc};
 use tokio::task::JoinHandle;
 
 use crate::ast::{
-    AndOr, CaseEnd, Command, Compound, Connector, List, Pipe, Redir, RedirOp, Simple,
+    AndOr, CaseEnd, Command, Compound, Connector, List, Param, ParamOp, Pipe, Redir, RedirOp, Seg,
+    Simple,
 };
 use crate::builtins::{self, Output};
 use crate::expand::{Exp, split_fields};
 use crate::jobs::JobTable;
 use crate::state::ShellState;
 use crate::test::{self, Tok};
-use crate::{Result, glob, parser};
+use crate::{Result, arith, glob, parser};
+
+const ARITH_CACHE_CAP: usize = 32;
 
 const TEE_KEEP: usize = 32 * 1024;
 /// How long to wait for a tee to drain after its command has exited. A
@@ -51,14 +55,96 @@ pub(crate) struct InBuf {
     pos: usize,
 }
 
+/// Buffered reader for seekable input files; rewinds before handing the raw fd
+/// to an external process so child processes see the exact kernel offset.
+#[derive(Debug)]
+pub(crate) struct FileInput {
+    file: Arc<std::fs::File>,
+    buf: Vec<u8>,
+    pos: usize,
+    seekable: Option<bool>,
+}
+
+impl FileInput {
+    fn new(file: Arc<std::fs::File>) -> Self {
+        Self {
+            file,
+            buf: Vec::new(),
+            pos: 0,
+            seekable: None,
+        }
+    }
+
+    fn is_seekable(&mut self) -> bool {
+        if let Some(s) = self.seekable {
+            return s;
+        }
+        let s = (&*self.file).stream_position().is_ok();
+        self.seekable = Some(s);
+        s
+    }
+
+    fn rewind_and_clone(&mut self) -> io::Result<std::fs::File> {
+        let unread = self.buf.len().saturating_sub(self.pos);
+        if unread > 0 {
+            if let Ok(back) = i64::try_from(unread) {
+                let _ = (&*self.file).seek(SeekFrom::Current(-back));
+            }
+            self.buf.clear();
+            self.pos = 0;
+        }
+        self.file.try_clone()
+    }
+
+    fn read_record(&mut self, delim: u8) -> io::Result<(Vec<u8>, bool)> {
+        let mut out = Vec::new();
+        if !self.is_seekable() {
+            let mut r: &std::fs::File = &self.file;
+            let mut byte = [0u8; 1];
+            loop {
+                match r.read(&mut byte)? {
+                    0 => return Ok((out, true)),
+                    _ if byte[0] == delim => return Ok((out, false)),
+                    _ => out.push(byte[0]),
+                }
+            }
+        }
+        loop {
+            if self.pos < self.buf.len() {
+                let rest = &self.buf[self.pos..];
+                if let Some(i) = rest.iter().position(|&b| b == delim) {
+                    out.extend_from_slice(&rest[..i]);
+                    self.pos += i + 1;
+                    return Ok((out, false));
+                }
+                out.extend_from_slice(rest);
+                self.pos = self.buf.len();
+            }
+            self.buf.resize(8192, 0);
+            let n = (&*self.file).read(&mut self.buf)?;
+            self.buf.truncate(n);
+            self.pos = 0;
+            if n == 0 {
+                return Ok((out, true));
+            }
+        }
+    }
+}
+
 /// Where a command reads standard input from.
 #[derive(Debug, Clone)]
 pub(crate) enum Input {
     Inherit,
     Null,
-    File(Arc<std::fs::File>),
+    File(Arc<Mutex<FileInput>>),
     Buf(Arc<Mutex<InBuf>>),
     Pipe(Arc<Mutex<Option<ChildStdout>>>),
+}
+
+impl Input {
+    pub(crate) fn file(file: Arc<std::fs::File>) -> Self {
+        Self::File(Arc::new(Mutex::new(FileInput::new(file))))
+    }
 }
 
 /// The output end of a pipeline stage.
@@ -105,6 +191,15 @@ enum Reader {
     OutTee(JoinHandle<Vec<u8>>),
     ErrTee(JoinHandle<Vec<u8>>),
     Fill(JoinHandle<()>),
+}
+
+impl Reader {
+    fn abort(&self) {
+        match self {
+            Self::OutTee(h) | Self::ErrTee(h) => h.abort(),
+            Self::Fill(h) => h.abort(),
+        }
+    }
 }
 
 pub(crate) struct Spawned {
@@ -232,7 +327,10 @@ fn write_stdout(bytes: &[u8]) -> io::Result<()> {
     }
     let mut out = io::stdout().lock();
     out.write_all(bytes)?;
-    out.flush()
+    if !bytes.ends_with(b"\n") {
+        out.flush()?;
+    }
+    Ok(())
 }
 
 fn write_stderr(bytes: &[u8]) -> io::Result<()> {
@@ -241,7 +339,10 @@ fn write_stderr(bytes: &[u8]) -> io::Result<()> {
     }
     let mut err = io::stderr().lock();
     err.write_all(bytes)?;
-    err.flush()
+    if !bytes.ends_with(b"\n") {
+        err.flush()?;
+    }
+    Ok(())
 }
 
 async fn drain(input: &Input) -> Input {
@@ -276,7 +377,7 @@ pub(crate) struct Ctx<'a> {
     pub(crate) state: &'a mut ShellState,
     pub(crate) jobs: &'a mut JobTable,
     pub(crate) text: String,
-    pub(crate) temps: Vec<PathBuf>,
+    pub(crate) temps: Vec<tempfile::NamedTempFile>,
     pub(crate) after: Vec<(List, PathBuf)>,
     pub(crate) top: bool,
     cond: u32,
@@ -286,14 +387,7 @@ pub(crate) struct Ctx<'a> {
     depth: u32,
     background: bool,
     subst_status: Option<i32>,
-}
-
-impl Drop for Ctx<'_> {
-    fn drop(&mut self) {
-        for p in &self.temps {
-            let _ = std::fs::remove_file(p);
-        }
-    }
+    arith_cache: Vec<(String, arith::Expr)>,
 }
 
 impl<'a> Ctx<'a> {
@@ -312,6 +406,7 @@ impl<'a> Ctx<'a> {
             depth: 0,
             background: false,
             subst_status: None,
+            arith_cache: Vec::new(),
         }
     }
 
@@ -330,7 +425,23 @@ impl<'a> Ctx<'a> {
             depth: self.depth + 1,
             background: false,
             subst_status: None,
+            arith_cache: Vec::new(),
         }
+    }
+
+    pub(crate) fn eval_arith_cached(&mut self, text: &str) -> Exp<i64> {
+        if let Some(idx) = self.arith_cache.iter().position(|(s, _)| s == text) {
+            let expr = &self.arith_cache[idx].1;
+            return arith::eval_expr(expr, self.state)
+                .map_err(|e| format!("xsh: {}: {e}", text.trim()));
+        }
+        let expr = arith::parse(text).map_err(|e| format!("xsh: {}: {e}", text.trim()))?;
+        let res =
+            arith::eval_expr(&expr, self.state).map_err(|e| format!("xsh: {}: {e}", text.trim()));
+        if self.arith_cache.len() < ARITH_CACHE_CAP {
+            self.arith_cache.push((text.to_owned(), expr));
+        }
+        res
     }
 
     /// Writes to a sink, recording terminal output for the logs.
@@ -398,13 +509,24 @@ impl<'a> Ctx<'a> {
     }
 
     pub(crate) fn run_list<'s>(&'s mut self, list: &'s List, io: &'s Io) -> BoxFut<'s, Ctl> {
+        self.run_list_from(list, 0, io)
+    }
+
+    fn run_list_from<'s>(
+        &'s mut self,
+        list: &'s List,
+        start: usize,
+        io: &'s Io,
+    ) -> BoxFut<'s, Ctl> {
         Box::pin(async move {
-            for item in &list.0 {
+            for item in &list.0[start..] {
                 if self.top {
                     self.state.begin_capture(&self.text);
                 }
                 let ctl = if item.background {
                     self.background_item(&item.and_or, io).await?
+                } else if let Some(res) = self.try_run_and_or_sync(&item.and_or, io) {
+                    res?
                 } else {
                     self.run_and_or(&item.and_or, io).await?
                 };
@@ -414,6 +536,400 @@ impl<'a> Ctx<'a> {
             }
             Ok(Ctl::Normal)
         })
+    }
+
+    /// Runs as many leading items of `list` synchronously as possible without
+    /// allocating a boxed future. Returns `Ok(res)` if the list finished or
+    /// `Err(idx)` with the first item index that requires async execution.
+    fn try_run_list_sync(
+        &mut self,
+        list: &List,
+        io: &Io,
+    ) -> std::result::Result<Result<Ctl>, usize> {
+        for (i, item) in list.0.iter().enumerate() {
+            if item.background {
+                return Err(i);
+            }
+            if self.top {
+                self.state.begin_capture(&self.text);
+            }
+            let Some(res) = self.try_run_and_or_sync(&item.and_or, io) else {
+                return Err(i);
+            };
+            match res {
+                Ok(Ctl::Normal) => {}
+                other => return Ok(other),
+            }
+        }
+        Ok(Ok(Ctl::Normal))
+    }
+
+    async fn run_list_fast(&mut self, list: &List, io: &Io) -> Result<Ctl> {
+        match self.try_run_list_sync(list, io) {
+            Ok(res) => res,
+            Err(idx) => self.run_list_from(list, idx, io).await,
+        }
+    }
+
+    fn try_run_and_or_sync(&mut self, ao: &AndOr, io: &Io) -> Option<Result<Ctl>> {
+        if !ao.rest.is_empty() || ao.first.commands.len() != 1 {
+            return None;
+        }
+        let negated = ao.first.negated;
+        if !negated && self.cond == 0 && self.state.trap("ERR").is_some() {
+            return None;
+        }
+        if negated {
+            self.cond += 1;
+        }
+        let res = self.try_run_command_sync(&ao.first.commands[0], io);
+        if negated {
+            self.cond -= 1;
+        }
+        let ctl = match res? {
+            Ok(c) => c,
+            Err(e) => return Some(Err(e)),
+        };
+        if negated && ctl == Ctl::Normal {
+            let s = self.state.last_status();
+            self.state.set_last_status(i32::from(s == 0));
+            return Some(Ok(Ctl::Normal));
+        }
+        if ctl == Ctl::Normal
+            && !negated
+            && self.cond == 0
+            && self.state.last_status() != 0
+            && self.state.options().errexit
+        {
+            return Some(Ok(Ctl::Exit(self.state.last_status())));
+        }
+        Some(Ok(ctl))
+    }
+
+    fn try_run_command_sync(&mut self, cmd: &Command, io: &Io) -> Option<Result<Ctl>> {
+        if !self.after.is_empty() {
+            return None;
+        }
+        match cmd {
+            Command::Simple(s) => self.try_exec_simple_sync(s, io),
+            Command::Compound(Compound::Arith(expr), redirs) if redirs.is_empty() => {
+                let res = self.try_arith_word_sync(expr)?;
+                Some(match res {
+                    Ok(v) => {
+                        if self.state.options().xtrace
+                            && let Err(e) = self.write_err(io, &format!("+ (( {v} ))"))
+                        {
+                            return Some(Err(e));
+                        }
+                        self.state.set_last_status(i32::from(v == 0));
+                        Ok(Ctl::Normal)
+                    }
+                    Err(msg) => self.arith_fail(io, &msg),
+                })
+            }
+            Command::Compound(Compound::Cond(words), redirs) if redirs.is_empty() => {
+                self.try_cond_expr_sync(words, io)
+            }
+            Command::Function(name, body) => {
+                self.state.set_function(name.clone(), Arc::clone(body));
+                self.state.set_last_status(0);
+                Some(Ok(Ctl::Normal))
+            }
+            Command::Compound(..) => None,
+        }
+    }
+
+    fn try_single_assign_sync(&mut self, s: &Simple, io: &Io) -> Option<Result<Ctl>> {
+        let a = &s.assigns[0];
+        if self.state.is_readonly(&a.name) {
+            return Some(
+                self.write_err(io, &format!("xsh: {}: readonly variable", a.name))
+                    .map(|()| {
+                        self.state.set_last_status(1);
+                        Ctl::Abort
+                    }),
+            );
+        }
+        if !a.append
+            && let [Seg::Arith { expr, .. }] = a.value.segs.as_slice()
+        {
+            let res = self.try_arith_word_sync(expr)?;
+            return Some(match res {
+                Ok(v) => {
+                    self.state.set_var_i64(&a.name, v);
+                    self.state.set_last_status(0);
+                    Ok(Ctl::Normal)
+                }
+                Err(msg) => self.write_err(io, &msg).map(|()| {
+                    self.state.set_last_status(1);
+                    Ctl::Abort
+                }),
+            });
+        }
+        if !a.append
+            && a.value.segs.len() >= 2
+            && let Some(Seg::Param {
+                param:
+                    Param {
+                        name: head_name,
+                        op: ParamOp::Plain,
+                    },
+                ..
+            }) = a.value.segs.first()
+            && head_name == &a.name
+            && (!self.state.options().nounset || self.state.var(&a.name).is_some())
+        {
+            let tail_pure = a.value.segs[1..].iter().all(|seg| match seg {
+                Seg::Lit { .. } => true,
+                Seg::Param {
+                    param:
+                        Param {
+                            name,
+                            op: ParamOp::Plain,
+                        },
+                    ..
+                } => name != &a.name && name != "@" && name != "*",
+                _ => false,
+            });
+            if tail_pure {
+                let mut suffix = String::new();
+                for seg in &a.value.segs[1..] {
+                    match seg {
+                        Seg::Lit { text, .. } => suffix.push_str(text),
+                        Seg::Param {
+                            param: Param { name, .. },
+                            ..
+                        } => {
+                            let val = self.state.lookup_cow(name);
+                            if val.is_none() && self.state.options().nounset {
+                                return Some(
+                                    self.write_err(io, &format!("xsh: {name}: unbound variable"))
+                                        .map(|()| {
+                                            self.state.set_last_status(1);
+                                            Ctl::Abort
+                                        }),
+                                );
+                            }
+                            if let Some(v) = val {
+                                suffix.push_str(&v);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                self.state.append_var_str(&a.name, &suffix);
+                self.state.set_last_status(0);
+                return Some(Ok(Ctl::Normal));
+            }
+        }
+        let v = match self.try_expand_single_sync(&a.value)? {
+            Ok(v) => v,
+            Err(msg) => {
+                return Some(self.write_err(io, &msg).map(|()| {
+                    self.state.set_last_status(1);
+                    Ctl::Abort
+                }));
+            }
+        };
+        if a.append {
+            self.state.append_var_str(&a.name, &v);
+        } else {
+            self.state.set_var_str(&a.name, &v);
+        }
+        self.state.set_last_status(0);
+        Some(Ok(Ctl::Normal))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn try_exec_simple_sync(&mut self, s: &Simple, io: &Io) -> Option<Result<Ctl>> {
+        if self.state.options().xtrace {
+            return None;
+        }
+        if s.words.is_empty() && s.redirects.is_empty() && s.assigns.len() == 1 {
+            return self.try_single_assign_sync(s, io);
+        }
+        let cmd_name = s.words.first()?.plain()?;
+        if !self.state.functions().is_empty() && self.state.functions().contains_key(cmd_name) {
+            return None;
+        }
+        let is_sync_builtin = matches!(
+            cmd_name,
+            ":" | "true"
+                | "false"
+                | "["
+                | "test"
+                | "echo"
+                | "printf"
+                | "break"
+                | "continue"
+                | "return"
+                | "local"
+                | "shift"
+                | "unset"
+                | "export"
+                | "readonly"
+                | "let"
+                | "set"
+                | "shopt"
+                | "read"
+        );
+        if !is_sync_builtin {
+            return None;
+        }
+        if cmd_name == "read" && !matches!(io.input, Input::File(_) | Input::Buf(_) | Input::Null) {
+            return None;
+        }
+        let mut argv = Vec::with_capacity(s.words.len());
+        for w in &s.words {
+            match self.try_expand_fields_into_sync(w, &mut argv)? {
+                Ok(()) => {}
+                Err(msg) => {
+                    return Some(self.write_err(io, &msg).map(|()| {
+                        self.state.set_last_status(1);
+                        Ctl::Abort
+                    }));
+                }
+            }
+        }
+        let mut assigns = Vec::with_capacity(s.assigns.len());
+        for a in &s.assigns {
+            let v = match self.try_expand_single_sync(&a.value)? {
+                Ok(v) => v,
+                Err(msg) => {
+                    return Some(self.write_err(io, &msg).map(|()| {
+                        self.state.set_last_status(1);
+                        Ctl::Abort
+                    }));
+                }
+            };
+            let v = if a.append {
+                format!("{}{v}", self.state.var(&a.name).unwrap_or_default())
+            } else {
+                v
+            };
+            if self.state.is_readonly(&a.name) {
+                return Some(
+                    self.write_err(io, &format!("xsh: {}: readonly variable", a.name))
+                        .map(|()| {
+                            self.state.set_last_status(1);
+                            Ctl::Abort
+                        }),
+                );
+            }
+            assigns.push((a.name.clone(), v));
+        }
+        let owned_io;
+        let io2 = if s.redirects.is_empty() {
+            io
+        } else {
+            owned_io = match self.try_open_redirs_sync(&s.redirects, io)? {
+                Ok(io2) => io2,
+                Err(msg) => {
+                    return Some(self.write_err(io, &msg).map(|()| {
+                        self.state.set_last_status(1);
+                        Ctl::Normal
+                    }));
+                }
+            };
+            &owned_io
+        };
+        let (name, rest) = (&argv[0], &argv[1..]);
+        let saved = (!assigns.is_empty()).then(|| self.apply_temp(&assigns));
+        let ctl = self.run_builtin_sync_inner(name, rest, io2);
+        if let Some(saved) = saved {
+            self.restore_temp(saved);
+        }
+        Some(ctl)
+    }
+
+    fn run_builtin_sync_inner(&mut self, name: &str, args: &[String], io: &Io) -> Result<Ctl> {
+        match name {
+            "break" | "continue" => self.break_continue(name, args, io),
+            "return" => self.return_builtin(args, io),
+            "local" => self.local_builtin(args, io),
+            "read" => self.read_builtin_sync(args, io),
+            _ => {
+                let out = builtins::run_sync(name, args, self.state, self.jobs)
+                    .unwrap_or_else(|| Output::fail(127, format!("xsh: {name}: not a built-in")));
+                self.emit(out, io)
+            }
+        }
+    }
+
+    fn try_cond_expr_sync(&mut self, words: &[crate::ast::Word], io: &Io) -> Option<Result<Ctl>> {
+        const OPS: &[&str] = &["&&", "||", "!", "(", ")", "==", "=", "!=", "<", ">", "=~"];
+        let mut toks = Vec::with_capacity(words.len());
+        let mut pattern_next = false;
+        for w in words {
+            let op = w
+                .plain()
+                .is_some_and(|p| OPS.contains(&p) || p.starts_with('-'));
+            if pattern_next && (w.is_quoted() || w.segs.iter().any(|s| matches!(s, Seg::Tilde(_))))
+            {
+                return None;
+            }
+            let text = match self.try_expand_single_sync(w)? {
+                Ok(t) => t,
+                Err(msg) => return Some(self.arith_fail(io, &msg)),
+            };
+            pattern_next = op && matches!(text.as_str(), "==" | "=" | "!=");
+            toks.push(Tok {
+                text: Cow::Owned(text),
+                op,
+                pattern: None,
+            });
+        }
+        if self.state.options().xtrace {
+            let line: Vec<&str> = toks.iter().map(|t| t.text.as_ref()).collect();
+            if let Err(e) = self.write_err(io, &format!("+ [[ {} ]]", line.join(" "))) {
+                return Some(Err(e));
+            }
+        }
+        let res = {
+            let state = &*self.state;
+            test::eval(&toks, true, state.cwd(), state.options(), &|n| {
+                state.var(n).is_some()
+            })
+        };
+        match res {
+            Ok(v) => self.state.set_last_status(i32::from(!v)),
+            Err(e) => {
+                if let Err(err) = self.write_err(io, &format!("xsh: [[: {e}")) {
+                    return Some(Err(err));
+                }
+                self.state.set_last_status(2);
+            }
+        }
+        Some(Ok(Ctl::Normal))
+    }
+
+    fn try_open_redirs_sync(&mut self, redirs: &[Redir], io: &Io) -> Option<Exp<Io>> {
+        let mut io = io.clone();
+        for r in redirs {
+            let target = match &r.op {
+                RedirOp::HereDoc(w) | RedirOp::HereString(w) => {
+                    match self.try_expand_single_sync(w)? {
+                        Ok(t) => t,
+                        Err(e) => return Some(Err(e)),
+                    }
+                }
+                RedirOp::In(w)
+                | RedirOp::Out { target: w, .. }
+                | RedirOp::Append(w)
+                | RedirOp::ReadWrite(w)
+                | RedirOp::DupOut(w)
+                | RedirOp::DupIn(w)
+                | RedirOp::Both { target: w, .. } => match self.try_expand_single_sync(w)? {
+                    Ok(t) if t.is_empty() => return Some(Err("xsh: ambiguous redirect".into())),
+                    Ok(t) => t,
+                    Err(e) => return Some(Err(e)),
+                },
+            };
+            if let Err(e) = self.apply_redir_target(r, target, &mut io) {
+                return Some(Err(e));
+            }
+        }
+        Some(Ok(io))
     }
 
     fn run_and_or<'s>(&'s mut self, ao: &'s AndOr, io: &'s Io) -> BoxFut<'s, Ctl> {
@@ -438,7 +954,10 @@ impl<'a> Ctx<'a> {
                 let status = self.state.last_status();
                 if let Some(cmd) = self.state.trap("ERR").map(str::to_owned) {
                     if !cmd.is_empty() {
-                        self.run_text(&cmd, io).await?;
+                        let trap_ctl = self.run_text(&cmd, io).await?;
+                        if trap_ctl == Ctl::Abort {
+                            return Ok(Ctl::Abort);
+                        }
                         self.state.set_last_status(status);
                     }
                 }
@@ -479,6 +998,7 @@ impl<'a> Ctx<'a> {
             } else {
                 io.input.clone()
             };
+            let temp_mark = self.temps.len();
             let mut procs: Vec<(usize, Spawned)> = Vec::new();
             let mut statuses = vec![0; n];
             let saved_bg = self.background;
@@ -521,6 +1041,16 @@ impl<'a> Ctx<'a> {
                     }
                     Err(e) => {
                         self.background = saved_bg;
+                        for (_, mut sp) in procs {
+                            for r in &sp.readers {
+                                r.abort();
+                            }
+                            let _ = sp.child.start_kill();
+                            let _ = sp.child.wait().await;
+                        }
+                        if !background {
+                            self.temps.truncate(temp_mark);
+                        }
                         return Err(e);
                     }
                 }
@@ -530,7 +1060,15 @@ impl<'a> Ctx<'a> {
             }
             self.background = saved_bg;
             if background {
-                let children: Vec<Child> = procs.into_iter().map(|(_, sp)| sp.child).collect();
+                let children: Vec<Child> = procs
+                    .into_iter()
+                    .map(|(_, sp)| {
+                        for r in &sp.readers {
+                            r.abort();
+                        }
+                        sp.child
+                    })
+                    .collect();
                 if !children.is_empty() {
                     let (id, pids) = self.jobs.add(&self.text, children);
                     self.state.set_last_bg(pids.last().copied());
@@ -552,6 +1090,7 @@ impl<'a> Ctx<'a> {
                     Ok(c) => c,
                     Err(e) => {
                         fg.set(Vec::new());
+                        self.temps.truncate(temp_mark);
                         return Err(e);
                     }
                 };
@@ -571,6 +1110,13 @@ impl<'a> Ctx<'a> {
                 statuses.last().copied().unwrap_or(0)
             };
             self.state.set_last_status(status);
+            let after_res = if self.after.is_empty() {
+                Ok(())
+            } else {
+                self.run_after().await
+            };
+            self.temps.truncate(temp_mark);
+            after_res?;
             Ok(Ctl::Normal)
         })
     }
@@ -604,6 +1150,7 @@ impl<'a> Ctx<'a> {
                 return self.run_pipe(&ao.first, io, true).await;
             }
             let mut st = self.state.clone();
+            st.reset_foreground();
             let ao = ao.clone();
             let mut io = io.clone();
             if matches!(io.input, Input::Inherit) {
@@ -642,36 +1189,50 @@ impl<'a> Ctx<'a> {
 
     pub(crate) fn run_command<'s>(&'s mut self, cmd: &'s Command, io: &'s Io) -> BoxFut<'s, Ctl> {
         Box::pin(async move {
-            let ctl = match cmd {
-                Command::Simple(s) => match self.exec_simple(s, io).await? {
-                    SimpleRes::Done(c) => c,
-                    SimpleRes::Spawned(sp) => {
-                        let fg = self.state.foreground();
-                        fg.clear_stop();
-                        self.jobs.end_stop_group();
-                        fg.set(sp.child.id().into_iter().collect());
-                        let code = self.finish(sp).await;
-                        fg.set(Vec::new());
-                        self.state.set_last_status(code?);
+            let temp_mark = self.temps.len();
+            let res: Result<Ctl> = async {
+                let ctl = match cmd {
+                    Command::Simple(s) => match self.exec_simple(s, io).await? {
+                        SimpleRes::Done(c) => c,
+                        SimpleRes::Spawned(sp) => {
+                            let fg = self.state.foreground();
+                            fg.clear_stop();
+                            self.jobs.end_stop_group();
+                            fg.set(sp.child.id().into_iter().collect());
+                            let code = self.finish(sp).await;
+                            fg.set(Vec::new());
+                            self.state.set_last_status(code?);
+                            Ctl::Normal
+                        }
+                    },
+                    Command::Compound(c, redirs) => {
+                        if redirs.is_empty() {
+                            self.run_compound(c, io).await?
+                        } else {
+                            match self.open_redirs(redirs, io).await? {
+                                Ok(io2) => self.run_compound(c, &io2).await?,
+                                Err(msg) => {
+                                    self.write_err(io, &msg)?;
+                                    self.state.set_last_status(1);
+                                    Ctl::Normal
+                                }
+                            }
+                        }
+                    }
+                    Command::Function(name, body) => {
+                        self.state.set_function(name.clone(), Arc::clone(body));
+                        self.state.set_last_status(0);
                         Ctl::Normal
                     }
-                },
-                Command::Compound(c, redirs) => match self.open_redirs(redirs, io).await? {
-                    Ok(io2) => self.run_compound(c, &io2).await?,
-                    Err(msg) => {
-                        self.write_err(io, &msg)?;
-                        self.state.set_last_status(1);
-                        Ctl::Normal
-                    }
-                },
-                Command::Function(name, body) => {
-                    self.state.set_function(name.clone(), Arc::clone(body));
-                    self.state.set_last_status(0);
-                    Ctl::Normal
+                };
+                if !self.after.is_empty() {
+                    self.run_after().await?;
                 }
-            };
-            self.run_after().await?;
-            Ok(ctl)
+                Ok(ctl)
+            }
+            .await;
+            self.temps.truncate(temp_mark);
+            res
         })
     }
 
@@ -683,7 +1244,7 @@ impl<'a> Ctx<'a> {
                 Err(_) => continue,
             };
             let io = Io {
-                input: Input::File(file),
+                input: Input::file(file),
                 ..Io::default()
             };
             let status = self.state.last_status();
@@ -709,6 +1270,9 @@ impl<'a> Ctx<'a> {
             }
         };
         let Some(status) = waited else {
+            for r in &readers {
+                r.abort();
+            }
             let (id, new) = self.jobs.add_stopped(&self.text, child);
             if new {
                 let msg = format!("\n[{id}]+  Stopped    {}\n", self.text);
@@ -719,16 +1283,16 @@ impl<'a> Ctx<'a> {
         let code = exit_code(status);
         for r in readers {
             match r {
-                Reader::OutTee(mut h) => {
-                    if let Ok(Ok(b)) = tokio::time::timeout(TEE_GRACE, &mut h).await {
-                        self.state.push_stdout(&b);
-                    }
-                }
-                Reader::ErrTee(mut h) => {
-                    if let Ok(Ok(b)) = tokio::time::timeout(TEE_GRACE, &mut h).await {
-                        self.state.push_stderr(&b);
-                    }
-                }
+                Reader::OutTee(mut h) => match tokio::time::timeout(TEE_GRACE, &mut h).await {
+                    Ok(Ok(b)) => self.state.push_stdout(&b),
+                    Ok(Err(_)) => {}
+                    Err(_) => h.abort(),
+                },
+                Reader::ErrTee(mut h) => match tokio::time::timeout(TEE_GRACE, &mut h).await {
+                    Ok(Ok(b)) => self.state.push_stderr(&b),
+                    Ok(Err(_)) => {}
+                    Err(_) => h.abort(),
+                },
                 Reader::Fill(h) => {
                     let _ = h.await;
                 }
@@ -778,11 +1342,95 @@ impl<'a> Ctx<'a> {
     ) -> BoxFut<'s, SimpleRes> {
         Box::pin(async move {
             self.subst_status = None;
-            let mut argv = Vec::new();
-            for w in &s.words {
-                match self.expand_fields(w).await? {
-                    Ok(f) => argv.extend(f),
+            // Fast path for a single bare assignment with no redirections or xtrace.
+            if s.words.is_empty()
+                && s.redirects.is_empty()
+                && s.assigns.len() == 1
+                && !self.state.options().xtrace
+            {
+                let a = &s.assigns[0];
+                if self.state.is_readonly(&a.name) {
+                    return self.abort(io, &format!("xsh: {}: readonly variable", a.name));
+                }
+                if !a.append
+                    && let [Seg::Arith { expr, .. }] = a.value.segs.as_slice()
+                {
+                    match self.arith_word(expr).await? {
+                        Ok(v) => {
+                            self.state.set_var_i64(&a.name, v);
+                            self.state.set_last_status(self.subst_status.unwrap_or(0));
+                            return Ok(SimpleRes::Done(Ctl::Normal));
+                        }
+                        Err(msg) => return self.abort(io, &msg),
+                    }
+                }
+                if !a.append
+                    && a.value.segs.len() >= 2
+                    && let Some(Seg::Param {
+                        param:
+                            Param {
+                                name: head_name,
+                                op: ParamOp::Plain,
+                            },
+                        ..
+                    }) = a.value.segs.first()
+                    && head_name == &a.name
+                    && (!self.state.options().nounset || self.state.var(&a.name).is_some())
+                {
+                    let tail_pure = a.value.segs[1..].iter().all(|seg| match seg {
+                        Seg::Lit { .. } => true,
+                        Seg::Param {
+                            param:
+                                Param {
+                                    name,
+                                    op: ParamOp::Plain,
+                                },
+                            ..
+                        } => name != &a.name && name != "@" && name != "*",
+                        _ => false,
+                    });
+                    if tail_pure {
+                        let mut suffix = String::new();
+                        for seg in &a.value.segs[1..] {
+                            match seg {
+                                Seg::Lit { text, .. } => suffix.push_str(text),
+                                Seg::Param {
+                                    param: Param { name, .. },
+                                    ..
+                                } => {
+                                    let val = self.state.lookup_cow(name);
+                                    if val.is_none() && self.state.options().nounset {
+                                        return self
+                                            .abort(io, &format!("xsh: {name}: unbound variable"));
+                                    }
+                                    if let Some(v) = val {
+                                        suffix.push_str(&v);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        self.state.append_var_str(&a.name, &suffix);
+                        self.state.set_last_status(0);
+                        return Ok(SimpleRes::Done(Ctl::Normal));
+                    }
+                }
+                let v = match self.expand_single(&a.value).await? {
+                    Ok(v) => v,
                     Err(msg) => return self.abort(io, &msg),
+                };
+                if a.append {
+                    self.state.append_var_str(&a.name, &v);
+                } else {
+                    self.state.set_var_str(&a.name, &v);
+                }
+                self.state.set_last_status(self.subst_status.unwrap_or(0));
+                return Ok(SimpleRes::Done(Ctl::Normal));
+            }
+            let mut argv = Vec::with_capacity(s.words.len());
+            for w in &s.words {
+                if let Err(msg) = self.expand_fields_into(w, &mut argv).await? {
+                    return self.abort(io, &msg);
                 }
             }
             let mut assigns = Vec::with_capacity(s.assigns.len());
@@ -804,46 +1452,60 @@ impl<'a> Ctx<'a> {
             if self.state.options().xtrace {
                 self.trace(&assigns, &argv, io)?;
             }
-            let io2 = match self.open_redirs(&s.redirects, io).await? {
-                Ok(io2) => io2,
-                Err(msg) => {
-                    self.write_err(io, &msg)?;
-                    self.state.set_last_status(1);
-                    return Ok(SimpleRes::Done(Ctl::Normal));
-                }
+            let owned_io;
+            let io2 = if s.redirects.is_empty() {
+                io
+            } else {
+                owned_io = match self.open_redirs(&s.redirects, io).await? {
+                    Ok(io2) => io2,
+                    Err(msg) => {
+                        self.write_err(io, &msg)?;
+                        self.state.set_last_status(1);
+                        return Ok(SimpleRes::Done(Ctl::Normal));
+                    }
+                };
+                &owned_io
             };
-            let Some((first, rest)) = argv.split_first() else {
+            if argv.is_empty() {
                 for (k, v) in assigns {
                     self.state.set_var(k, v);
                 }
                 let status = self.subst_status.unwrap_or(0);
                 self.state.set_last_status(status);
                 return Ok(SimpleRes::Done(Ctl::Normal));
-            };
-            let (name, args) = (first.clone(), rest.to_vec());
-            if let Some(body) = self.state.functions().get(&name).cloned() {
-                let saved = self.apply_temp(&assigns);
-                let io3 = self.for_compound(&io2).await;
+            }
+            if !self.state.functions().is_empty()
+                && let Some(body) = self.state.functions().get(&argv[0]).cloned()
+            {
+                let args = argv.split_off(1);
+                let saved = (!assigns.is_empty()).then(|| self.apply_temp(&assigns));
+                let io3 = self.for_compound(io2).await;
                 let ctl = self.call_function(&body, args, &io3).await;
-                self.restore_temp(saved);
+                if let Some(saved) = saved {
+                    self.restore_temp(saved);
+                }
                 return Ok(SimpleRes::Done(ctl?));
             }
-            if builtins::is_builtin(&name) {
-                let saved = self.apply_temp(&assigns);
-                let ctl = self.run_builtin(&name, &args, &io2).await;
-                self.restore_temp(saved);
+            let (name, args) = (&argv[0], &argv[1..]);
+            if builtins::is_builtin(name) {
+                let saved = (!assigns.is_empty()).then(|| self.apply_temp(&assigns));
+                let ctl = self.run_builtin(name, args, io2).await;
+                if let Some(saved) = saved {
+                    self.restore_temp(saved);
+                }
                 return Ok(SimpleRes::Done(ctl?));
             }
             if args.is_empty()
                 && assigns.is_empty()
                 && self.state.options().autocd
-                && builtins::find_programs(&name, self.state).is_empty()
-                && self.state.resolve(&name).is_dir()
+                && builtins::find_programs(name, self.state).is_empty()
+                && self.state.resolve(name).is_dir()
             {
-                let ctl = self.run_builtin("cd", &[name], &io2).await?;
+                let dir_arg = [argv.remove(0)];
+                let ctl = self.run_builtin("cd", &dir_arg, io2).await?;
                 return Ok(SimpleRes::Done(ctl));
             }
-            match self.spawn(&name, &args, &assigns, &io2)? {
+            match self.spawn(name, args, &assigns, io2)? {
                 Ok(sp) => Ok(SimpleRes::Spawned(sp)),
                 Err(status) => {
                     self.state.set_last_status(status);
@@ -915,7 +1577,13 @@ impl<'a> Ctx<'a> {
         let stdin = match &io.input {
             Input::Inherit => Stdio::inherit(),
             Input::Null => Stdio::null(),
-            Input::File(f) => Stdio::from(f.try_clone()?),
+            Input::File(f) => {
+                let file = f
+                    .lock()
+                    .map_err(|_| io::Error::other("input lock poisoned"))?
+                    .rewind_and_clone()?;
+                Stdio::from(file)
+            }
             Input::Buf(b) => {
                 let bytes = b
                     .lock()
@@ -1002,7 +1670,12 @@ impl<'a> Ctx<'a> {
         let loops = std::mem::take(&mut self.loops);
         let old = self.state.replace_positional(args);
         self.state.push_frame();
-        let res = self.run_command(body, io).await;
+        let res = match &**body {
+            Command::Compound(Compound::Group(list), redirs) if redirs.is_empty() => {
+                self.run_list_fast(list, io).await
+            }
+            _ => self.run_command(body, io).await,
+        };
         self.state.pop_frame();
         self.state.replace_positional(old);
         self.loops = loops;
@@ -1016,16 +1689,17 @@ impl<'a> Ctx<'a> {
 
     /// Runs `list` in a copy of the state; returns its status.
     pub(crate) async fn subshell(&mut self, list: &List, io: &Io) -> Result<i32> {
-        let mut st = self.state.clone();
-        let ctl = {
+        let mut st = self.state.subshell_clone();
+        let res = {
             let mut sub = self.sub(&mut st);
-            sub.run_list(list, io).await?
+            sub.run_list(list, io).await
         };
+        self.state.adopt_logs(&mut st);
+        let ctl = res?;
         let status = match ctl {
             Ctl::Exit(c) => c,
             _ => st.last_status(),
         };
-        self.state.adopt_logs(&mut st);
         self.state.set_last_status(status);
         Ok(status)
     }
@@ -1040,7 +1714,10 @@ impl<'a> Ctx<'a> {
         };
         let status = self.subshell(list, &io).await?;
         self.subst_status = Some(status);
-        let bytes = buf.lock().map(|g| g.clone()).unwrap_or_default();
+        let bytes = buf
+            .lock()
+            .map(|mut g| std::mem::take(&mut *g))
+            .unwrap_or_default();
         let mut out = String::from_utf8_lossy(&bytes).into_owned();
         while out.ends_with('\n') {
             out.pop();
@@ -1050,7 +1727,7 @@ impl<'a> Ctx<'a> {
 
     async fn loop_body(&mut self, body: &List, io: &Io) -> Result<Option<Ctl>> {
         self.loops += 1;
-        let res = self.run_list(body, io).await;
+        let res = self.run_list_fast(body, io).await;
         self.loops -= 1;
         Ok(match res? {
             Ctl::Break(n) if n > 1 => Some(Ctl::Break(n - 1)),
@@ -1063,7 +1740,7 @@ impl<'a> Ctx<'a> {
 
     async fn cond_list(&mut self, list: &List, io: &Io) -> Result<Ctl> {
         self.cond += 1;
-        let res = self.run_list(list, io).await;
+        let res = self.run_list_fast(list, io).await;
         self.cond -= 1;
         res
     }
@@ -1072,7 +1749,7 @@ impl<'a> Ctx<'a> {
     fn run_compound<'s>(&'s mut self, c: &'s Compound, io: &'s Io) -> BoxFut<'s, Ctl> {
         Box::pin(async move {
             match c {
-                Compound::Group(list) => self.run_list(list, io).await,
+                Compound::Group(list) => self.run_list_fast(list, io).await,
                 Compound::Subshell(list) => {
                     self.subshell(list, io).await?;
                     Ok(Ctl::Normal)
@@ -1087,11 +1764,11 @@ impl<'a> Ctx<'a> {
                             return Ok(ctl);
                         }
                         if self.state.last_status() == 0 {
-                            return self.run_list(body, io).await;
+                            return self.run_list_fast(body, io).await;
                         }
                     }
                     if let Some(list) = otherwise {
-                        self.run_list(list, io).await
+                        self.run_list_fast(list, io).await
                     } else {
                         self.state.set_last_status(0);
                         Ok(Ctl::Normal)
@@ -1138,7 +1815,12 @@ impl<'a> Ctx<'a> {
                     };
                     self.state.set_last_status(0);
                     for value in values {
-                        self.state.set_var(var.clone(), value);
+                        if self.state.is_readonly(var) {
+                            self.write_err(io, &format!("xsh: {var}: readonly variable"))?;
+                            self.state.set_last_status(1);
+                            return Ok(Ctl::Abort);
+                        }
+                        self.state.set_var_str(var, &value);
                         match self.loop_body(body, io).await? {
                             None => {}
                             Some(Ctl::Normal) => break,
@@ -1157,12 +1839,30 @@ impl<'a> Ctx<'a> {
                         return self.arith_fail(io, &msg);
                     }
                     self.state.set_last_status(0);
+                    let cond_empty = cond.segs.iter().all(|s| {
+                        matches!(s, crate::ast::Seg::Lit { text, .. } if text.trim().is_empty())
+                    });
+                    let cond_parsed = if cond_empty {
+                        None
+                    } else if let [Seg::Lit { text, .. }] = cond.segs.as_slice() {
+                        Some((text.as_str(), arith::parse(text)))
+                    } else {
+                        None
+                    };
+                    let step_parsed = if let [Seg::Lit { text, .. }] = step.segs.as_slice() {
+                        Some((text.as_str(), arith::parse(text)))
+                    } else {
+                        None
+                    };
                     loop {
-                        let empty = cond.segs.iter().all(|s| {
-                            matches!(s, crate::ast::Seg::Lit { text, .. } if text.trim().is_empty())
-                        });
-                        if !empty {
-                            match self.arith_word(cond).await? {
+                        if !cond_empty {
+                            let v = match &cond_parsed {
+                                Some((src, Ok(ast))) => arith::eval_expr(ast, self.state)
+                                    .map_err(|e| format!("xsh: {}: {e}", src.trim())),
+                                Some((src, Err(e))) => Err(format!("xsh: {}: {e}", src.trim())),
+                                None => self.arith_word(cond).await?,
+                            };
+                            match v {
                                 Ok(0) => break,
                                 Ok(_) => {}
                                 Err(msg) => return self.arith_fail(io, &msg),
@@ -1173,7 +1873,13 @@ impl<'a> Ctx<'a> {
                             Some(Ctl::Normal) => break,
                             Some(other) => return Ok(other),
                         }
-                        if let Err(msg) = self.arith_word(step).await? {
+                        let step_res = match &step_parsed {
+                            Some((src, Ok(ast))) => arith::eval_expr(ast, self.state)
+                                .map_err(|e| format!("xsh: {}: {e}", src.trim())),
+                            Some((src, Err(e))) => Err(format!("xsh: {}: {e}", src.trim())),
+                            None => self.arith_word(step).await?,
+                        };
+                        if let Err(msg) = step_res {
                             return self.arith_fail(io, &msg);
                         }
                     }
@@ -1248,24 +1954,32 @@ impl<'a> Ctx<'a> {
                 Ok(t) => t,
                 Err(msg) => return self.arith_fail(io, &msg),
             };
-            let pattern = if pattern_next {
+            let pattern = if pattern_next
+                && (w.is_quoted() || w.segs.iter().any(|s| matches!(s, Seg::Tilde(_))))
+            {
                 match self.expand_pattern(w).await? {
-                    Ok(p) => Some(p),
+                    Ok(p) => Some(Cow::Owned(p)),
                     Err(msg) => return self.arith_fail(io, &msg),
                 }
             } else {
                 None
             };
             pattern_next = op && matches!(text.as_str(), "==" | "=" | "!=");
-            toks.push(Tok { text, op, pattern });
+            toks.push(Tok {
+                text: Cow::Owned(text),
+                op,
+                pattern,
+            });
         }
         if self.state.options().xtrace {
-            let line: Vec<&str> = toks.iter().map(|t| t.text.as_str()).collect();
+            let line: Vec<&str> = toks.iter().map(|t| t.text.as_ref()).collect();
             self.write_err(io, &format!("+ [[ {} ]]", line.join(" ")))?;
         }
         let res = {
             let state = &*self.state;
-            test::eval(&toks, true, state.cwd(), &|n| state.var(n).is_some())
+            test::eval(&toks, true, state.cwd(), state.options(), &|n| {
+                state.var(n).is_some()
+            })
         };
         match res {
             Ok(v) => self.state.set_last_status(i32::from(!v)),
@@ -1279,29 +1993,102 @@ impl<'a> Ctx<'a> {
 
     /// Parses and runs `text` in this context (for traps and `eval`).
     pub(crate) async fn run_text(&mut self, text: &str, io: &Io) -> Result<Ctl> {
-        match parser::parse_program(text, self.state.aliases()) {
+        if self.depth >= MAX_NESTING {
+            self.write_err(io, "xsh: maximum nesting level exceeded")?;
+            self.state.set_last_status(1);
+            return Ok(Ctl::Abort);
+        }
+        self.depth += 1;
+        let res = match parser::parse_program(text, self.state.aliases()) {
             Ok(list) => self.run_list(&list, io).await,
             Err(e) => {
                 self.write_err(io, &format!("xsh: {e}"))?;
                 self.state.set_last_status(2);
                 Ok(Ctl::Normal)
             }
-        }
+        };
+        self.depth -= 1;
+        res
     }
 
-    #[allow(clippy::too_many_lines)]
+    fn apply_redir_target(&self, r: &Redir, target: String, io: &mut Io) -> Exp<()> {
+        let input_op = matches!(
+            r.op,
+            RedirOp::In(_)
+                | RedirOp::ReadWrite(_)
+                | RedirOp::DupIn(_)
+                | RedirOp::HereDoc(_)
+                | RedirOp::HereString(_)
+        );
+        let fd = r.fd.unwrap_or(u32::from(!input_op));
+        if input_op {
+            if fd != 0 {
+                return Err(format!("xsh: {fd}: input redirection only works on 0"));
+            }
+            io.input = match &r.op {
+                RedirOp::HereDoc(_) => buf_input(target.into_bytes()),
+                RedirOp::HereString(_) => buf_input(format!("{target}\n").into_bytes()),
+                RedirOp::DupIn(_) => match target.as_str() {
+                    "-" => Input::Null,
+                    "0" => io.input.clone(),
+                    _ => return Err(format!("xsh: {target}: bad file descriptor")),
+                },
+                RedirOp::ReadWrite(_) => {
+                    Input::file(self.open_file(&target, true, true, false, false)?)
+                }
+                _ => Input::file(self.open_file(&target, true, false, false, false)?),
+            };
+            return Ok(());
+        }
+        let sink = match &r.op {
+            RedirOp::Out { clobber, .. } => {
+                if self.state.options().noclobber
+                    && !clobber
+                    && self.state.resolve(&target).is_file()
+                {
+                    return Err(format!("xsh: {target}: cannot overwrite existing file"));
+                }
+                Sink::File(self.open_file(&target, false, true, false, true)?)
+            }
+            RedirOp::Append(_) => Sink::File(self.open_file(&target, false, true, true, false)?),
+            RedirOp::Both { append, .. } => {
+                let f = self.open_file(&target, false, true, *append, !append)?;
+                io.out = Sink::File(Arc::clone(&f));
+                io.err = Sink::File(f);
+                return Ok(());
+            }
+            RedirOp::DupOut(_) => match target.as_str() {
+                "-" => Sink::Null,
+                "1" => io.out.clone(),
+                "2" => io.err.clone(),
+                t if r.fd.is_none() && !t.bytes().all(|b| b.is_ascii_digit()) => {
+                    let f = self.open_file(t, false, true, false, true)?;
+                    io.out = Sink::File(Arc::clone(&f));
+                    io.err = Sink::File(f);
+                    return Ok(());
+                }
+                t => return Err(format!("xsh: {t}: bad file descriptor")),
+            },
+            _ => return Ok(()),
+        };
+        match fd {
+            1 => io.out = sink,
+            2 => io.err = sink,
+            _ => {
+                return Err(format!(
+                    "xsh: {fd}: only file descriptors 0, 1, and 2 can be redirected"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     async fn open_redirs(&mut self, redirs: &[Redir], io: &Io) -> Result<Exp<Io>> {
+        if let Some(res) = self.try_open_redirs_sync(redirs, io) {
+            return Ok(res);
+        }
         let mut io = io.clone();
         for r in redirs {
-            let input_op = matches!(
-                r.op,
-                RedirOp::In(_)
-                    | RedirOp::ReadWrite(_)
-                    | RedirOp::DupIn(_)
-                    | RedirOp::HereDoc(_)
-                    | RedirOp::HereString(_)
-            );
-            let fd = r.fd.unwrap_or(u32::from(!input_op));
             let target = match &r.op {
                 RedirOp::HereDoc(w) | RedirOp::HereString(w) => {
                     match self.expand_single(w).await? {
@@ -1321,84 +2108,8 @@ impl<'a> Ctx<'a> {
                     Err(e) => return Ok(Err(e)),
                 },
             };
-            if input_op {
-                if fd != 0 {
-                    return Ok(Err(format!("xsh: {fd}: input redirection only works on 0")));
-                }
-                io.input = match &r.op {
-                    RedirOp::HereDoc(_) => buf_input(target.into_bytes()),
-                    RedirOp::HereString(_) => buf_input(format!("{target}\n").into_bytes()),
-                    RedirOp::DupIn(_) => match target.as_str() {
-                        "-" => Input::Null,
-                        "0" => io.input.clone(),
-                        _ => return Ok(Err(format!("xsh: {target}: bad file descriptor"))),
-                    },
-                    RedirOp::ReadWrite(_) => {
-                        match self.open_file(&target, true, true, false, false) {
-                            Ok(f) => Input::File(f),
-                            Err(e) => return Ok(Err(e)),
-                        }
-                    }
-                    _ => match self.open_file(&target, true, false, false, false) {
-                        Ok(f) => Input::File(f),
-                        Err(e) => return Ok(Err(e)),
-                    },
-                };
-                continue;
-            }
-            let sink = match &r.op {
-                RedirOp::Out { clobber, .. } => {
-                    if self.state.options().noclobber
-                        && !clobber
-                        && self.state.resolve(&target).is_file()
-                    {
-                        return Ok(Err(format!(
-                            "xsh: {target}: cannot overwrite existing file"
-                        )));
-                    }
-                    match self.open_file(&target, false, true, false, true) {
-                        Ok(f) => Sink::File(f),
-                        Err(e) => return Ok(Err(e)),
-                    }
-                }
-                RedirOp::Append(_) => match self.open_file(&target, false, true, true, false) {
-                    Ok(f) => Sink::File(f),
-                    Err(e) => return Ok(Err(e)),
-                },
-                RedirOp::Both { append, .. } => {
-                    let f = match self.open_file(&target, false, true, *append, !append) {
-                        Ok(f) => f,
-                        Err(e) => return Ok(Err(e)),
-                    };
-                    io.out = Sink::File(Arc::clone(&f));
-                    io.err = Sink::File(f);
-                    continue;
-                }
-                RedirOp::DupOut(_) => match target.as_str() {
-                    "-" => Sink::Null,
-                    "1" => io.out.clone(),
-                    "2" => io.err.clone(),
-                    t if r.fd.is_none() && !t.bytes().all(|b| b.is_ascii_digit()) => {
-                        let f = match self.open_file(t, false, true, false, true) {
-                            Ok(f) => f,
-                            Err(e) => return Ok(Err(e)),
-                        };
-                        io.out = Sink::File(Arc::clone(&f));
-                        io.err = Sink::File(f);
-                        continue;
-                    }
-                    t => return Ok(Err(format!("xsh: {t}: bad file descriptor"))),
-                },
-                _ => continue,
-            };
-            match fd {
-                1 => io.out = sink,
-                2 => io.err = sink,
-                _ => {
-                    return Ok(Err(format!(
-                        "xsh: {fd}: only file descriptors 0, 1, and 2 can be redirected"
-                    )));
-                }
+            if let Err(e) = self.apply_redir_target(r, target, &mut io) {
+                return Ok(Err(e));
             }
         }
         Ok(Ok(io))
@@ -1463,83 +2174,88 @@ impl<'a> Ctx<'a> {
                     }
                 },
                 "read" => self.read_builtin(args, io).await,
-                "break" | "continue" => {
-                    let n = match args.first().map(|a| a.parse::<u32>()) {
-                        None => 1,
-                        Some(Ok(n)) if n >= 1 => n,
-                        Some(_) => {
-                            let out = Output::fail(
-                                1,
-                                format!("{name}: loop count must be a positive number"),
-                            );
-                            return self.emit(out, io);
-                        }
-                    };
-                    if self.loops == 0 {
-                        let out = Output {
-                            stderr: format!("xsh: {name}: only meaningful in a loop\n"),
-                            ..Output::default()
-                        };
-                        return self.emit(out, io);
-                    }
-                    self.state.set_last_status(0);
-                    let n = n.min(self.loops);
-                    Ok(if name == "break" {
-                        Ctl::Break(n)
-                    } else {
-                        Ctl::Continue(n)
-                    })
-                }
-                "return" => {
-                    if self.funcs == 0 && self.sources == 0 {
-                        let out = Output::fail(
-                            2,
-                            "return: can only return from a function or sourced script",
-                        );
-                        return self.emit(out, io);
-                    }
-                    let status = match args.first().map(|a| a.parse::<i32>()) {
-                        None => self.state.last_status(),
-                        Some(Ok(n)) => n & 0xff,
-                        Some(Err(_)) => {
-                            let out = Output::fail(2, "return: numeric argument required");
-                            self.emit(out, io)?;
-                            2
-                        }
-                    };
-                    self.state.set_last_status(status);
-                    Ok(Ctl::Return)
-                }
-                "local" => {
-                    let mut out = Output::default();
-                    if self.funcs == 0 {
-                        out.error(1, "local: can only be used in a function");
-                        return self.emit(out, io);
-                    }
-                    for a in args {
-                        let (n, v) = a
-                            .split_once('=')
-                            .map_or((a.as_str(), None), |(n, v)| (n, Some(v)));
-                        if !parser::is_var_name(n) {
-                            out.error(1, format!("local: `{a}`: not a valid identifier"));
-                            continue;
-                        }
-                        // As in bash, `local x` starts out unset; it does
-                        // not inherit the caller's value.
-                        self.state.make_local(n);
-                        match v {
-                            Some(v) => self.state.set_var(n, v),
-                            None => self.state.clear_var(n),
-                        }
-                    }
-                    self.emit(out, io)
-                }
+                "break" | "continue" => self.break_continue(name, args, io),
+                "return" => self.return_builtin(args, io),
+                "local" => self.local_builtin(args, io),
                 _ => {
                     let out = builtins::run(name, args, self.state, self.jobs).await;
                     self.emit(out, io)
                 }
             }
         })
+    }
+
+    fn break_continue(&mut self, name: &str, args: &[String], io: &Io) -> Result<Ctl> {
+        let n = match args.first().map(|a| a.parse::<u32>()) {
+            None => 1,
+            Some(Ok(n)) if n >= 1 => n,
+            Some(_) => {
+                let out = Output::fail(1, format!("{name}: loop count must be a positive number"));
+                return self.emit(out, io);
+            }
+        };
+        if self.loops == 0 {
+            let out = Output {
+                stderr: format!("xsh: {name}: only meaningful in a loop\n"),
+                ..Output::default()
+            };
+            return self.emit(out, io);
+        }
+        self.state.set_last_status(0);
+        let n = n.min(self.loops);
+        Ok(if name == "break" {
+            Ctl::Break(n)
+        } else {
+            Ctl::Continue(n)
+        })
+    }
+
+    fn return_builtin(&mut self, args: &[String], io: &Io) -> Result<Ctl> {
+        if self.funcs == 0 && self.sources == 0 {
+            let out = Output::fail(
+                2,
+                "return: can only return from a function or sourced script",
+            );
+            return self.emit(out, io);
+        }
+        let status = match args.first().map(|a| a.parse::<i32>()) {
+            None => self.state.last_status(),
+            Some(Ok(n)) => n & 0xff,
+            Some(Err(_)) => {
+                let out = Output::fail(2, "return: numeric argument required");
+                self.emit(out, io)?;
+                2
+            }
+        };
+        self.state.set_last_status(status);
+        Ok(Ctl::Return)
+    }
+
+    fn local_builtin(&mut self, args: &[String], io: &Io) -> Result<Ctl> {
+        let mut out = Output::default();
+        if self.funcs == 0 {
+            out.error(1, "local: can only be used in a function");
+            return self.emit(out, io);
+        }
+        for a in args {
+            let (n, v) = a
+                .split_once('=')
+                .map_or((a.as_str(), None), |(n, v)| (n, Some(v)));
+            if !parser::is_var_name(n) {
+                out.error(1, format!("local: `{a}`: not a valid identifier"));
+                continue;
+            }
+            if self.state.is_readonly(n) {
+                out.error(1, format!("local: {n}: readonly variable"));
+                continue;
+            }
+            self.state.make_local(n);
+            match v {
+                Some(v) => self.state.set_var_str(n, v),
+                None => self.state.clear_var(n),
+            }
+        }
+        self.emit(out, io)
     }
 
     async fn source(&mut self, name: &str, args: &[String], io: &Io) -> Result<Ctl> {
@@ -1621,6 +2337,10 @@ impl<'a> Ctx<'a> {
         if let Some(cmd) = self.state.trap("EXIT").map(str::to_owned) {
             self.state.traps_mut().remove("EXIT");
             self.run_text(&cmd, io).await?;
+        }
+        if let Err(e) = apply_exec_io(io) {
+            let out = Output::fail(1, format!("xsh: exec: {e}"));
+            return self.emit(out, io);
         }
         let err = std::process::Command::new(prog)
             .args(rest)
@@ -1719,10 +2439,9 @@ impl<'a> Ctx<'a> {
         Ok(Ctl::Normal)
     }
 
-    async fn read_record(&mut self, input: &Input, delim: u8) -> Result<(Vec<u8>, bool)> {
+    fn read_record_sync(input: &Input, delim: u8) -> Result<(Vec<u8>, bool)> {
         let mut out = Vec::new();
         match input {
-            Input::Null => Ok((out, true)),
             Input::Buf(b) => {
                 let Ok(mut g) = b.lock() else {
                     return Ok((out, true));
@@ -1739,51 +2458,27 @@ impl<'a> Ctx<'a> {
                 }
             }
             Input::File(f) => {
-                let mut r: &std::fs::File = f;
-                let mut byte = [0u8; 1];
-                loop {
-                    match r.read(&mut byte)? {
-                        0 => return Ok((out, true)),
-                        _ if byte[0] == delim => return Ok((out, false)),
-                        _ => out.push(byte[0]),
-                    }
-                }
+                let mut g = f
+                    .lock()
+                    .map_err(|_| io::Error::other("input lock poisoned"))?;
+                Ok(g.read_record(delim)?)
             }
-            Input::Inherit => {
-                let res = tokio::task::spawn_blocking(move || {
-                    let mut data = Vec::new();
-                    let mut byte = [0u8; 1];
-                    let mut stdin = io::stdin().lock();
-                    loop {
-                        match stdin.read(&mut byte) {
-                            Ok(0) | Err(_) => return (data, true),
-                            Ok(_) if byte[0] == delim => return (data, false),
-                            Ok(_) => data.push(byte[0]),
-                        }
-                    }
-                })
-                .await;
-                Ok(res.unwrap_or((out, true)))
-            }
-            Input::Pipe(_) => {
-                let drained = drain(input).await;
-                return Box::pin(self.read_record(&drained, delim)).await;
-            }
+            Input::Null | Input::Inherit | Input::Pipe(_) => Ok((out, true)),
         }
     }
 
-    async fn read_builtin(&mut self, args: &[String], io: &Io) -> Result<Ctl> {
+    fn read_builtin_sync(&mut self, args: &[String], io: &Io) -> Result<Ctl> {
         let (mut raw, mut prompt, mut delim) = (false, None, b'\n');
-        let mut names = Vec::new();
+        let mut names: Vec<&str> = Vec::new();
         let mut i = 0;
         while let Some(a) = args.get(i) {
             i += 1;
             if !names.is_empty() || !a.starts_with('-') || a == "-" {
-                names.push(a.clone());
+                names.push(a.as_str());
                 continue;
             }
             if a == "--" {
-                names.extend(args.get(i..).unwrap_or_default().iter().cloned());
+                names.extend(args.get(i..).unwrap_or_default().iter().map(String::as_str));
                 break;
             }
             let flags: Vec<char> = a.chars().skip(1).collect();
@@ -1820,7 +2515,150 @@ impl<'a> Ctx<'a> {
         if let Some(p) = prompt {
             self.write_sink(&io.err, p.as_bytes())?;
         }
+        let mut line = Vec::new();
+        let mut eof;
+        loop {
+            let (chunk, end) = Self::read_record_sync(&io.input, delim)?;
+            eof = end;
+            if raw {
+                line = chunk;
+                break;
+            }
+            let mut it = chunk.into_iter().peekable();
+            let mut cont = false;
+            while let Some(b) = it.next() {
+                if b == b'\\' {
+                    match it.next() {
+                        Some(n) => line.push(n),
+                        None => cont = true,
+                    }
+                } else {
+                    line.push(b);
+                }
+            }
+            if !cont || eof {
+                break;
+            }
+        }
+        self.finish_read(&names, &line, eof, io)
+    }
+
+    fn finish_read(&mut self, names: &[&str], line: &[u8], eof: bool, io: &Io) -> Result<Ctl> {
+        let text = String::from_utf8_lossy(line);
+        let no_data = eof && text.is_empty();
+        let mut ro_err = false;
+        if names.is_empty() {
+            if self.state.is_readonly("REPLY") {
+                self.write_err(io, "read: REPLY: readonly variable")?;
+                ro_err = true;
+            } else {
+                self.state.set_var_str("REPLY", &text);
+            }
+        } else if names.len() == 1 && self.state.var("IFS").is_some_and(str::is_empty) {
+            let name = names[0];
+            if self.state.is_readonly(name) {
+                self.write_err(io, &format!("read: {name}: readonly variable"))?;
+                ro_err = true;
+            } else {
+                self.state.set_var_str(name, &text);
+            }
+        } else {
+            let ifs = self
+                .state
+                .var("IFS")
+                .map_or_else(|| " \t\n".to_owned(), str::to_owned);
+            let fields = split_fields(&text, &ifs, names.len());
+            for (k, name) in names.iter().enumerate() {
+                let value = fields.get(k).map_or("", String::as_str);
+                if self.state.is_readonly(name) {
+                    self.write_err(io, &format!("read: {name}: readonly variable"))?;
+                    ro_err = true;
+                } else {
+                    self.state.set_var_str(name, value);
+                }
+            }
+        }
+        self.state.set_last_status(i32::from(no_data || ro_err));
+        Ok(Ctl::Normal)
+    }
+
+    async fn read_record(&self, input: &Input, delim: u8) -> Result<(Vec<u8>, bool)> {
+        match input {
+            Input::Null | Input::Buf(_) | Input::File(_) => Self::read_record_sync(input, delim),
+            Input::Inherit => {
+                let res = tokio::task::spawn_blocking(move || {
+                    let mut data = Vec::new();
+                    let mut byte = [0u8; 1];
+                    let mut stdin = io::stdin().lock();
+                    loop {
+                        match stdin.read(&mut byte) {
+                            Ok(0) | Err(_) => return (data, true),
+                            Ok(_) if byte[0] == delim => return (data, false),
+                            Ok(_) => data.push(byte[0]),
+                        }
+                    }
+                })
+                .await;
+                Ok(res.unwrap_or((Vec::new(), true)))
+            }
+            Input::Pipe(_) => {
+                let drained = drain(input).await;
+                return Box::pin(self.read_record(&drained, delim)).await;
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn read_builtin(&mut self, args: &[String], io: &Io) -> Result<Ctl> {
+        let (mut raw, mut silent, mut prompt, mut delim) = (false, false, None, b'\n');
+        let mut names = Vec::new();
+        let mut i = 0;
+        while let Some(a) = args.get(i) {
+            i += 1;
+            if !names.is_empty() || !a.starts_with('-') || a == "-" {
+                names.push(a.clone());
+                continue;
+            }
+            if a == "--" {
+                names.extend(args.get(i..).unwrap_or_default().iter().cloned());
+                break;
+            }
+            let flags: Vec<char> = a.chars().skip(1).collect();
+            for (k, c) in flags.iter().enumerate() {
+                match c {
+                    'r' => raw = true,
+                    's' => silent = true,
+                    'p' | 'd' => {
+                        let tail: String = flags.get(k + 1..).unwrap_or_default().iter().collect();
+                        let value = if tail.is_empty() {
+                            i += 1;
+                            args.get(i - 1).cloned().unwrap_or_default()
+                        } else {
+                            tail
+                        };
+                        if *c == 'p' {
+                            prompt = Some(value);
+                        } else {
+                            delim = value.bytes().next().unwrap_or(0);
+                        }
+                        break;
+                    }
+                    _ => {
+                        let out = Output::fail(2, format!("read: -{c}: invalid option"));
+                        return self.emit(out, io);
+                    }
+                }
+            }
+        }
+        if let Some(bad) = names.iter().find(|n| !parser::is_var_name(n)) {
+            let out = Output::fail(1, format!("read: `{bad}': not a valid identifier"));
+            return self.emit(out, io);
+        }
+        if let Some(p) = prompt {
+            self.write_sink(&io.err, p.as_bytes())?;
+        }
         let input = drain(&io.input).await;
+        let echo_guard = (silent && matches!(input, Input::Inherit)).then(EchoGuard::suppress);
         let mut line = Vec::new();
         let mut eof;
         loop {
@@ -1846,19 +2684,144 @@ impl<'a> Ctx<'a> {
                 break;
             }
         }
+        drop(echo_guard);
         let text = String::from_utf8_lossy(&line).into_owned();
         let no_data = eof && text.is_empty();
+        let mut ro_err = false;
         if names.is_empty() {
-            self.state.set_var("REPLY", text);
+            if self.state.is_readonly("REPLY") {
+                self.write_err(io, "read: REPLY: readonly variable")?;
+                ro_err = true;
+            } else {
+                self.state.set_var("REPLY", text);
+            }
+        } else if names.len() == 1 && self.state.var("IFS").is_some_and(str::is_empty) {
+            let name = &names[0];
+            if self.state.is_readonly(name) {
+                self.write_err(io, &format!("read: {name}: readonly variable"))?;
+                ro_err = true;
+            } else {
+                self.state.set_var_str(name, &text);
+            }
         } else {
             let ifs = self.state.var("IFS").unwrap_or(" \t\n").to_owned();
             let fields = split_fields(&text, &ifs, names.len());
             for (k, name) in names.iter().enumerate() {
-                self.state
-                    .set_var(name.clone(), fields.get(k).cloned().unwrap_or_default());
+                if self.state.is_readonly(name) {
+                    self.write_err(io, &format!("read: {name}: readonly variable"))?;
+                    ro_err = true;
+                } else {
+                    self.state
+                        .set_var_str(name, fields.get(k).map_or("", String::as_str));
+                }
             }
         }
-        self.state.set_last_status(i32::from(eof || no_data));
+        self.state
+            .set_last_status(i32::from(eof || no_data || ro_err));
         Ok(Ctl::Normal)
+    }
+}
+
+struct EchoGuard {
+    saved: Option<rustix::termios::Termios>,
+}
+
+impl EchoGuard {
+    fn suppress() -> Self {
+        use rustix::termios::{LocalModes, OptionalActions, tcgetattr, tcsetattr};
+        let stdin = io::stdin();
+        if !stdin.is_terminal() {
+            return Self { saved: None };
+        }
+        let Ok(orig) = tcgetattr(&stdin) else {
+            return Self { saved: None };
+        };
+        let mut muted = orig.clone();
+        muted.local_modes.remove(LocalModes::ECHO);
+        if tcsetattr(&stdin, OptionalActions::Now, &muted).is_err() {
+            return Self { saved: None };
+        }
+        Self { saved: Some(orig) }
+    }
+}
+
+impl Drop for EchoGuard {
+    fn drop(&mut self) {
+        if let Some(orig) = &self.saved {
+            let _ = rustix::termios::tcsetattr(
+                io::stdin(),
+                rustix::termios::OptionalActions::Now,
+                orig,
+            );
+        }
+    }
+}
+
+fn apply_exec_io(io_cfg: &Io) -> io::Result<()> {
+    use rustix::stdio::{dup2_stderr, dup2_stdin, dup2_stdout};
+    let orig_out = rustix::io::dup(io::stdout())?;
+    let orig_err = rustix::io::dup(io::stderr())?;
+    match &io_cfg.input {
+        Input::Inherit | Input::Buf(_) => {}
+        Input::Null => {
+            let devnull = std::fs::File::open("/dev/null")?;
+            dup2_stdin(&devnull)?;
+        }
+        Input::File(f) => {
+            let file = f
+                .lock()
+                .map_err(|_| io::Error::other("input lock poisoned"))?
+                .rewind_and_clone()?;
+            dup2_stdin(&file)?;
+        }
+        Input::Pipe(p) => {
+            if let Some(out) = p.lock().ok().and_then(|mut g| g.take()) {
+                let fd: OwnedFd = out.into_owned_fd()?;
+                dup2_stdin(&fd)?;
+            }
+        }
+    }
+    match &io_cfg.out {
+        Sink::Stdout | Sink::Buf(_) | Sink::Pipe(_) => {}
+        Sink::Stderr => dup2_stdout(&orig_err)?,
+        Sink::Null => {
+            let devnull = std::fs::OpenOptions::new().write(true).open("/dev/null")?;
+            dup2_stdout(&devnull)?;
+        }
+        Sink::File(f) => dup2_stdout(f.as_ref())?,
+    }
+    match &io_cfg.err {
+        Sink::Stderr | Sink::Buf(_) | Sink::Pipe(_) => {}
+        Sink::Stdout => dup2_stderr(&orig_out)?,
+        Sink::Null => {
+            let devnull = std::fs::OpenOptions::new().write(true).open("/dev/null")?;
+            dup2_stderr(&devnull)?;
+        }
+        Sink::File(f) => dup2_stderr(f.as_ref())?,
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn process_substitution_reclaims_temps_after_each_command() {
+        let mut state = ShellState::new(
+            PathBuf::from("/tmp"),
+            [("PATH".to_owned(), "/bin:/usr/bin".to_owned())],
+        );
+        let mut jobs = JobTable::default();
+        let src = "for i in 1 2 3 4 5; do cat <(echo $i) >/dev/null; done";
+        let list = parser::parse_program(src, state.aliases()).expect("parse");
+        let mut ctx = Ctx::new(&mut state, &mut jobs, src.to_owned());
+        let ctl = ctx.run_list(&list, &Io::default()).await.expect("run");
+        assert_eq!(ctl, Ctl::Normal);
+        assert!(
+            ctx.temps.is_empty(),
+            "leaked {} temp files",
+            ctx.temps.len()
+        );
     }
 }

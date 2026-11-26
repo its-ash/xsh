@@ -5,20 +5,87 @@ use crate::state::ShellState;
 
 const MAX_DEPTH: usize = 64;
 
-#[derive(Debug, Clone, PartialEq)]
-enum Tok {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tok<'a> {
     Num(i64),
-    Name(String),
+    Name(&'a str),
     Op(&'static str),
 }
 
-const OPS: &[&str] = &[
-    "<<=", ">>=", "**", "++", "--", "<<", ">>", "<=", ">=", "==", "!=", "&&", "||", "+=", "-=",
-    "*=", "/=", "%=", "&=", "^=", "|=", "+", "-", "*", "/", "%", "<", ">", "&", "^", "|", "!", "~",
-    "?", ":", "=", "(", ")", ",",
-];
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnaryOp {
+    Neg,
+    Pos,
+    Not,
+    BitNot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BinOp {
+    Or,
+    And,
+    BitOr,
+    BitXor,
+    BitAnd,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Shl,
+    Shr,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    Pow,
+}
+
+/// Pre-parsed arithmetic expression for fast repeated evaluation in loops.
+#[derive(Debug, Clone)]
+pub(crate) enum Expr {
+    Num(i64),
+    Var(String),
+    Unary(UnaryOp, Box<Self>),
+    PreInc(String, i64),
+    PostInc(String, i64),
+    Bin(BinOp, Box<Self>, Box<Self>),
+    Assign(String, Option<BinOp>, Box<Self>),
+    Ternary(Box<Self>, Box<Self>, Box<Self>),
+    Comma(Box<Self>, Box<Self>),
+}
+
+/// Fast path for plain decimal integers (optional leading `-`, no leading 0
+/// octal prefix). Returns `None` for hex, octal, `base#`, or overflow.
+fn parse_fast_decimal(s: &str) -> Option<i64> {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    let (neg, digits) = if bytes[0] == b'-' {
+        (true, &bytes[1..])
+    } else {
+        (false, bytes)
+    };
+    if digits.is_empty() || (digits.len() > 1 && digits[0] == b'0') {
+        return None;
+    }
+    let mut acc: i64 = 0;
+    for &b in digits {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        acc = acc.checked_mul(10)?.checked_add(i64::from(b - b'0'))?;
+    }
+    Some(if neg { -acc } else { acc })
+}
 
 fn number(text: &str) -> Result<i64, String> {
+    if let Some(n) = parse_fast_decimal(text) {
+        return Ok(n);
+    }
     let bad = || format!("`{text}`: invalid number");
     if let Some((base, digits)) = text.split_once('#') {
         let base: u32 = base.parse().map_err(|_| bad())?;
@@ -36,349 +103,531 @@ fn number(text: &str) -> Result<i64, String> {
     text.parse().map_err(|_| bad())
 }
 
-fn lex(expr: &str) -> Result<Vec<Tok>, String> {
-    let chars: Vec<char> = expr.chars().collect();
-    let mut toks = Vec::new();
-    let mut i = 0;
-    while let Some(&c) = chars.get(i) {
-        if c.is_whitespace() {
-            i += 1;
-        } else if c.is_ascii_digit() {
-            let start = i;
-            while chars
-                .get(i)
-                .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '#' || *c == '_')
-            {
-                i += 1;
-            }
-            let text: String = chars.get(start..i).unwrap_or_default().iter().collect();
-            toks.push(Tok::Num(number(&text)?));
-        } else if c == '_' || c.is_ascii_alphabetic() {
-            let start = i;
-            while chars
-                .get(i)
-                .is_some_and(|c| *c == '_' || c.is_ascii_alphanumeric())
-            {
-                i += 1;
-            }
-            toks.push(Tok::Name(
-                chars.get(start..i).unwrap_or_default().iter().collect(),
-            ));
-        } else {
-            let op = OPS
-                .iter()
-                .find(|op| {
-                    op.chars()
-                        .enumerate()
-                        .all(|(k, o)| chars.get(i + k) == Some(&o))
-                })
-                .ok_or_else(|| format!("syntax error near `{c}`"))?;
-            i += op.len();
-            toks.push(Tok::Op(op));
-        }
-    }
-    Ok(toks)
+struct Lexer<'a> {
+    src: &'a str,
+    pos: usize,
 }
 
-struct Eval<'a> {
-    toks: Vec<Tok>,
-    pos: usize,
-    state: &'a mut ShellState,
-    skip: u32,
+impl<'a> Lexer<'a> {
+    fn new(src: &'a str) -> Self {
+        Self { src, pos: 0 }
+    }
+
+    fn next_tok(&mut self) -> Result<Option<Tok<'a>>, String> {
+        let bytes = self.src.as_bytes();
+        while let Some(&b) = bytes.get(self.pos) {
+            if b.is_ascii_whitespace() {
+                self.pos += 1;
+            } else if !b.is_ascii() {
+                let ch = self.src[self.pos..].chars().next().unwrap_or_default();
+                if ch.is_whitespace() {
+                    self.pos += ch.len_utf8();
+                } else {
+                    return Err(format!("syntax error near `{ch}`"));
+                }
+            } else {
+                break;
+            }
+        }
+        let Some(&b) = bytes.get(self.pos) else {
+            return Ok(None);
+        };
+        if b.is_ascii_digit() {
+            let start = self.pos;
+            while bytes
+                .get(self.pos)
+                .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'#' || *c == b'_')
+            {
+                self.pos += 1;
+            }
+            return Ok(Some(Tok::Num(number(&self.src[start..self.pos])?)));
+        }
+        if b == b'_' || b.is_ascii_alphabetic() {
+            let start = self.pos;
+            while bytes
+                .get(self.pos)
+                .is_some_and(|c| *c == b'_' || c.is_ascii_alphanumeric())
+            {
+                self.pos += 1;
+            }
+            return Ok(Some(Tok::Name(&self.src[start..self.pos])));
+        }
+        let b1 = bytes.get(self.pos + 1).copied();
+        let b2 = bytes.get(self.pos + 2).copied();
+        let op: &'static str = match (b, b1, b2) {
+            (b'<', Some(b'<'), Some(b'=')) => "<<=",
+            (b'>', Some(b'>'), Some(b'=')) => ">>=",
+            (b'*', Some(b'*'), _) => "**",
+            (b'+', Some(b'+'), _) => "++",
+            (b'-', Some(b'-'), _) => "--",
+            (b'<', Some(b'<'), _) => "<<",
+            (b'>', Some(b'>'), _) => ">>",
+            (b'<', Some(b'='), _) => "<=",
+            (b'>', Some(b'='), _) => ">=",
+            (b'=', Some(b'='), _) => "==",
+            (b'!', Some(b'='), _) => "!=",
+            (b'&', Some(b'&'), _) => "&&",
+            (b'|', Some(b'|'), _) => "||",
+            (b'+', Some(b'='), _) => "+=",
+            (b'-', Some(b'='), _) => "-=",
+            (b'*', Some(b'='), _) => "*=",
+            (b'/', Some(b'='), _) => "/=",
+            (b'%', Some(b'='), _) => "%=",
+            (b'&', Some(b'='), _) => "&=",
+            (b'^', Some(b'='), _) => "^=",
+            (b'|', Some(b'='), _) => "|=",
+            (b'+', _, _) => "+",
+            (b'-', _, _) => "-",
+            (b'*', _, _) => "*",
+            (b'/', _, _) => "/",
+            (b'%', _, _) => "%",
+            (b'<', _, _) => "<",
+            (b'>', _, _) => ">",
+            (b'&', _, _) => "&",
+            (b'^', _, _) => "^",
+            (b'|', _, _) => "|",
+            (b'!', _, _) => "!",
+            (b'~', _, _) => "~",
+            (b'?', _, _) => "?",
+            (b':', _, _) => ":",
+            (b'=', _, _) => "=",
+            (b'(', _, _) => "(",
+            (b')', _, _) => ")",
+            (b',', _, _) => ",",
+            _ => {
+                let c = self.src[self.pos..].chars().next().unwrap_or_default();
+                return Err(format!("syntax error near `{c}`"));
+            }
+        };
+        self.pos += op.len();
+        Ok(Some(Tok::Op(op)))
+    }
+}
+
+fn show(t: Tok<'_>) -> String {
+    match t {
+        Tok::Num(n) => n.to_string(),
+        Tok::Name(n) => n.to_owned(),
+        Tok::Op(o) => o.to_owned(),
+    }
+}
+
+struct Parser<'a> {
+    lexer: Lexer<'a>,
+    cur: Option<Tok<'a>>,
+    peek: Option<Tok<'a>>,
     depth: usize,
 }
 
-/// Evaluates an arithmetic expression, reading and assigning shell
-/// variables.
-pub(crate) fn eval(expr: &str, state: &mut ShellState) -> Result<i64, String> {
-    eval_depth(expr, state, 0)
-}
+impl Parser<'_> {
+    fn advance(&mut self) -> Result<(), String> {
+        self.cur = self.peek;
+        self.peek = self.lexer.next_tok()?;
+        Ok(())
+    }
 
-fn eval_depth(expr: &str, state: &mut ShellState, depth: usize) -> Result<i64, String> {
-    if depth > MAX_DEPTH {
-        return Err("expression recursion level exceeded".into());
+    fn enter(&mut self) -> Result<(), String> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            return Err("expression recursion level exceeded".into());
+        }
+        Ok(())
     }
-    let toks = lex(expr)?;
-    if toks.is_empty() {
-        return Ok(0);
-    }
-    let mut e = Eval {
-        toks,
-        pos: 0,
-        state,
-        skip: 0,
-        depth,
-    };
-    let v = e.comma()?;
-    match e.toks.get(e.pos) {
-        None => Ok(v),
-        Some(t) => Err(format!("syntax error near `{}`", show(t))),
-    }
-}
 
-fn show(t: &Tok) -> String {
-    match t {
-        Tok::Num(n) => n.to_string(),
-        Tok::Name(n) => n.clone(),
-        Tok::Op(o) => (*o).to_owned(),
+    fn leave(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
     }
-}
 
-impl Eval<'_> {
     fn peek_op(&self) -> Option<&'static str> {
-        match self.toks.get(self.pos) {
+        match self.cur {
             Some(Tok::Op(o)) => Some(o),
             _ => None,
         }
     }
 
-    fn eat(&mut self, op: &str) -> bool {
+    fn eat(&mut self, op: &str) -> Result<bool, String> {
         if self.peek_op() == Some(op) {
-            self.pos += 1;
-            true
+            self.advance()?;
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
     }
 
-    fn var(&mut self, name: &str) -> Result<i64, String> {
-        if self.skip > 0 {
-            return Ok(0);
+    fn comma(&mut self) -> Result<Expr, String> {
+        let mut lhs = self.assignment()?;
+        while self.eat(",")? {
+            let rhs = self.assignment()?;
+            lhs = Expr::Comma(Box::new(lhs), Box::new(rhs));
         }
-        let value = self.state.lookup(name).unwrap_or_default();
-        let value = value.trim();
-        if value.is_empty() {
-            return Ok(0);
-        }
-        if let Ok(n) = number(value) {
-            return Ok(n);
-        }
-        eval_depth(value, self.state, self.depth + 1)
+        Ok(lhs)
     }
 
-    fn assign(&mut self, name: &str, v: i64) -> Result<i64, String> {
-        if self.skip == 0 {
-            if !is_var_name(name) {
-                return Err(format!("`{name}`: not assignable"));
-            }
-            self.state.set_var(name, v.to_string());
-        }
-        Ok(v)
-    }
-
-    fn comma(&mut self) -> Result<i64, String> {
-        let mut v = self.assignment()?;
-        while self.eat(",") {
-            v = self.assignment()?;
-        }
-        Ok(v)
-    }
-
-    fn assignment(&mut self) -> Result<i64, String> {
-        if let (Some(Tok::Name(name)), Some(Tok::Op(op))) = (
-            self.toks.get(self.pos).cloned(),
-            self.toks.get(self.pos + 1).cloned(),
-        ) {
+    fn assignment(&mut self) -> Result<Expr, String> {
+        if let (Some(Tok::Name(name)), Some(Tok::Op(op))) = (self.cur, self.peek) {
             let bin = match op {
                 "=" => Some(None),
-                "+=" | "-=" | "*=" | "/=" | "%=" | "<<=" | ">>=" | "&=" | "^=" | "|=" => {
-                    Some(Some(op.trim_end_matches('=')))
-                }
+                "+=" => Some(Some(BinOp::Add)),
+                "-=" => Some(Some(BinOp::Sub)),
+                "*=" => Some(Some(BinOp::Mul)),
+                "/=" => Some(Some(BinOp::Div)),
+                "%=" => Some(Some(BinOp::Rem)),
+                "<<=" => Some(Some(BinOp::Shl)),
+                ">>=" => Some(Some(BinOp::Shr)),
+                "&=" => Some(Some(BinOp::BitAnd)),
+                "^=" => Some(Some(BinOp::BitXor)),
+                "|=" => Some(Some(BinOp::BitOr)),
                 _ => None,
             };
             if let Some(bin) = bin {
-                self.pos += 2;
-                let rhs = self.assignment()?;
-                let v = match bin {
-                    None => rhs,
-                    Some(b) => {
-                        let cur = self.var(&name)?;
-                        self.binary(b, cur, rhs)?
-                    }
-                };
-                return self.assign(&name, v);
+                self.advance()?;
+                self.advance()?;
+                self.enter()?;
+                let rhs = self.assignment();
+                self.leave();
+                return Ok(Expr::Assign(name.to_owned(), bin, Box::new(rhs?)));
             }
         }
         self.ternary()
     }
 
-    fn ternary(&mut self) -> Result<i64, String> {
+    fn ternary(&mut self) -> Result<Expr, String> {
         let c = self.binop(0)?;
-        if !self.eat("?") {
+        if !self.eat("?")? {
             return Ok(c);
         }
-        if c == 0 {
-            self.skip += 1;
-        }
-        let a = self.assignment();
-        if c == 0 {
-            self.skip -= 1;
-        }
-        let a = a?;
-        if !self.eat(":") {
+        self.enter()?;
+        let a = match self.assignment() {
+            Ok(v) => v,
+            Err(e) => {
+                self.leave();
+                return Err(e);
+            }
+        };
+        if !self.eat(":")? {
+            self.leave();
             return Err("expected `:`".into());
         }
-        if c != 0 {
-            self.skip += 1;
-        }
         let b = self.ternary();
-        if c != 0 {
-            self.skip -= 1;
-        }
-        let b = b?;
-        Ok(if c != 0 { a } else { b })
+        self.leave();
+        Ok(Expr::Ternary(Box::new(c), Box::new(a), Box::new(b?)))
     }
 
-    fn binop(&mut self, level: usize) -> Result<i64, String> {
-        const LEVELS: &[&[&str]] = &[
-            &["||"],
-            &["&&"],
-            &["|"],
-            &["^"],
-            &["&"],
-            &["==", "!="],
-            &["<", "<=", ">", ">="],
-            &["<<", ">>"],
-            &["+", "-"],
-            &["*", "/", "%"],
+    fn binop(&mut self, level: usize) -> Result<Expr, String> {
+        const LEVELS: &[&[(&str, BinOp)]] = &[
+            &[("||", BinOp::Or)],
+            &[("&&", BinOp::And)],
+            &[("|", BinOp::BitOr)],
+            &[("^", BinOp::BitXor)],
+            &[("&", BinOp::BitAnd)],
+            &[("==", BinOp::Eq), ("!=", BinOp::Ne)],
+            &[
+                ("<", BinOp::Lt),
+                ("<=", BinOp::Le),
+                (">", BinOp::Gt),
+                (">=", BinOp::Ge),
+            ],
+            &[("<<", BinOp::Shl), (">>", BinOp::Shr)],
+            &[("+", BinOp::Add), ("-", BinOp::Sub)],
+            &[("*", BinOp::Mul), ("/", BinOp::Div), ("%", BinOp::Rem)],
         ];
         let Some(ops) = LEVELS.get(level) else {
             return self.power();
         };
         let mut lhs = self.binop(level + 1)?;
-        while let Some(op) = self.peek_op().filter(|o| ops.contains(o)) {
-            self.pos += 1;
-            let short = match op {
-                "||" => lhs != 0,
-                "&&" => lhs == 0,
-                _ => false,
-            };
-            if short {
-                self.skip += 1;
-            }
-            let rhs = self.binop(level + 1);
-            if short {
-                self.skip -= 1;
-            }
-            let rhs = rhs?;
-            lhs = match op {
-                "||" => i64::from(lhs != 0 || rhs != 0),
-                "&&" => i64::from(lhs != 0 && rhs != 0),
-                _ => self.binary(op, lhs, rhs)?,
-            };
+        while let Some(op) = self
+            .peek_op()
+            .and_then(|o| ops.iter().find(|(s, _)| *s == o).map(|(_, b)| *b))
+        {
+            self.advance()?;
+            let rhs = self.binop(level + 1)?;
+            lhs = Expr::Bin(op, Box::new(lhs), Box::new(rhs));
         }
         Ok(lhs)
     }
 
-    fn binary(&self, op: &str, a: i64, b: i64) -> Result<i64, String> {
-        let zero = || {
-            if b == 0 {
-                Err("division by 0".to_owned())
-            } else {
-                Ok(())
-            }
-        };
-        let shift = u32::try_from(b.rem_euclid(64)).unwrap_or(0);
-        Ok(match op {
-            "+" => a.wrapping_add(b),
-            "-" => a.wrapping_sub(b),
-            "*" => a.wrapping_mul(b),
-            "/" => {
-                if self.skip > 0 {
-                    return Ok(0);
-                }
-                zero()?;
-                a.wrapping_div(b)
-            }
-            "%" => {
-                if self.skip > 0 {
-                    return Ok(0);
-                }
-                zero()?;
-                a.wrapping_rem(b)
-            }
-            "<<" => a.wrapping_shl(shift),
-            ">>" => a.wrapping_shr(shift),
-            "&" => a & b,
-            "^" => a ^ b,
-            "|" => a | b,
-            "==" => i64::from(a == b),
-            "!=" => i64::from(a != b),
-            "<" => i64::from(a < b),
-            "<=" => i64::from(a <= b),
-            ">" => i64::from(a > b),
-            ">=" => i64::from(a >= b),
-            _ => return Err(format!("unknown operator `{op}`")),
-        })
-    }
-
-    fn power(&mut self) -> Result<i64, String> {
+    fn power(&mut self) -> Result<Expr, String> {
         let base = self.unary()?;
-        if self.eat("**") {
-            let exp = self.power()?;
-            if exp < 0 {
-                return Err("exponent less than 0".into());
-            }
-            let exp = u32::try_from(exp).unwrap_or(u32::MAX);
-            return Ok(base.wrapping_pow(exp));
+        if self.eat("**")? {
+            self.enter()?;
+            let exp = self.power();
+            self.leave();
+            return Ok(Expr::Bin(BinOp::Pow, Box::new(base), Box::new(exp?)));
         }
         Ok(base)
     }
 
-    fn unary(&mut self) -> Result<i64, String> {
+    fn unary(&mut self) -> Result<Expr, String> {
         for (op, delta) in [("++", 1), ("--", -1)] {
-            if self.eat(op) {
-                let Some(Tok::Name(name)) = self.toks.get(self.pos).cloned() else {
+            if self.eat(op)? {
+                let Some(Tok::Name(name)) = self.cur else {
                     return Err(format!("`{op}` needs a variable"));
                 };
-                self.pos += 1;
-                let v = self.var(&name)?.wrapping_add(delta);
-                return self.assign(&name, v);
+                self.advance()?;
+                return Ok(Expr::PreInc(name.to_owned(), delta));
             }
         }
-        if self.eat("-") {
-            return Ok(self.unary()?.wrapping_neg());
-        }
-        if self.eat("+") {
-            return self.unary();
-        }
-        if self.eat("!") {
-            return Ok(i64::from(self.unary()? == 0));
-        }
-        if self.eat("~") {
-            return Ok(!self.unary()?);
+        for (sym, op) in [
+            ("-", UnaryOp::Neg),
+            ("+", UnaryOp::Pos),
+            ("!", UnaryOp::Not),
+            ("~", UnaryOp::BitNot),
+        ] {
+            if self.eat(sym)? {
+                self.enter()?;
+                let v = self.unary();
+                self.leave();
+                return Ok(Expr::Unary(op, Box::new(v?)));
+            }
         }
         self.postfix()
     }
 
-    fn postfix(&mut self) -> Result<i64, String> {
-        match self.toks.get(self.pos).cloned() {
+    fn postfix(&mut self) -> Result<Expr, String> {
+        match self.cur {
             Some(Tok::Num(n)) => {
-                self.pos += 1;
-                Ok(n)
+                self.advance()?;
+                Ok(Expr::Num(n))
             }
             Some(Tok::Name(name)) => {
-                self.pos += 1;
-                let v = self.var(&name)?;
-                for (op, delta) in [("++", 1), ("--", -1)] {
-                    if self.eat(op) {
-                        self.assign(&name, v.wrapping_add(delta))?;
-                    }
+                self.advance()?;
+                if self.eat("++")? {
+                    Ok(Expr::PostInc(name.to_owned(), 1))
+                } else if self.eat("--")? {
+                    Ok(Expr::PostInc(name.to_owned(), -1))
+                } else {
+                    Ok(Expr::Var(name.to_owned()))
                 }
-                Ok(v)
             }
             Some(Tok::Op("(")) => {
-                self.pos += 1;
-                let v = self.comma()?;
-                if !self.eat(")") {
+                self.advance()?;
+                self.enter()?;
+                let v = self.comma();
+                self.leave();
+                let v = v?;
+                if !self.eat(")")? {
                     return Err("expected `)`".into());
                 }
                 Ok(v)
             }
-            Some(t) => Err(format!("syntax error near `{}`", show(&t))),
+            Some(t) => Err(format!("syntax error near `{}`", show(t))),
             None => Err("unexpected end of expression".into()),
         }
     }
+}
+
+/// Parses an arithmetic expression into a reusable AST.
+pub(crate) fn parse(expr: &str) -> Result<Expr, String> {
+    parse_depth(expr, 0)
+}
+
+fn parse_depth(expr: &str, depth: usize) -> Result<Expr, String> {
+    if depth > MAX_DEPTH {
+        return Err("expression recursion level exceeded".into());
+    }
+    let mut lexer = Lexer::new(expr);
+    let cur = lexer.next_tok()?;
+    if cur.is_none() {
+        return Ok(Expr::Num(0));
+    }
+    let peek = lexer.next_tok()?;
+    let mut p = Parser {
+        lexer,
+        cur,
+        peek,
+        depth,
+    };
+    let ast = p.comma()?;
+    match p.cur {
+        None => Ok(ast),
+        Some(t) => Err(format!("syntax error near `{}`", show(t))),
+    }
+}
+
+fn read_var(name: &str, state: &mut ShellState, depth: usize) -> Result<i64, String> {
+    if let Some(raw) = state.var(name) {
+        let value = raw.trim();
+        if value.is_empty() {
+            return Ok(0);
+        }
+        if let Some(n) = parse_fast_decimal(value) {
+            return Ok(n);
+        }
+        if let Ok(n) = number(value) {
+            return Ok(n);
+        }
+        let owned = value.to_owned();
+        return eval_depth(&owned, state, depth + 1);
+    }
+    if name == "RANDOM"
+        && let Some(raw) = state.lookup_cow(name)
+        && let Some(n) = parse_fast_decimal(&raw)
+    {
+        return Ok(n);
+    }
+    Ok(0)
+}
+
+fn assign_var(name: &str, v: i64, state: &mut ShellState) -> Result<i64, String> {
+    if !is_var_name(name) {
+        return Err(format!("`{name}`: not assignable"));
+    }
+    if state.is_readonly(name) {
+        return Err(format!("{name}: readonly variable"));
+    }
+    state.set_var_i64(name, v);
+    Ok(v)
+}
+
+fn apply_bin(op: BinOp, a: i64, b: i64) -> Result<i64, String> {
+    Ok(match op {
+        BinOp::Add => a.wrapping_add(b),
+        BinOp::Sub => a.wrapping_sub(b),
+        BinOp::Mul => a.wrapping_mul(b),
+        BinOp::Div => {
+            if b == 0 {
+                return Err("division by 0".to_owned());
+            }
+            a.wrapping_div(b)
+        }
+        BinOp::Rem => {
+            if b == 0 {
+                return Err("division by 0".to_owned());
+            }
+            a.wrapping_rem(b)
+        }
+        BinOp::Shl => a.wrapping_shl(u32::try_from(b.rem_euclid(64)).unwrap_or(0)),
+        BinOp::Shr => a.wrapping_shr(u32::try_from(b.rem_euclid(64)).unwrap_or(0)),
+        BinOp::BitAnd => a & b,
+        BinOp::BitXor => a ^ b,
+        BinOp::BitOr => a | b,
+        BinOp::Eq => i64::from(a == b),
+        BinOp::Ne => i64::from(a != b),
+        BinOp::Lt => i64::from(a < b),
+        BinOp::Le => i64::from(a <= b),
+        BinOp::Gt => i64::from(a > b),
+        BinOp::Ge => i64::from(a >= b),
+        BinOp::Pow => {
+            if b < 0 {
+                return Err("exponent less than 0".into());
+            }
+            a.wrapping_pow(u32::try_from(b).unwrap_or(u32::MAX))
+        }
+        BinOp::Or => i64::from(a != 0 || b != 0),
+        BinOp::And => i64::from(a != 0 && b != 0),
+    })
+}
+
+/// Evaluates a pre-parsed arithmetic expression.
+pub(crate) fn eval_expr(expr: &Expr, state: &mut ShellState) -> Result<i64, String> {
+    eval_node(expr, state, 0)
+}
+
+fn inc_var(
+    name: &str,
+    delta: i64,
+    post: bool,
+    state: &mut ShellState,
+    depth: usize,
+) -> Result<i64, String> {
+    if !is_var_name(name) {
+        return Err(format!("`{name}`: not assignable"));
+    }
+    if state.is_readonly(name) {
+        return Err(format!("{name}: readonly variable"));
+    }
+    if name != "RANDOM"
+        && let Some(res) = state.try_modify_var_i64(name, parse_fast_decimal, |cur| {
+            let next = cur.wrapping_add(delta);
+            Ok((next, if post { cur } else { next }))
+        })
+    {
+        return res;
+    }
+    let cur = read_var(name, state, depth)?;
+    let next = cur.wrapping_add(delta);
+    assign_var(name, next, state)?;
+    Ok(if post { cur } else { next })
+}
+
+fn eval_node(expr: &Expr, state: &mut ShellState, depth: usize) -> Result<i64, String> {
+    match expr {
+        Expr::Num(n) => Ok(*n),
+        Expr::Var(name) => read_var(name, state, depth),
+        Expr::Unary(op, inner) => {
+            let v = eval_node(inner, state, depth)?;
+            Ok(match op {
+                UnaryOp::Neg => v.wrapping_neg(),
+                UnaryOp::Pos => v,
+                UnaryOp::Not => i64::from(v == 0),
+                UnaryOp::BitNot => !v,
+            })
+        }
+        Expr::PreInc(name, delta) => inc_var(name, *delta, false, state, depth),
+        Expr::PostInc(name, delta) => inc_var(name, *delta, true, state, depth),
+        Expr::Bin(BinOp::Or, lhs, rhs) => {
+            if eval_node(lhs, state, depth)? != 0 {
+                return Ok(1);
+            }
+            Ok(i64::from(eval_node(rhs, state, depth)? != 0))
+        }
+        Expr::Bin(BinOp::And, lhs, rhs) => {
+            if eval_node(lhs, state, depth)? == 0 {
+                return Ok(0);
+            }
+            Ok(i64::from(eval_node(rhs, state, depth)? != 0))
+        }
+        Expr::Bin(op, lhs, rhs) => {
+            let a = eval_node(lhs, state, depth)?;
+            let b = eval_node(rhs, state, depth)?;
+            apply_bin(*op, a, b)
+        }
+        Expr::Assign(name, None, rhs) => {
+            let v = eval_node(rhs, state, depth)?;
+            assign_var(name, v, state)
+        }
+        Expr::Assign(name, Some(op), rhs) => {
+            let rhs_val = eval_node(rhs, state, depth)?;
+            if !is_var_name(name) {
+                return Err(format!("`{name}`: not assignable"));
+            }
+            if state.is_readonly(name) {
+                return Err(format!("{name}: readonly variable"));
+            }
+            if name != "RANDOM"
+                && let Some(res) = state.try_modify_var_i64(name, parse_fast_decimal, |cur| {
+                    let next = apply_bin(*op, cur, rhs_val)?;
+                    Ok((next, next))
+                })
+            {
+                return res;
+            }
+            let cur = read_var(name, state, depth)?;
+            let next = apply_bin(*op, cur, rhs_val)?;
+            assign_var(name, next, state)
+        }
+        Expr::Ternary(cond, a, b) => {
+            if eval_node(cond, state, depth)? != 0 {
+                eval_node(a, state, depth)
+            } else {
+                eval_node(b, state, depth)
+            }
+        }
+        Expr::Comma(a, b) => {
+            let _ = eval_node(a, state, depth)?;
+            eval_node(b, state, depth)
+        }
+    }
+}
+
+/// Evaluates an arithmetic expression, reading and assigning shell variables.
+pub(crate) fn eval(expr: &str, state: &mut ShellState) -> Result<i64, String> {
+    eval_depth(expr, state, 0)
+}
+
+fn eval_depth(expr: &str, state: &mut ShellState, depth: usize) -> Result<i64, String> {
+    let ast = parse_depth(expr, depth)?;
+    eval_node(&ast, state, depth)
 }
 
 #[cfg(test)]
@@ -435,15 +684,24 @@ mod tests {
         assert_eq!(s.var("z"), None);
         assert_eq!(eval("1 || z++", &mut s)?, 1);
         assert_eq!(s.var("z"), None);
+        assert_eq!(eval("0 && (2 ** -1)", &mut s)?, 0);
         Ok(())
     }
 
     #[test]
     fn reports_errors() {
         let mut s = st();
-        for e in ["1 / 0", "1 +", "(1", "2 ** -1", "1 @ 2", "09"] {
+        s.set_var("ro", "5");
+        s.set_readonly("ro");
+        for e in [
+            "1 / 0", "1 +", "(1", "2 ** -1", "1 @ 2", "09", "ro = 1", "ro++", "++ro", "x++--",
+        ] {
             assert!(eval(e, &mut s).is_err(), "{e}");
         }
+        let deep = format!("{}1{}", "(".repeat(100), ")".repeat(100));
+        assert!(eval(&deep, &mut s).is_err());
+        let unary = format!("{}1", "-".repeat(100));
+        assert!(eval(&unary, &mut s).is_err());
         s.set_var("r", "r + 1");
         assert!(eval("r", &mut s).is_err());
     }

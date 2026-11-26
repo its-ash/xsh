@@ -1,11 +1,11 @@
 //! Word expansion: braces, tilde, parameters, command and arithmetic
 //! substitution, field splitting, and file name patterns.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::borrow::Cow;
 
 use crate::ast::{List, Param, ParamOp, ReplaceMode, Seg, Word};
 use crate::exec::{BoxFut, Ctx};
-use crate::glob::{self, GlobOpts};
+use crate::glob::{self, Compiled, GlobOpts};
 use crate::parser::is_var_name;
 use crate::{Result, arith};
 
@@ -49,13 +49,13 @@ fn sequence(content: &[Atom<'_>]) -> Option<Vec<Vec<Atom<'static>>>> {
         .collect::<Option<_>>()?;
     let parts: Vec<&str> = text.split("..").collect();
     let (a, b, step) = match parts.as_slice() {
-        [a, b] => (*a, *b, 1i64),
-        [a, b, s] => (*a, *b, s.parse::<i64>().ok()?.abs().max(1)),
+        [a, b] => (*a, *b, 1u64),
+        [a, b, s] => (*a, *b, s.parse::<i64>().ok()?.unsigned_abs().max(1)),
         _ => return None,
     };
     let to_atoms = |s: String| s.chars().map(Atom::Ch).collect::<Vec<_>>();
     if let (Ok(x), Ok(y)) = (a.parse::<i64>(), b.parse::<i64>()) {
-        let count = x.abs_diff(y) / step.unsigned_abs() + 1;
+        let count = x.abs_diff(y) / step + 1;
         if count > MAX_BRACE as u64 {
             return None;
         }
@@ -66,8 +66,10 @@ fn sequence(content: &[Atom<'_>]) -> Option<Vec<Vec<Atom<'static>>>> {
         } else {
             0
         };
+        let step_i = i128::from(step);
+        let y_i = i128::from(y);
         let mut out = Vec::new();
-        let mut v = x;
+        let mut v = i128::from(x);
         loop {
             out.push(to_atoms(if width > 0 {
                 if v < 0 {
@@ -78,10 +80,18 @@ fn sequence(content: &[Atom<'_>]) -> Option<Vec<Vec<Atom<'static>>>> {
             } else {
                 v.to_string()
             }));
-            if v == y || (x < y && v + step > y) || (x > y && v - step < y) {
+            if v == y_i {
                 break;
             }
-            v = if x < y { v + step } else { v - step };
+            let next = if x < y {
+                v.checked_add(step_i)
+            } else {
+                v.checked_sub(step_i)
+            };
+            match next {
+                Some(n) if (x < y && n <= y_i) || (x > y && n >= y_i) => v = n,
+                _ => break,
+            }
         }
         return Some(out);
     }
@@ -93,11 +103,11 @@ fn sequence(content: &[Atom<'_>]) -> Option<Vec<Vec<Atom<'static>>>> {
         return None;
     }
     let (lo, hi) = (u32::from(x), u32::from(y));
-    let step = u32::try_from(step).ok()?;
+    let step = usize::try_from(step).ok()?;
     let mut vals: Vec<u32> = if lo <= hi {
-        (lo..=hi).step_by(step as usize).collect()
+        (lo..=hi).step_by(step).collect()
     } else {
-        (hi..=lo).rev().step_by(step as usize).collect()
+        (hi..=lo).rev().step_by(step).collect()
     };
     vals.retain(|v| char::from_u32(*v).is_some());
     Some(
@@ -250,52 +260,129 @@ fn bounds(s: &str) -> Vec<usize> {
 }
 
 fn remove_prefix(val: &str, pat: &str, longest: bool) -> String {
+    let compiled = Compiled::new(pat);
+    if let Some(lit) = compiled.as_literal() {
+        return val.strip_prefix(lit).unwrap_or(val).to_owned();
+    }
+    if val.is_ascii() {
+        let found = if longest {
+            (0..=val.len())
+                .rev()
+                .find(|&i| compiled.matches_str(&val[..i], false))
+        } else {
+            (0..=val.len()).find(|&i| compiled.matches_str(&val[..i], false))
+        };
+        return found.map_or_else(|| val.to_owned(), |i| val[i..].to_owned());
+    }
+    let chars: Vec<char> = val.chars().collect();
     let b = bounds(val);
     let found = if longest {
-        b.iter().rev().find(|&&i| glob::matches(pat, &val[..i]))
+        (0..=chars.len())
+            .rev()
+            .find(|&i| compiled.matches_chars(&chars[..i], false))
     } else {
-        b.iter().find(|&&i| glob::matches(pat, &val[..i]))
+        (0..=chars.len()).find(|&i| compiled.matches_chars(&chars[..i], false))
     };
-    found.map_or_else(|| val.to_owned(), |&i| val[i..].to_owned())
+    found.map_or_else(|| val.to_owned(), |i| val[b[i]..].to_owned())
 }
 
 fn remove_suffix(val: &str, pat: &str, longest: bool) -> String {
+    let compiled = Compiled::new(pat);
+    if let Some(lit) = compiled.as_literal() {
+        return val.strip_suffix(lit).unwrap_or(val).to_owned();
+    }
+    if val.is_ascii() {
+        let found = if longest {
+            (0..=val.len()).find(|&i| compiled.matches_str(&val[i..], false))
+        } else {
+            (0..=val.len())
+                .rev()
+                .find(|&i| compiled.matches_str(&val[i..], false))
+        };
+        return found.map_or_else(|| val.to_owned(), |i| val[..i].to_owned());
+    }
+    let chars: Vec<char> = val.chars().collect();
     let b = bounds(val);
     let found = if longest {
-        b.iter().find(|&&i| glob::matches(pat, &val[i..]))
+        (0..=chars.len()).find(|&i| compiled.matches_chars(&chars[i..], false))
     } else {
-        b.iter().rev().find(|&&i| glob::matches(pat, &val[i..]))
+        (0..=chars.len())
+            .rev()
+            .find(|&i| compiled.matches_chars(&chars[i..], false))
     };
-    found.map_or_else(|| val.to_owned(), |&i| val[..i].to_owned())
+    found.map_or_else(|| val.to_owned(), |i| val[..b[i]].to_owned())
 }
 
 fn replace(val: &str, pat: &str, with: &str, mode: ReplaceMode) -> String {
     if pat.is_empty() {
         return val.to_owned();
     }
+    let compiled = Compiled::new(pat);
+    if let Some(lit) = compiled.as_literal() {
+        if lit.is_empty() {
+            return val.to_owned();
+        }
+        return match mode {
+            ReplaceMode::Prefix => val
+                .strip_prefix(lit)
+                .map_or_else(|| val.to_owned(), |rest| format!("{with}{rest}")),
+            ReplaceMode::Suffix => val
+                .strip_suffix(lit)
+                .map_or_else(|| val.to_owned(), |head| format!("{head}{with}")),
+            ReplaceMode::First => val.replacen(lit, with, 1),
+            ReplaceMode::All => val.replace(lit, with),
+        };
+    }
+    if val.is_ascii() {
+        return match mode {
+            ReplaceMode::Prefix => (0..=val.len())
+                .rev()
+                .find(|&e| compiled.matches_str(&val[..e], false))
+                .map_or_else(|| val.to_owned(), |e| format!("{with}{}", &val[e..])),
+            ReplaceMode::Suffix => (0..=val.len())
+                .find(|&s| compiled.matches_str(&val[s..], false))
+                .map_or_else(|| val.to_owned(), |s| format!("{}{with}", &val[..s])),
+            ReplaceMode::First | ReplaceMode::All => {
+                let mut out = String::with_capacity(val.len());
+                let mut k = 0;
+                while k < val.len() {
+                    let hit = (k + 1..=val.len())
+                        .rev()
+                        .find(|&e| compiled.matches_str(&val[k..e], false));
+                    if let Some(ek) = hit {
+                        out.push_str(with);
+                        k = ek;
+                        if mode == ReplaceMode::First {
+                            out.push_str(&val[k..]);
+                            return out;
+                        }
+                    } else {
+                        out.push_str(&val[k..=k]);
+                        k += 1;
+                    }
+                }
+                out
+            }
+        };
+    }
+    let chars: Vec<char> = val.chars().collect();
     let b = bounds(val);
     match mode {
-        ReplaceMode::Prefix => b
-            .iter()
+        ReplaceMode::Prefix => (0..=chars.len())
             .rev()
-            .find(|&&e| glob::matches(pat, &val[..e]))
-            .map_or_else(|| val.to_owned(), |&e| format!("{with}{}", &val[e..])),
-        ReplaceMode::Suffix => b
-            .iter()
-            .find(|&&s| glob::matches(pat, &val[s..]))
-            .map_or_else(|| val.to_owned(), |&s| format!("{}{with}", &val[..s])),
+            .find(|&e| compiled.matches_chars(&chars[..e], false))
+            .map_or_else(|| val.to_owned(), |e| format!("{with}{}", &val[b[e]..])),
+        ReplaceMode::Suffix => (0..=chars.len())
+            .find(|&s| compiled.matches_chars(&chars[s..], false))
+            .map_or_else(|| val.to_owned(), |s| format!("{}{with}", &val[..b[s]])),
         ReplaceMode::First | ReplaceMode::All => {
-            let mut out = String::new();
+            let mut out = String::with_capacity(val.len());
             let mut k = 0;
-            while k + 1 < b.len() {
-                let i = b[k];
-                let hit = b
-                    .iter()
-                    .enumerate()
-                    .skip(k + 1)
+            while k < chars.len() {
+                let hit = (k + 1..=chars.len())
                     .rev()
-                    .find(|(_, e)| glob::matches(pat, &val[i..**e]));
-                if let Some((ek, _)) = hit {
+                    .find(|&e| compiled.matches_chars(&chars[k..e], false));
+                if let Some(ek) = hit {
                     out.push_str(with);
                     k = ek;
                     if mode == ReplaceMode::First {
@@ -303,7 +390,7 @@ fn replace(val: &str, pat: &str, with: &str, mode: ReplaceMode) -> String {
                         return out;
                     }
                 } else {
-                    out.push_str(&val[i..b[k + 1]]);
+                    out.push(chars[k]);
                     k += 1;
                 }
             }
@@ -312,11 +399,23 @@ fn replace(val: &str, pat: &str, with: &str, mode: ReplaceMode) -> String {
     }
 }
 
-static TEMP: AtomicU64 = AtomicU64::new(0);
+fn unquoted_lit(w: &Word) -> Option<&str> {
+    match w.segs.as_slice() {
+        [
+            Seg::Lit {
+                text,
+                quoted: false,
+            },
+        ] => Some(text.as_str()),
+        _ => None,
+    }
+}
 
-fn temp_path() -> std::path::PathBuf {
-    let n = TEMP.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("xsh-{}-{n}", std::process::id()))
+fn any_lit(w: &Word) -> Option<&str> {
+    match w.segs.as_slice() {
+        [Seg::Lit { text, .. }] => Some(text.as_str()),
+        _ => None,
+    }
 }
 
 impl Ctx<'_> {
@@ -330,6 +429,122 @@ impl Ctx<'_> {
             dotglob: o.dotglob,
             globstar: o.globstar,
             nocase: o.nocaseglob,
+        }
+    }
+
+    fn push_unquoted_field(&self, text: String, out: &mut Vec<String>) -> Exp<()> {
+        if self.state.options().noglob || !glob::has_meta(&text) {
+            out.push(text);
+            return Ok(());
+        }
+        let mut pat = String::with_capacity(text.len());
+        for c in text.chars() {
+            if c == '\\' {
+                pat.push_str("\\\\");
+            } else {
+                pat.push(c);
+            }
+        }
+        if !glob::has_meta(&pat) {
+            out.push(text);
+            return Ok(());
+        }
+        let matches = glob::expand(&pat, self.state.cwd(), self.glob_opts());
+        if !matches.is_empty() {
+            out.extend(matches);
+        } else if self.state.options().nullglob {
+        } else if self.state.options().failglob {
+            return Err(format!("xsh: no match: {text}"));
+        } else {
+            out.push(text);
+        }
+        Ok(())
+    }
+
+    /// Synchronous fast path for expanding `w` into `out` when no brace
+    /// expansion, command/process substitution, or word-splitting is needed.
+    pub(crate) fn try_expand_fields_into_sync(
+        &mut self,
+        w: &Word,
+        out: &mut Vec<String>,
+    ) -> Option<Exp<()>> {
+        match w.segs.as_slice() {
+            [Seg::Lit { text, quoted: true }] => {
+                out.push(text.clone());
+                Some(Ok(()))
+            }
+            [
+                Seg::Lit {
+                    text,
+                    quoted: false,
+                },
+            ] if !text.as_bytes().contains(&b'{') => {
+                Some(self.push_unquoted_field(text.clone(), out))
+            }
+            [
+                Seg::Param {
+                    param:
+                        Param {
+                            name,
+                            op: ParamOp::Plain,
+                        },
+                    quoted,
+                },
+            ] if name != "@" && name != "*" => {
+                let val = self.state.lookup_cow(name);
+                if val.is_none() && self.state.options().nounset {
+                    return Some(Err(format!("xsh: {name}: unbound variable")));
+                }
+                if *quoted {
+                    out.push(val.map(Cow::into_owned).unwrap_or_default());
+                    return Some(Ok(()));
+                }
+                let Some(val) = val else {
+                    return Some(Ok(()));
+                };
+                let ifs = self.state.var("IFS").unwrap_or(DEFAULT_IFS);
+                if !val.chars().any(|c| ifs.contains(c)) {
+                    if !val.is_empty() {
+                        let s = val.into_owned();
+                        return Some(self.push_unquoted_field(s, out));
+                    }
+                    return Some(Ok(()));
+                }
+                None
+            }
+            segs if !segs.is_empty()
+                && segs.iter().all(|s| match s {
+                    Seg::Lit { quoted: true, .. } | Seg::Arith { quoted: true, .. } => true,
+                    Seg::Param {
+                        param: Param { name, .. },
+                        quoted: true,
+                    } => name != "@" && name != "*",
+                    _ => false,
+                }) =>
+            {
+                let res = self.try_expand_single_sync(w)?;
+                Some(res.map(|s| out.push(s)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Appends expanded fields of `w` into `out`, using zero-Box fast paths for
+    /// plain literals and simple parameter expansions.
+    pub(crate) async fn expand_fields_into(
+        &mut self,
+        w: &Word,
+        out: &mut Vec<String>,
+    ) -> Result<Exp<()>> {
+        if let Some(res) = self.try_expand_fields_into_sync(w, out) {
+            return Ok(res);
+        }
+        match self.expand_fields(w).await? {
+            Ok(fields) => {
+                out.extend(fields);
+                Ok(Ok(()))
+            }
+            Err(e) => Ok(Err(e)),
         }
     }
 
@@ -360,21 +575,25 @@ impl Ctx<'_> {
             let mut out = Vec::with_capacity(fields.len());
             for field in fields {
                 let text: String = field.iter().map(|(c, _)| *c).collect();
-                let active = !self.state.options().noglob
+                let maybe_glob = !self.state.options().noglob
                     && field
                         .iter()
                         .any(|(c, q)| !q && matches!(c, '*' | '?' | '['));
-                if !active {
+                if !maybe_glob {
                     out.push(text);
                     continue;
                 }
-                let mut pat = String::new();
+                let mut pat = String::with_capacity(text.len());
                 for (c, q) in &field {
                     if *q || *c == '\\' {
                         escape_into(&mut pat, *c);
                     } else {
                         pat.push(*c);
                     }
+                }
+                if !glob::has_meta(&pat) {
+                    out.push(text);
+                    continue;
                 }
                 let matches = glob::expand(&pat, self.state.cwd(), self.glob_opts());
                 if !matches.is_empty() {
@@ -446,14 +665,217 @@ impl Ctx<'_> {
         Ok(Ok(()))
     }
 
+    fn check_unset(&self, name: &str, has: bool) -> Exp<()> {
+        if !has && self.state.options().nounset && name != "@" && name != "*" {
+            Err(format!("xsh: {name}: unbound variable"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn try_expand_slice_sync(
+        &mut self,
+        name: &str,
+        offset: &Word,
+        length: Option<&Word>,
+        out: &mut String,
+    ) -> Option<Exp<()>> {
+        let [Seg::Lit { text: off_s, .. }] = offset.segs.as_slice() else {
+            return None;
+        };
+        let len_s = match length {
+            None => None,
+            Some(w) => match w.segs.as_slice() {
+                [Seg::Lit { text, .. }] => Some(text.as_str()),
+                _ => return None,
+            },
+        };
+        let has = self.state.lookup_cow(name).is_some();
+        if let Err(e) = self.check_unset(name, has) {
+            return Some(Err(e));
+        }
+        let off = match arith::eval(off_s, self.state) {
+            Ok(n) => n,
+            Err(e) => return Some(Err(format!("xsh: {}: {e}", off_s.trim()))),
+        };
+        let len_arg = match len_s {
+            None => None,
+            Some(ls) => match arith::eval(ls, self.state) {
+                Ok(n) => Some(n),
+                Err(e) => return Some(Err(format!("xsh: {}: {e}", ls.trim()))),
+            },
+        };
+        let val = self.state.lookup_cow(name);
+        let v = val.as_deref().unwrap_or_default();
+        if !v.is_ascii() {
+            return None;
+        }
+        let len = i64::try_from(v.len()).unwrap_or(i64::MAX);
+        let start = if off < 0 {
+            len.saturating_add(off).max(0)
+        } else {
+            off.min(len)
+        };
+        let end = match len_arg {
+            None => len,
+            Some(n) if n < 0 => {
+                let e = len.saturating_add(n);
+                if e < start {
+                    return Some(Err(format!("xsh: {name}: substring expression < 0")));
+                }
+                e
+            }
+            Some(n) => start.saturating_add(n).min(len),
+        };
+        let (s, e) = (
+            usize::try_from(start).unwrap_or(0),
+            usize::try_from(end).unwrap_or(0),
+        );
+        out.push_str(v.get(s..e.max(s)).unwrap_or_default());
+        Some(Ok(()))
+    }
+
+    fn try_expand_param_sync(
+        &mut self,
+        name: &str,
+        op: &ParamOp,
+        out: &mut String,
+    ) -> Option<Exp<()>> {
+        match op {
+            ParamOp::Plain => {
+                let val = match name {
+                    "@" | "*" if self.state.positional().is_empty() => None,
+                    _ => self.state.lookup_cow(name),
+                };
+                if let Err(e) = self.check_unset(name, val.is_some()) {
+                    return Some(Err(e));
+                }
+                if let Some(v) = val {
+                    out.push_str(&v);
+                }
+            }
+            ParamOp::Length => {
+                let val = match name {
+                    "@" | "*" if self.state.positional().is_empty() => None,
+                    _ => self.state.lookup_cow(name),
+                };
+                if let Err(e) = self.check_unset(name, val.is_some()) {
+                    return Some(Err(e));
+                }
+                let len = if name == "@" || name == "*" {
+                    self.state.positional().len()
+                } else if let Some(v) = val {
+                    if v.is_ascii() {
+                        v.len()
+                    } else {
+                        v.chars().count()
+                    }
+                } else {
+                    0
+                };
+                let _ = std::fmt::Write::write_fmt(out, format_args!("{len}"));
+            }
+            ParamOp::Prefix { longest, pattern } => {
+                let pat = unquoted_lit(pattern)?;
+                let val = self.state.lookup_cow(name);
+                if let Err(e) = self.check_unset(name, val.is_some()) {
+                    return Some(Err(e));
+                }
+                out.push_str(&remove_prefix(
+                    val.as_deref().unwrap_or_default(),
+                    pat,
+                    *longest,
+                ));
+            }
+            ParamOp::Suffix { longest, pattern } => {
+                let pat = unquoted_lit(pattern)?;
+                let val = self.state.lookup_cow(name);
+                if let Err(e) = self.check_unset(name, val.is_some()) {
+                    return Some(Err(e));
+                }
+                out.push_str(&remove_suffix(
+                    val.as_deref().unwrap_or_default(),
+                    pat,
+                    *longest,
+                ));
+            }
+            ParamOp::Replace {
+                mode,
+                pattern,
+                with,
+            } => {
+                let (pat, rep) = (unquoted_lit(pattern)?, any_lit(with)?);
+                let val = self.state.lookup_cow(name);
+                if let Err(e) = self.check_unset(name, val.is_some()) {
+                    return Some(Err(e));
+                }
+                out.push_str(&replace(
+                    val.as_deref().unwrap_or_default(),
+                    pat,
+                    rep,
+                    *mode,
+                ));
+            }
+            ParamOp::Slice { offset, length } => {
+                return self.try_expand_slice_sync(name, offset, length.as_ref(), out);
+            }
+            _ => return None,
+        }
+        Some(Ok(()))
+    }
+
+    /// Synchronous fast path for `expand_single` when no command/process
+    /// substitution or nested word expansion is involved.
+    pub(crate) fn try_expand_single_sync(&mut self, w: &Word) -> Option<Exp<String>> {
+        if let [Seg::Lit { text, .. }] = w.segs.as_slice() {
+            return Some(Ok(text.clone()));
+        }
+        let mut out = String::new();
+        for seg in &w.segs {
+            match seg {
+                Seg::Lit { text, .. } => out.push_str(text),
+                Seg::Tilde(user) => out.push_str(&self.tilde(user.as_deref())),
+                Seg::Param {
+                    param: Param { name, op },
+                    ..
+                } => {
+                    if let Err(e) = self.try_expand_param_sync(name, op, &mut out)? {
+                        return Some(Err(e));
+                    }
+                }
+                Seg::Arith { expr, .. } => {
+                    let v = match self.try_arith_word_sync(expr)? {
+                        Ok(v) => v,
+                        Err(e) => return Some(Err(e)),
+                    };
+                    let _ = std::fmt::Write::write_fmt(&mut out, format_args!("{v}"));
+                }
+                _ => return None,
+            }
+        }
+        Some(Ok(out))
+    }
+
     /// Expands a word to one string, with no splitting or patterns.
-    pub(crate) fn expand_single<'s>(&'s mut self, w: &'s Word) -> BoxFut<'s, Exp<String>> {
-        self.expand_join(w, false)
+    pub(crate) async fn expand_single(&mut self, w: &Word) -> Result<Exp<String>> {
+        if let Some(res) = self.try_expand_single_sync(w) {
+            return Ok(res);
+        }
+        self.expand_join(w, false).await
     }
 
     /// Expands a word to a pattern: quoted parts match literally.
-    pub(crate) fn expand_pattern<'s>(&'s mut self, w: &'s Word) -> BoxFut<'s, Exp<String>> {
-        self.expand_join(w, true)
+    pub(crate) async fn expand_pattern(&mut self, w: &Word) -> Result<Exp<String>> {
+        if let [
+            Seg::Lit {
+                text,
+                quoted: false,
+            },
+        ] = w.segs.as_slice()
+        {
+            return Ok(Ok(text.clone()));
+        }
+        self.expand_join(w, true).await
     }
 
     fn expand_join<'s>(&'s mut self, w: &'s Word, pattern: bool) -> BoxFut<'s, Exp<String>> {
@@ -519,11 +941,8 @@ impl Ctx<'_> {
                 Seg::Tilde(user) => Ok(self.tilde(user.as_deref())),
                 Seg::Param { param, .. } => self.param(param).await?,
                 Seg::Command { body, .. } => Ok(self.capture(body).await?),
-                Seg::Arith { expr, .. } => match self.expand_single(expr).await? {
-                    Ok(text) => match arith::eval(&text, self.state) {
-                        Ok(v) => Ok(v.to_string()),
-                        Err(e) => Err(format!("xsh: {}: {e}", text.trim())),
-                    },
+                Seg::Arith { expr, .. } => match self.arith_word(expr).await? {
+                    Ok(v) => Ok(v.to_string()),
                     Err(e) => Err(e),
                 },
                 Seg::ProcIn(body) => Ok(self.proc_in(body).await?),
@@ -533,9 +952,10 @@ impl Ctx<'_> {
     }
 
     async fn proc_in(&mut self, body: &List) -> Result<String> {
-        let path = temp_path();
-        let file = std::sync::Arc::new(std::fs::File::create(&path)?);
-        self.temps.push(path.clone());
+        let tmp = tempfile::Builder::new().prefix("xsh-").tempfile()?;
+        let path = tmp.path().to_path_buf();
+        let file = std::sync::Arc::new(tmp.as_file().try_clone()?);
+        self.temps.push(tmp);
         let io = crate::exec::Io {
             out: crate::exec::Sink::File(file),
             ..crate::exec::Io::default()
@@ -545,9 +965,9 @@ impl Ctx<'_> {
     }
 
     fn proc_out(&mut self, body: &List) -> Result<String> {
-        let path = temp_path();
-        std::fs::File::create(&path)?;
-        self.temps.push(path.clone());
+        let tmp = tempfile::Builder::new().prefix("xsh-").tempfile()?;
+        let path = tmp.path().to_path_buf();
+        self.temps.push(tmp);
         self.after.push((body.clone(), path.clone()));
         Ok(path.display().to_string())
     }
@@ -559,11 +979,14 @@ impl Ctx<'_> {
     )]
     async fn param(&mut self, p: &Param) -> Result<Exp<String>> {
         let name = p.name.as_str();
-        let val = match name {
-            "@" | "*" if self.state.positional().is_empty() => None,
-            _ => self.state.lookup(name),
+        let (is_set, is_empty) = {
+            let val = match name {
+                "@" | "*" if self.state.positional().is_empty() => None,
+                _ => self.state.lookup_cow(name),
+            };
+            (val.is_some(), val.as_deref().is_none_or(str::is_empty))
         };
-        let unset = |colon: bool| val.as_ref().is_none_or(|v| colon && v.is_empty());
+        let unset = |colon: bool| !is_set || (colon && is_empty);
         let strict = !matches!(
             p.op,
             ParamOp::Default { .. }
@@ -571,17 +994,26 @@ impl Ctx<'_> {
                 | ParamOp::Alt { .. }
                 | ParamOp::Error { .. }
         );
-        if strict && val.is_none() && self.state.options().nounset && name != "@" && name != "*" {
+        if strict && !is_set && self.state.options().nounset && name != "@" && name != "*" {
             return Ok(Err(format!("xsh: {name}: unbound variable")));
         }
-        let v = val.clone().unwrap_or_default();
+        let get_owned = |state: &crate::state::ShellState| -> String {
+            match name {
+                "@" | "*" if state.positional().is_empty() => String::new(),
+                _ => state.lookup(name).unwrap_or_default(),
+            }
+        };
         Ok(Ok(match &p.op {
-            ParamOp::Plain => v,
+            ParamOp::Plain => get_owned(self.state),
             ParamOp::Length => {
                 if name == "@" || name == "*" {
                     self.state.positional().len().to_string()
                 } else {
-                    v.chars().count().to_string()
+                    match self.state.lookup_cow(name) {
+                        Some(v) if v.is_ascii() => v.len().to_string(),
+                        Some(v) => v.chars().count().to_string(),
+                        None => "0".to_owned(),
+                    }
                 }
             }
             ParamOp::Default { colon, word } => {
@@ -591,7 +1023,7 @@ impl Ctx<'_> {
                         Err(e) => return Ok(Err(e)),
                     }
                 } else {
-                    v
+                    get_owned(self.state)
                 }
             }
             ParamOp::Assign { colon, word } => {
@@ -603,10 +1035,13 @@ impl Ctx<'_> {
                     if !is_var_name(name) {
                         return Ok(Err(format!("xsh: ${name}: cannot assign in this way")));
                     }
-                    self.state.set_var(name, s.clone());
+                    if self.state.is_readonly(name) {
+                        return Ok(Err(format!("xsh: {name}: readonly variable")));
+                    }
+                    self.state.set_var_str(name, &s);
                     s
                 } else {
-                    v
+                    get_owned(self.state)
                 }
             }
             ParamOp::Alt { colon, word } => {
@@ -632,14 +1067,20 @@ impl Ctx<'_> {
                     };
                     return Ok(Err(format!("xsh: {name}: {msg}")));
                 }
-                v
+                get_owned(self.state)
             }
             ParamOp::Prefix { longest, pattern } => match self.expand_pattern(pattern).await? {
-                Ok(pat) => remove_prefix(&v, &pat, *longest),
+                Ok(pat) => {
+                    let v = self.state.lookup_cow(name);
+                    remove_prefix(v.as_deref().unwrap_or_default(), &pat, *longest)
+                }
                 Err(e) => return Ok(Err(e)),
             },
             ParamOp::Suffix { longest, pattern } => match self.expand_pattern(pattern).await? {
-                Ok(pat) => remove_suffix(&v, &pat, *longest),
+                Ok(pat) => {
+                    let v = self.state.lookup_cow(name);
+                    remove_suffix(v.as_deref().unwrap_or_default(), &pat, *longest)
+                }
                 Err(e) => return Ok(Err(e)),
             },
             ParamOp::Replace {
@@ -655,41 +1096,75 @@ impl Ctx<'_> {
                     Ok(w) => w,
                     Err(e) => return Ok(Err(e)),
                 };
-                replace(&v, &pat, &with, *mode)
+                let v = self.state.lookup_cow(name);
+                replace(v.as_deref().unwrap_or_default(), &pat, &with, *mode)
             }
             ParamOp::Slice { offset, length } => {
-                let chars: Vec<char> = v.chars().collect();
-                let len = i64::try_from(chars.len()).unwrap_or(i64::MAX);
                 let off = match self.arith_word(offset).await? {
                     Ok(n) => n,
                     Err(e) => return Ok(Err(e)),
                 };
-                let start = if off < 0 {
-                    (len + off).max(0)
-                } else {
-                    off.min(len)
-                };
-                let end = match length {
-                    None => len,
+                let len_arg = match length {
+                    None => None,
                     Some(l) => match self.arith_word(l).await? {
-                        Ok(n) if n < 0 => {
-                            let e = len + n;
+                        Ok(n) => Some(n),
+                        Err(e) => return Ok(Err(e)),
+                    },
+                };
+                let v = self.state.lookup_cow(name);
+                let v = v.as_deref().unwrap_or_default();
+                if v.is_ascii() {
+                    let len = i64::try_from(v.len()).unwrap_or(i64::MAX);
+                    let start = if off < 0 {
+                        len.saturating_add(off).max(0)
+                    } else {
+                        off.min(len)
+                    };
+                    let end = match len_arg {
+                        None => len,
+                        Some(n) if n < 0 => {
+                            let e = len.saturating_add(n);
                             if e < start {
                                 return Ok(Err(format!("xsh: {name}: substring expression < 0")));
                             }
                             e
                         }
-                        Ok(n) => (start + n).min(len),
-                        Err(e) => return Ok(Err(e)),
-                    },
-                };
-                let (s, e) = (
-                    usize::try_from(start).unwrap_or(0),
-                    usize::try_from(end).unwrap_or(0),
-                );
-                chars.get(s..e.max(s)).unwrap_or_default().iter().collect()
+                        Some(n) => start.saturating_add(n).min(len),
+                    };
+                    let (s, e) = (
+                        usize::try_from(start).unwrap_or(0),
+                        usize::try_from(end).unwrap_or(0),
+                    );
+                    v.get(s..e.max(s)).unwrap_or_default().to_owned()
+                } else {
+                    let chars: Vec<char> = v.chars().collect();
+                    let len = i64::try_from(chars.len()).unwrap_or(i64::MAX);
+                    let start = if off < 0 {
+                        len.saturating_add(off).max(0)
+                    } else {
+                        off.min(len)
+                    };
+                    let end = match len_arg {
+                        None => len,
+                        Some(n) if n < 0 => {
+                            let e = len.saturating_add(n);
+                            if e < start {
+                                return Ok(Err(format!("xsh: {name}: substring expression < 0")));
+                            }
+                            e
+                        }
+                        Some(n) => start.saturating_add(n).min(len),
+                    };
+                    let (s, e) = (
+                        usize::try_from(start).unwrap_or(0),
+                        usize::try_from(end).unwrap_or(0),
+                    );
+                    chars.get(s..e.max(s)).unwrap_or_default().iter().collect()
+                }
             }
             ParamOp::Upper { all } => {
+                let v = self.state.lookup_cow(name);
+                let v = v.as_deref().unwrap_or_default();
                 if *all {
                     v.to_uppercase()
                 } else {
@@ -700,6 +1175,8 @@ impl Ctx<'_> {
                 }
             }
             ParamOp::Lower { all } => {
+                let v = self.state.lookup_cow(name);
+                let v = v.as_deref().unwrap_or_default();
                 if *all {
                     v.to_lowercase()
                 } else {
@@ -712,7 +1189,22 @@ impl Ctx<'_> {
         }))
     }
 
+    /// Synchronous fast path for arithmetic words using the pre-parsed cache.
+    pub(crate) fn try_arith_word_sync(&mut self, w: &Word) -> Option<Exp<i64>> {
+        if let [Seg::Lit { text, .. }] = w.segs.as_slice() {
+            return Some(self.eval_arith_cached(text));
+        }
+        let text = match self.try_expand_single_sync(w)? {
+            Ok(t) => t,
+            Err(e) => return Some(Err(e)),
+        };
+        Some(arith::eval(&text, self.state).map_err(|e| format!("xsh: {}: {e}", text.trim())))
+    }
+
     pub(crate) async fn arith_word(&mut self, w: &Word) -> Result<Exp<i64>> {
+        if let Some(res) = self.try_arith_word_sync(w) {
+            return Ok(res);
+        }
         Ok(match self.expand_single(w).await? {
             Ok(text) => {
                 arith::eval(&text, self.state).map_err(|e| format!("xsh: {}: {e}", text.trim()))
@@ -745,5 +1237,27 @@ mod tests {
         assert_eq!(replace("abc", "a", "Z", ReplaceMode::Prefix), "Zbc");
         assert_eq!(replace("abc", "c", "Z", ReplaceMode::Suffix), "abZ");
         assert_eq!(replace("abc", "b*", "", ReplaceMode::All), "a");
+    }
+
+    #[test]
+    fn brace_sequence_handles_i64_extremes() {
+        let min_step: Vec<Atom<'_>> = format!("0..10..{}", i64::MIN)
+            .chars()
+            .map(Atom::Ch)
+            .collect();
+        let res = sequence(&min_step);
+        assert_eq!(res.as_ref().map(Vec::len), Some(1));
+        let max_range: Vec<Atom<'_>> = format!("{}..{}..2", i64::MAX - 1, i64::MAX)
+            .chars()
+            .map(Atom::Ch)
+            .collect();
+        let res = sequence(&max_range);
+        assert_eq!(res.as_ref().map(Vec::len), Some(1));
+        let min_range: Vec<Atom<'_>> = format!("{}..{}..2", i64::MIN + 1, i64::MIN)
+            .chars()
+            .map(Atom::Ch)
+            .collect();
+        let res = sequence(&min_range);
+        assert_eq!(res.as_ref().map(Vec::len), Some(1));
     }
 }

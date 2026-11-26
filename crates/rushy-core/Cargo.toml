@@ -7,10 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-rustix.workspace = true
+rustix = { workspace = true, features = ["stdio"] }
+tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
 tokio = { workspace = true, features = ["time"] }

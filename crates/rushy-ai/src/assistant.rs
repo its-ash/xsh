@@ -3,7 +3,7 @@
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::context::Context;
+use crate::context::{Context, redact_secrets};
 use crate::provider::{AiProvider, AiRequest, ChatMessage, ToolSpec, tail};
 use crate::safety::{Verdict, check_command};
 use crate::{Result, prompts};
@@ -198,10 +198,10 @@ impl<'a> Assistant<'a> {
     pub fn fix_request(&self, f: &Failure, ctx: &Context) -> AiRequest {
         let mut body = format!(
             "Command: {}\nExit code: {}\nWorking directory: {}\nStderr:\n{}\n",
-            f.command,
+            redact_secrets(&f.command),
             f.exit_code,
             f.cwd,
-            tail(&f.stderr, STDERR_LIMIT)
+            tail(&redact_secrets(&f.stderr), STDERR_LIMIT)
         );
         if let Some(g) = &f.git_status {
             body.push_str("git status --short:\n");

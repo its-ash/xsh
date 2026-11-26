@@ -294,9 +294,18 @@ struct ShortcutField: View {
         .onDisappear { stop() }
     }
 
+    private static var activeStop: (() -> Void)?
+
     private func start() {
+        Self.activeStop?()
         recording = true
+        Self.activeStop = { stop() }
         monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { e in
+            let flags = e.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            if flags == .command, let ch = e.charactersIgnoringModifiers?.lowercased(), ch == "q" || ch == "w" {
+                stop()
+                return e
+            }
             if Int(e.keyCode) == 53 {
                 stop()
             } else if let text = Shortcut.text(from: e) {
@@ -311,6 +320,7 @@ struct ShortcutField: View {
         recording = false
         if let monitor { NSEvent.removeMonitor(monitor) }
         monitor = nil
+        Self.activeStop = nil
     }
 }
 
@@ -340,17 +350,24 @@ struct GeneralExtra: View {
         var types = [UTType.unixExecutable]
         if let t = UTType("com.apple.terminal.shell-script") { types.append(t) }
         let group = DispatchGroup()
+        let lock = NSLock()
         var failure: String?
+        let record: (Error?) -> Void = { e in
+            guard let e else { return }
+            lock.lock()
+            failure = e.localizedDescription
+            lock.unlock()
+        }
         for t in types {
             group.enter()
             ws.setDefaultApplication(at: app, toOpen: t) { e in
-                if let e { failure = e.localizedDescription }
+                record(e)
                 group.leave()
             }
         }
         group.enter()
         ws.setDefaultApplication(at: app, toOpenURLsWithScheme: "ssh") { e in
-            if let e { failure = e.localizedDescription }
+            record(e)
             group.leave()
         }
         group.notify(queue: .main) {
@@ -930,6 +947,7 @@ private struct AICustomModelRows: View {
             let list = r.status == 0 ? (try? JSONSerialization.jsonObject(with: r.out)) as? [String] : nil
             let text = r.err.trimmingCharacters(in: .whitespacesAndNewlines)
             DispatchQueue.main.async {
+                guard self.url == address else { return }
                 fetching = false
                 if let list {
                     models = list
@@ -986,9 +1004,12 @@ struct AdvancedExtra: View {
                     at: URL(fileURLWithPath: path).deletingLastPathComponent(), withIntermediateDirectories: true)
                 FileManager.default.createFile(atPath: path, contents: Data())
             }
-            NSWorkspace.shared.open([URL(fileURLWithPath: path)],
-                                    withApplicationAt: URL(fileURLWithPath: "/System/Applications/TextEdit.app"),
-                                    configuration: NSWorkspace.OpenConfiguration())
+            let fileURL = URL(fileURLWithPath: path)
+            if !NSWorkspace.shared.open(fileURL) {
+                NSWorkspace.shared.open([fileURL],
+                                        withApplicationAt: URL(fileURLWithPath: "/System/Applications/TextEdit.app"),
+                                        configuration: NSWorkspace.OpenConfiguration())
+            }
         }
     }
 

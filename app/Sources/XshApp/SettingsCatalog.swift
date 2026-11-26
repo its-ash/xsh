@@ -228,6 +228,8 @@ enum Catalog {
                 Setting("shell.notify_after_secs", "Notice for commands longer than", .number(0...86_400, step: 5, unit: "s"), "0 turns this off."),
                 Setting("shell.capture_stderr", "Keep error output for ai fix", .toggle),
                 Setting("shell.terminal_integration", "Send title, folder, and prompt marks to the terminal", .toggle),
+                Setting("shell.ssh_integration", "Preserve colors and highlighting over SSH", .toggle,
+                        "Adds theme colors, prompt marks, and live syntax highlighting on remote servers without installing anything."),
             ]),
             SettingGroup("Start-up", [
                 Setting("shell.rc_file", "Start-up file", .text("init.xsh"), "Relative to the config folder."),

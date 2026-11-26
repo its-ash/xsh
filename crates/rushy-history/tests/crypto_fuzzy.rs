@@ -66,6 +66,7 @@ fn passphrase_keys_depend_on_salt_and_need_a_long_salt() -> TestResult {
     assert_eq!(Cipher::new(&k2).open(&sealed, b"")?, msg);
     assert!(Cipher::new(&k3).open(&sealed, b"").is_err());
     assert!(Key::from_passphrase("pass", b"short").is_err());
+    assert!(Key::from_passphrase("", b"saltsalt").is_err());
     Ok(())
 }
 

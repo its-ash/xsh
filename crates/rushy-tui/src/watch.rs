@@ -4,18 +4,17 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use notify::{Event, EventKind, PollWatcher, RecursiveMode, Watcher};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::mpsc::{Receiver, Sender, channel};
 
 use crate::Result;
 
 const DEBOUNCE: Duration = Duration::from_millis(200);
+const MAX_DEBOUNCE: Duration = Duration::from_secs(1);
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Whether a change to `path` can affect the configuration: TOML, bundle
-/// scripts, README files, and directories (bundle installs and removals).
-/// Databases, sockets, and caches that happen to live nearby are ignored, so
-/// the shell's own writes (such as the history) never look like an edit.
-/// Hidden files such as Finder's `.DS_Store` are ignored too.
+/// scripts, and README files. Databases, sockets, extensionless temp/lock
+/// files, and hidden files (such as Finder's `.DS_Store`) are ignored.
 #[must_use]
 pub fn is_config_path(path: &Path) -> bool {
     if path
@@ -26,15 +25,12 @@ pub fn is_config_path(path: &Path) -> bool {
         return false;
     }
     match path.extension().and_then(|e| e.to_str()) {
-        None => true,
+        None => false,
         Some(e) => matches!(e.to_ascii_lowercase().as_str(), "toml" | "rushy" | "md"),
     }
 }
 
-fn handler(
-    tx: UnboundedSender<()>,
-    root: PathBuf,
-) -> impl FnMut(notify::Result<Event>) + Send + 'static {
+fn handler(tx: Sender<()>, root: PathBuf) -> impl FnMut(notify::Result<Event>) + Send + 'static {
     move |res| {
         if let Ok(ev) = res {
             let kind_ok = matches!(
@@ -42,7 +38,9 @@ fn handler(
                 EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
             );
             if kind_ok && ev.paths.iter().any(|p| *p != root && is_config_path(p)) {
-                let _ = tx.send(());
+                // One pending signal is enough: `changed` drains bursts, and a
+                // full queue already means "something changed".
+                let _ = tx.try_send(());
             }
         }
     }
@@ -55,7 +53,7 @@ fn handler(
 pub struct ConfigWatcher {
     // Held to keep the watch alive.
     _watcher: Box<dyn Watcher + Send>,
-    rx: UnboundedReceiver<()>,
+    rx: Receiver<()>,
     polling: bool,
 }
 
@@ -75,7 +73,7 @@ impl ConfigWatcher {
     /// Fails if the directory cannot be created or neither watcher can start.
     pub fn new(dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
-        let (tx, rx) = unbounded_channel();
+        let (tx, rx) = channel(1);
         let native = notify::recommended_watcher(handler(tx.clone(), dir.to_path_buf())).and_then(
             |mut w| {
                 w.watch(dir, RecursiveMode::Recursive)?;
@@ -105,13 +103,24 @@ impl ConfigWatcher {
         self.polling
     }
 
-    /// Waits for a change, then until the directory is quiet for 200 ms.
-    /// Returns `false` when the watcher has stopped.
+    /// Waits for a change, then until the directory is quiet for 200 ms (capped
+    /// at 1 s total debounce wait). Returns `false` when the watcher has stopped.
     pub async fn changed(&mut self) -> bool {
         if self.rx.recv().await.is_none() {
             return false;
         }
-        while let Ok(Some(())) = tokio::time::timeout(DEBOUNCE, self.rx.recv()).await {}
+        let deadline = tokio::time::Instant::now() + MAX_DEBOUNCE;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let wait = DEBOUNCE.min(remaining);
+            match tokio::time::timeout(wait, self.rx.recv()).await {
+                Ok(Some(())) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
         true
     }
 }
